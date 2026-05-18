@@ -395,10 +395,18 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             data = json.loads(body.decode())
     except urllib.error.HTTPError as e:
         u = AccountUsage.empty()
+        body_preview = e.read()[:200].decode(errors="replace") if e.fp else ""
         if e.code == 401:
             u.token_expired = True
+        elif e.code == 429:
+            # Account is actively rate-limited by Anthropic. Treat as 100%
+            # utilization on both windows so the swap target picker treats it
+            # as "completely full" and refuses to swap to it.
+            u.five_hour = UsageWindow(utilization=100.0, resets_at=None)
+            u.seven_day = UsageWindow(utilization=100.0, resets_at=None)
+            u.raw = {"error": f"HTTP 429 (rate_limited): {body_preview}", "rate_limited": True}
         else:
-            u.raw = {"error": f"HTTP {e.code}: {e.read()[:200].decode(errors='replace')}"}
+            u.raw = {"error": f"HTTP {e.code}: {body_preview}"}
         return u
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
         u = AccountUsage.empty()
@@ -463,7 +471,10 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
     candidates: list[tuple[str, dict]] = [
         (name, acct) for name, acct in accounts.items()
-        if name != current and not acct.get("token_expired", False)
+        if name != current
+        and not acct.get("token_expired", False)
+        and not acct.get("rate_limited", False)
+        and not acct.get("poll_error")
     ]
     if not candidates:
         return None
@@ -739,17 +750,37 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 
 
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
-    """Mutate state.json's per-account current_*_pct from a poll cycle."""
+    """Mutate state.json's per-account current_*_pct from a poll cycle.
+
+    On poll error (network failure, JSON parse failure, etc.), we PRESERVE
+    the previous current_*_pct values rather than zeroing them out — a
+    transient error shouldn't make the strategy picker think the account
+    is suddenly idle.
+    """
     for name, acct in state["accounts"].items():
         u = usage_by_account.get(name)
         if u is None:
             continue
         if u.token_expired:
             acct["token_expired"] = True
+            acct["last_poll_ts"] = u.polled_at
             continue
+        # Detect transient/unrecoverable errors that returned no usable data
+        has_error = bool(u.raw.get("error"))
+        has_any_window = u.five_hour is not None or u.seven_day is not None
+        if has_error and not has_any_window:
+            acct["poll_error"] = u.raw["error"]
+            acct["last_poll_ts"] = u.polled_at
+            continue
+        # Clear prior error state and any token_expired flag
+        acct.pop("poll_error", None)
         acct["token_expired"] = False
-        acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else 0.0
-        acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else 0.0
+        if u.raw.get("rate_limited"):
+            acct["rate_limited"] = True
+        else:
+            acct.pop("rate_limited", None)
+        acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
+        acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else acct.get("current_7d_pct", 0.0)
         acct["last_poll_ts"] = u.polled_at
         if u.five_hour and u.five_hour.resets_at:
             acct["five_hour_resets_at"] = u.five_hour.resets_at
@@ -770,6 +801,517 @@ def maybe_reset_thresholds(state: dict, config: dict) -> None:
         if acct.get("current_5h_pct", 0) < reset_below and acct.get("current_7d_pct", 0) < reset_below:
             if acct.get("next_swap_at_pct", first_step) > first_step:
                 acct["next_swap_at_pct"] = first_step
+
+
+# --------------------------------------------------------------------------
+# Live session tracking (Phase 3+)
+# --------------------------------------------------------------------------
+
+@dataclass
+class LiveSession:
+    """One Claude Code session believed to be alive based on hook log tails."""
+    session_id: str
+    account: str
+    pane: str           # tmux pane id like %12, or "no-tmux"
+    cwd: str
+    started_at: str
+    last_stop_at: str | None     # latest Stop hook entry; None if never stopped
+    transcript_path: Path | None  # ~/.claude/projects/<cwd>/<id>.jsonl
+
+
+def _parse_sessions_log() -> list[dict]:
+    """Read sessions.log as a list of dicts. Order: oldest first."""
+    if not SESSIONS_LOG.exists():
+        return []
+    entries: list[dict] = []
+    with SESSIONS_LOG.open() as f:
+        for line in f:
+            parts = line.strip().split(",", 4)
+            if len(parts) < 5:
+                continue
+            entries.append({"ts": parts[0], "session_id": parts[1], "account": parts[2], "pane": parts[3], "cwd": parts[4]})
+    return entries
+
+
+def _latest_stops_per_session() -> dict[str, str]:
+    """Read stops.log and return {session_id: latest_stop_ts}."""
+    if not STOPS_LOG.exists():
+        return {}
+    result: dict[str, str] = {}
+    with STOPS_LOG.open() as f:
+        for line in f:
+            parts = line.strip().split(",", 2)
+            if len(parts) < 2:
+                continue
+            ts, session_id = parts[0], parts[1]
+            result[session_id] = ts  # later entries overwrite, so result is latest
+    return result
+
+
+def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
+    """Best-effort enumeration of live Claude Code sessions on this machine.
+
+    "Live" = appears in sessions.log AND either (a) has recent activity in
+    its transcript JSONL, OR (b) has had a Stop signal recently.
+
+    Caveat: there's no SessionEnd hook in Claude Code, so we infer liveness
+    from staleness. A long-idle session may be wrongly flagged dead. This
+    is fine for hot-swap: if a session is truly idle for 10+ minutes, swapping
+    it is no different from a new session inheriting the new credentials.
+    """
+    entries = _parse_sessions_log()
+    latest_stops = _latest_stops_per_session()
+    now = datetime.now(timezone.utc)
+
+    # Deduplicate by session_id (keep latest entry — newest registration wins
+    # in case of restarts that re-fire SessionStart with same id, though that
+    # shouldn't happen with --resume which preserves the id).
+    by_id: dict[str, dict] = {}
+    for e in entries:
+        by_id[e["session_id"]] = e
+
+    live: list[LiveSession] = []
+    for sid, e in by_id.items():
+        if account_filter and e["account"] != account_filter:
+            continue
+        # Liveness: was there a Stop in the last hour? Or, fallback, is the
+        # JSONL transcript recent? (Don't require both — either signal counts.)
+        last_stop_at = latest_stops.get(sid)
+        is_live = False
+        if last_stop_at:
+            try:
+                last_stop_dt = datetime.fromisoformat(last_stop_at.replace("Z", "+00:00"))
+                if (now - last_stop_dt).total_seconds() < 3600:
+                    is_live = True
+            except ValueError:
+                pass
+
+        transcript = _find_transcript(sid, e.get("cwd", ""))
+        if transcript and transcript.exists():
+            mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+            if (now - mtime).total_seconds() < 3600:
+                is_live = True
+
+        if is_live:
+            live.append(LiveSession(
+                session_id=sid,
+                account=e["account"],
+                pane=e["pane"],
+                cwd=e["cwd"],
+                started_at=e["ts"],
+                last_stop_at=last_stop_at,
+                transcript_path=transcript,
+            ))
+    return live
+
+
+def _find_transcript(session_id: str, cwd: str) -> Path | None:
+    """Locate the JSONL transcript for a session. Returns None if not found.
+
+    Claude Code stores transcripts at ~/.claude/projects/<cwd-encoded>/<session-id>.jsonl
+    where cwd-encoded is the cwd path with `/` replaced by `-`.
+    """
+    projects_root = CLAUDE_DIR / "projects"
+    if not projects_root.exists():
+        return None
+    if cwd:
+        encoded = cwd.replace("/", "-")
+        candidate = projects_root / encoded / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+    # Fallback: linear scan
+    for jsonl in projects_root.glob(f"*/{session_id}.jsonl"):
+        return jsonl
+    return None
+
+
+def cache_warm(transcript: Path, window_seconds: int) -> bool:
+    """Return True if the transcript's last entry is within the cache window.
+
+    Lifted concept from cux: Anthropic's prompt cache TTL is 5 minutes. If
+    the last message was <5min ago, swapping now incurs cache-rebuild cost
+    on the new account (the new account hasn't seen the conversation). If
+    >5min ago, cache is gone anyway — swap is "free" cost-wise.
+    """
+    if not transcript or not transcript.exists():
+        return False
+    try:
+        # Find last non-empty line (cheap; JSONL is line-delimited)
+        with transcript.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            # Walk back from end finding last newline of a non-empty entry
+            chunk = b""
+            offset = size
+            while offset > 0 and b"\n" not in chunk[:-1]:
+                read = min(4096, offset)
+                offset -= read
+                f.seek(offset)
+                chunk = f.read(read) + chunk
+            last_line = chunk.strip().split(b"\n")[-1]
+        if not last_line:
+            return False
+        entry = json.loads(last_line)
+        ts_str = entry.get("timestamp") or entry.get("ts")
+        if not ts_str:
+            # Fallback to file mtime
+            ts = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+        else:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds() < window_seconds
+    except (OSError, json.JSONDecodeError, ValueError):
+        # On any parse failure, assume cache is cold (safer — don't block swap)
+        return False
+
+
+# --------------------------------------------------------------------------
+# Tmux integration (Phase 3+)
+# --------------------------------------------------------------------------
+
+def tmux_is_available() -> bool:
+    """Check if `tmux` binary is callable."""
+    return shutil.which("tmux") is not None
+
+
+def tmux_pane_exists(pane: str) -> bool:
+    """Verify the given tmux pane id still exists."""
+    if not pane or pane == "no-tmux" or not tmux_is_available():
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return pane in result.stdout.split()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds: float = 0.3) -> bool:
+    """Send `text` (optionally followed by Enter) to a tmux pane.
+
+    Pattern documented in tmux-Claude integration guides: use -l (literal)
+    to avoid escape interpretation, then send C-m separately with a small
+    delay. Returns True on success.
+    """
+    if not tmux_is_available() or not pane or pane == "no-tmux":
+        return False
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", text], check=True, timeout=5)
+        if then_enter:
+            time.sleep(delay_seconds)
+            subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def tmux_send_keys(pane: str, *keys: str) -> bool:
+    """Send raw key sequences (e.g. 'Escape', 'C-c') to a tmux pane."""
+    if not tmux_is_available() or not pane or pane == "no-tmux":
+        return False
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", pane, *keys], check=True, timeout=5)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def tmux_pane_name(pane: str) -> str:
+    """Return the tmux pane's command/process name, for whitelist matching."""
+    if not tmux_is_available() or not pane:
+        return ""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return ""
+
+
+# --------------------------------------------------------------------------
+# Hot-swap orchestrator (Phase 3)
+# --------------------------------------------------------------------------
+
+def session_is_pinned(session: LiveSession, config: dict) -> tuple[bool, str]:
+    """Check if a session is locked to its current account (Phase 6 feature)."""
+    pinned = config.get("session_locks", {}).get("pinned", {}) or {}
+    if session.pane in pinned and pinned[session.pane] != session.account:
+        return True, f"pinned via pane: {pinned[session.pane]}"
+    if session.session_id in pinned:
+        return True, f"pinned via session_id: {pinned[session.session_id]}"
+    return False, ""
+
+
+def session_matches_whitelist(session: LiveSession, config: dict) -> tuple[bool, str]:
+    """Check session.pane against never_restart_patterns regex list."""
+    patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
+    if not patterns or not session.pane or session.pane == "no-tmux":
+        return False, ""
+    pane_cmd = tmux_pane_name(session.pane)
+    for pat in patterns:
+        try:
+            if re.search(pat, pane_cmd):
+                return True, f"whitelist: {pat} matches '{pane_cmd}'"
+        except re.error:
+            continue
+    return False, ""
+
+
+def subagent_active(session: LiveSession, config: dict, idle_seconds: int = 60) -> bool:
+    """Estimate whether a session has an in-flight subagent or tool call.
+
+    Heuristic: count tool_use.log entries for this session_id where the
+    last entry is "start" (no matching "stop") within the recent window.
+    """
+    if not TOOL_USE_LOG.exists():
+        return False
+    in_flight = 0
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - idle_seconds
+    try:
+        with TOOL_USE_LOG.open() as f:
+            for line in f:
+                parts = line.strip().split(",", 3)
+                if len(parts) < 4:
+                    continue
+                ts_str, sid, _, phase = parts
+                if sid != session.session_id:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                in_flight += 1 if phase == "start" else -1
+    except OSError:
+        return False
+    return in_flight > 0
+
+
+def wait_for_stop(session_id: str, timeout_seconds: int) -> bool:
+    """Block until a fresh Stop signal is seen for session_id, or timeout."""
+    deadline = time.monotonic() + timeout_seconds
+    baseline = _latest_stops_per_session().get(session_id)
+    while time.monotonic() < deadline:
+        cur = _latest_stops_per_session().get(session_id)
+        if cur and cur != baseline:
+            return True
+        time.sleep(2)
+    return False
+
+
+def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> None:
+    """Hot-swap orchestrator. Called by daemon when config.hot_swap.enabled=true.
+
+    Sequence:
+      1. Enumerate live sessions on the swap-out account.
+      2. Filter: skip pinned, whitelisted, no-tmux sessions.
+      3. Subagent skip-guard: if any swappable session has active subagent
+         AND tier < config.subagent_skip.defer_below_tier, defer the swap.
+      4. Cache-bust window: if tier == 1 and ANY session has warm cache,
+         defer.
+      5. Tier-specific action (per session):
+         - Tier 1: wait_for_stop with config timeout, exit + relaunch.
+         - Tier 2: send pause-message, wait for resulting Stop, exit + relaunch.
+         - Tier 3: send Escape (interrupt running tool), log shells to inbox,
+           exit + relaunch.
+      6. After all sessions exited, call execute_swap.
+      7. Relaunch each session via `claude --resume <id> "Continue."`.
+
+    Sessions running outside tmux (pane='no-tmux') are SKIPPED — we can't
+    drive them. They'll keep running on the old account until they exit
+    naturally and the user restarts; at that point the wrapper picks up
+    the new active account.
+    """
+    current = state["active"]
+    hot = config.get("hot_swap", {})
+    tier = decision.tier
+
+    live = find_live_sessions(account_filter=current)
+    click.echo(f"  hot_swap: {len(live)} live session(s) on {current}")
+
+    swappable: list[LiveSession] = []
+    for s in live:
+        pinned, reason = session_is_pinned(s, config)
+        if pinned:
+            click.echo(f"    skip {s.session_id[:8]} ({reason})")
+            continue
+        wl, reason = session_matches_whitelist(s, config)
+        if wl:
+            click.echo(f"    skip {s.session_id[:8]} ({reason})")
+            continue
+        if s.pane == "no-tmux" or not tmux_pane_exists(s.pane):
+            click.echo(f"    skip {s.session_id[:8]} (no tmux pane — cannot drive)")
+            continue
+        swappable.append(s)
+
+    # Subagent skip-guard
+    if config.get("subagent_skip", {}).get("enabled", True):
+        defer_below = config["subagent_skip"].get("defer_below_tier", 3)
+        if tier < defer_below:
+            for s in swappable:
+                if subagent_active(s, config):
+                    click.echo(f"    DEFER: subagent active in {s.session_id[:8]} (tier={tier} < defer_below={defer_below})")
+                    return
+
+    # Cache-bust window — Tier 1 only
+    if tier == 1:
+        window = hot.get("cache_bust_window_seconds", 300)
+        for s in swappable:
+            if s.transcript_path and cache_warm(s.transcript_path, window):
+                click.echo(f"    DEFER: cache warm for {s.session_id[:8]} (Tier 1 swap would burn cache)")
+                return
+
+    # Per-tier pause behavior
+    for s in swappable:
+        if tier == 2:
+            click.echo(f"    {s.session_id[:8]}: injecting pause-message")
+            tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+            ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
+            if not ok:
+                click.echo(f"      timed out waiting for Stop; proceeding anyway")
+        elif tier == 3:
+            click.echo(f"    {s.session_id[:8]}: force interrupt (Escape)")
+            tmux_send_keys(s.pane, "Escape")
+            time.sleep(0.5)
+            # Log shell context to inbox so user can recover any in-flight work
+            shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
+            if shell_note:
+                append_inbox(
+                    "deviation",
+                    f"Force-interrupted session {s.session_id[:8]} (tier 3, threshold {decision.tier})",
+                    f"Account `{current}` was force-swapped to `{decision.target}` while session had active tool calls:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` if you'd rather keep going on the original account.",
+                )
+        else:  # tier 1
+            click.echo(f"    {s.session_id[:8]}: waiting for natural Stop (up to {hot.get('stop_wait_timeout_seconds', 300)}s)")
+            ok = wait_for_stop(s.session_id, hot.get("stop_wait_timeout_seconds", 300))
+            if not ok:
+                click.echo(f"      timed out; aborting hot-swap (will retry next cycle)")
+                return
+
+    # All swappable sessions are now at a turn boundary (or force-interrupted).
+    # Exit each pane's claude process.
+    for s in swappable:
+        click.echo(f"    {s.session_id[:8]}: sending /exit to pane {s.pane}")
+        tmux_send_text(s.pane, "/exit")
+        time.sleep(0.5)
+
+    # Wait briefly for processes to die before swapping files
+    time.sleep(2)
+
+    # Actually swap the credentials
+    execute_swap(decision.target, trigger=f"auto-tier{tier}")
+
+    # Relaunch each session with --resume
+    wake_msg = hot.get("wake_up_message", "Continue.")
+    for s in swappable:
+        click.echo(f"    {s.session_id[:8]}: relaunching with --resume")
+        # Construct the command. Use sh -c so we can cd to the cwd first.
+        # The wake message is a positional argument to `claude`, per cux's pattern.
+        cmd = f"cd {shlex_quote(s.cwd)} && claude --resume {shlex_quote(s.session_id)} {shlex_quote(wake_msg)}"
+        tmux_send_text(s.pane, cmd)
+
+
+def _read_rate_limit_log_since(since_ts: str | None) -> list[dict]:
+    """Return 429 entries newer than `since_ts` (ISO string)."""
+    if not RATE_LIMIT_LOG.exists():
+        return []
+    out: list[dict] = []
+    cutoff = 0.0
+    if since_ts:
+        try:
+            cutoff = datetime.fromisoformat(since_ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    try:
+        with RATE_LIMIT_LOG.open() as f:
+            for line in f:
+                parts = line.strip().split(",", 3)
+                if len(parts) < 3:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(parts[0].replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if ts <= cutoff:
+                    continue
+                out.append({"ts": parts[0], "session_id": parts[1], "match": parts[2]})
+    except OSError:
+        pass
+    return out
+
+
+def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
+    """If there's a recent 429 since last check, force a swap on the active account.
+
+    Returns a Tier-3 SwapDecision (force) so hot_swap_orchestrate skips
+    the gentle wait-for-Stop path.
+    """
+    if not config.get("reactive", {}).get("enabled", True):
+        return None
+    watermark = state.get("last_429_check_ts")
+    fresh = _read_rate_limit_log_since(watermark)
+    if not fresh:
+        # Bump watermark to now so we don't keep scanning old entries
+        state["last_429_check_ts"] = now_iso()
+        return None
+
+    state["last_429_check_ts"] = now_iso()
+    # Only react if at least one 429 was on the active account's session
+    active = state["active"]
+    matched_session = None
+    for entry in fresh:
+        sess_log = _parse_sessions_log()
+        sess_account_map = {e["session_id"]: e["account"] for e in sess_log}
+        if sess_account_map.get(entry["session_id"]) == active:
+            matched_session = entry
+            break
+    if not matched_session:
+        return None
+
+    target = pick_swap_target(state, config)
+    if target is None:
+        click.echo(f"  429 detected on {active} session {matched_session['session_id'][:8]} but no valid swap target")
+        return None
+    return SwapDecision(
+        target=target.name,
+        reason=f"429 reactive: {matched_session['match']} in session {matched_session['session_id'][:8]}",
+        tier=3,
+    )
+
+
+def _read_recent_tool_use_for_session(session_id: str, lookback_seconds: int) -> str:
+    """Read recent tool_use.log entries for a session, formatted for inbox."""
+    if not TOOL_USE_LOG.exists():
+        return ""
+    cutoff = time.time() - lookback_seconds
+    out: list[str] = []
+    try:
+        with TOOL_USE_LOG.open() as f:
+            for line in f:
+                parts = line.strip().split(",", 3)
+                if len(parts) < 4 or parts[1] != session_id:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(parts[0].replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if ts < cutoff:
+                    continue
+                out.append(line.strip())
+    except OSError:
+        pass
+    return "\n".join(out[-20:])  # most recent 20 entries
+
+
+def shlex_quote(s: str) -> str:
+    """Shell-quote a string for use in a tmux send-text command."""
+    import shlex
+    return shlex.quote(s)
 
 
 # --------------------------------------------------------------------------
@@ -916,21 +1458,50 @@ def list_cmd() -> None:
 
 @cli.command()
 def status() -> None:
-    """Show active account and per-account usage state."""
+    """Show active account, per-account usage state, locks, and recent activity."""
     if not STATE_JSON.exists():
         click.echo("Not initialized. Run `cus init` first.")
         sys.exit(1)
 
     state = read_json(STATE_JSON)
+    config = load_config()
     click.echo(f"Active account: {state['active']}")
     click.echo()
-    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Last swap':<30}")
-    click.echo("-" * 80)
+    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
+    click.echo("-" * 104)
     for name, a in sorted(state["accounts"].items()):
         marker = " *" if name == state["active"] else ""
-        last = a["last_swap_ts"] or "never"
-        click.echo(f"{name+marker:<20} {a['current_5h_pct']:>8.1f} {a['current_7d_pct']:>8.1f} {a['next_swap_at_pct']:>12} {last:<30}")
+        last = a.get("last_swap_ts") or "never"
+        flags = []
+        if a.get("token_expired"):
+            flags.append("TOKEN_EXPIRED")
+        if a.get("rate_limited"):
+            flags.append("RATE_LIMITED")
+        if a.get("poll_error"):
+            flags.append("POLL_ERROR")
+        status_col = ",".join(flags) if flags else "ok"
+        click.echo(f"{name+marker:<20} {a.get('current_5h_pct', 0):>8.1f} {a.get('current_7d_pct', 0):>8.1f} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}")
     click.echo()
+
+    # Locks
+    pins = config.get("session_locks", {}).get("pinned", {}) or {}
+    patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
+    if pins or patterns:
+        click.echo("Locks:")
+        for k, v in pins.items():
+            click.echo(f"  pinned: {k} -> {v}")
+        for p in patterns:
+            click.echo(f"  never_restart: {p}")
+        click.echo()
+
+    # Live sessions (from sessions.log + stops.log)
+    live = find_live_sessions()
+    if live:
+        click.echo(f"Live sessions ({len(live)}):")
+        for s in live:
+            click.echo(f"  {s.session_id[:8]}  account={s.account:<10} pane={s.pane:<8} cwd={s.cwd}")
+        click.echo()
+
     history = state.get("swap_history", [])
     if history:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
@@ -1117,6 +1688,22 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         config = load_config()
         click.echo(f"[{now_iso()}] cycle start. active={state['active']}")
 
+        # 0. Reactive check — has anything 429'd since last cycle?
+        reactive_decision = check_rate_limit_reactive(state, config)
+        if reactive_decision is not None:
+            click.echo(f"  reactive (429): {reactive_decision.reason}")
+            save_state(state)
+            if no_execute:
+                click.echo("    (--no-execute) skipping reactive swap")
+            elif config.get("hot_swap", {}).get("enabled", False):
+                try:
+                    hot_swap_orchestrate(reactive_decision, state, config)
+                except NameError:
+                    execute_swap(reactive_decision.target, trigger="reactive-429")
+            else:
+                execute_swap(reactive_decision.target, trigger="reactive-429")
+            return
+
         # 1. Poll
         usage_by_account: dict[str, AccountUsage] = {}
         for name in state["accounts"]:
@@ -1233,6 +1820,116 @@ def config() -> None:
     """Print effective config (defaults merged with config.yaml)."""
     cfg = load_config()
     click.echo(yaml.safe_dump(cfg, sort_keys=True, default_flow_style=False))
+
+
+# --------------------------------------------------------------------------
+# Phase 6 commands — pin/unpin, statusline, init-systemd
+# --------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("pane_or_session")
+@click.argument("account")
+def pin(pane_or_session: str, account: str) -> None:
+    """Pin a tmux pane (e.g. %12) or session-id to a specific account.
+
+    The daemon will never swap pinned sessions during hot-swap. Useful for
+    long-running autonomous work that you want kept on one account even if
+    that account is the one we want to drain.
+
+    The pin lives in config.yaml under session_locks.pinned. Persists
+    across daemon restarts.
+    """
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    user_cfg = read_yaml(CONFIG_YAML)
+    locks = user_cfg.setdefault("session_locks", {}).setdefault("pinned", {})
+    locks[pane_or_session] = account
+    write_yaml(CONFIG_YAML, user_cfg)
+    click.echo(f"Pinned {pane_or_session} -> {account}")
+
+
+@cli.command()
+@click.argument("pane_or_session")
+def unpin(pane_or_session: str) -> None:
+    """Remove a pin from a pane or session-id."""
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    user_cfg = read_yaml(CONFIG_YAML)
+    locks = user_cfg.get("session_locks", {}).get("pinned", {}) or {}
+    if pane_or_session in locks:
+        del locks[pane_or_session]
+        write_yaml(CONFIG_YAML, user_cfg)
+        click.echo(f"Unpinned {pane_or_session}")
+    else:
+        click.echo(f"{pane_or_session} was not pinned")
+
+
+@cli.command(name="statusline")
+def statusline_cmd() -> None:
+    """One-line summary for Claude Code statusline integration.
+
+    Output format: `<account> 5h:NN% 7d:NN%` with color flags if over threshold.
+    Configure in ~/.claude/settings.json:
+      "statusLine": {"type": "command", "command": "python3 /path/to/cus.py statusline"}
+    """
+    if not STATE_JSON.exists():
+        click.echo("cus: not init")
+        return
+    state = read_json(STATE_JSON)
+    active = state.get("active", "?")
+    acct = state.get("accounts", {}).get(active, {})
+    fh = acct.get("current_5h_pct", 0)
+    sd = acct.get("current_7d_pct", 0)
+    nx = acct.get("next_swap_at_pct", 50)
+    flag = ""
+    if max(fh, sd) >= nx:
+        flag = " ⚠ "
+    elif max(fh, sd) >= nx * 0.8:
+        flag = " · "
+    click.echo(f"cus:{active}{flag}5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%")
+
+
+@cli.command(name="init-systemd")
+@click.option("--user-unit-dir", default=str(HOME / ".config/systemd/user"), help="Where to install the unit file.")
+@click.option("--enable", is_flag=True, help="Run systemctl --user enable + start after writing.")
+def init_systemd_cmd(user_unit_dir: str, enable: bool) -> None:
+    """Write a systemd --user unit file for `cus daemon`.
+
+    Walk-back: `systemctl --user disable cus.service` and delete the unit file.
+    """
+    unit_path = Path(user_unit_dir) / "cus.service"
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    cus_path = Path(__file__).resolve()
+    unit = f"""[Unit]
+Description=claude-usage-swap daemon (auto-rotate Claude Code OAuth accounts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 {cus_path} daemon --foreground
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:{DAEMON_LOG}
+StandardError=append:{DAEMON_LOG}
+
+[Install]
+WantedBy=default.target
+"""
+    atomic_write_bytes(unit_path, unit.encode())
+    click.echo(f"Wrote {unit_path}")
+    if enable:
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+            subprocess.run(["systemctl", "--user", "enable", "--now", "cus.service"], check=True)
+            click.echo("Enabled + started cus.service (user)")
+        except subprocess.SubprocessError as e:
+            click.echo(f"systemctl failed: {e}")
+            sys.exit(1)
+    else:
+        click.echo("To enable: systemctl --user daemon-reload && systemctl --user enable --now cus.service")
 
 
 if __name__ == "__main__":
