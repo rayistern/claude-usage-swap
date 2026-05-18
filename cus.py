@@ -1325,12 +1325,17 @@ def cli() -> None:
 
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Show what would happen without writing anything.")
-def init(dry_run: bool) -> None:
+@click.option("--force", is_flag=True, help="Overwrite existing account dirs (refreshes stale credential snapshots).")
+def init(dry_run: bool, force: bool) -> None:
     """Discover existing Claude config dirs and import each as an account.
 
     Idempotent: re-running skips accounts that already exist in
-    ~/claude-accounts/. The live ~/.claude/ is named "default"; sibling
-    ~/.claude-<name>/ dirs are named "<name>".
+    ~/claude-accounts/ unless --force is passed. The live ~/.claude/ is
+    named "default"; sibling ~/.claude-<name>/ dirs are named "<name>".
+
+    Use --force when your live tokens have refreshed and you want the
+    storage-side snapshot to match. Existing state.json and config.yaml
+    are preserved either way (swap_history is not lost).
     """
     candidates = discover_config_dirs()
     if not candidates:
@@ -1348,25 +1353,28 @@ def init(dry_run: bool) -> None:
         click.echo("(dry-run) Would create:")
         click.echo(f"  {ACCOUNTS_DIR}/")
         for name, _ in candidates:
-            click.echo(f"    account-{name}/credentials.json")
-            click.echo(f"    account-{name}/claude-identity.json")
-            click.echo(f"    account-{name}/meta.yaml")
-        click.echo(f"  {STATE_JSON}")
-        click.echo(f"  {CONFIG_YAML}")
+            verb = "overwrite" if (ACCOUNTS_DIR / f"account-{name}").exists() and force else "create"
+            click.echo(f"    account-{name}/credentials.json  ({verb})")
+            click.echo(f"    account-{name}/claude-identity.json  ({verb})")
+            click.echo(f"    account-{name}/meta.yaml  ({verb})")
+        click.echo(f"  {STATE_JSON}  (only if missing)")
+        click.echo(f"  {CONFIG_YAML}  (only if missing)")
         return
 
     ACCOUNTS_DIR.mkdir(exist_ok=True)
     imported = 0
     skipped = 0
+    refreshed = 0
 
     for name, src_dir in candidates:
         dst = ACCOUNTS_DIR / f"account-{name}"
-        if dst.exists():
-            click.echo(f"  skip {name}: {dst} already exists")
+        if dst.exists() and not force:
+            click.echo(f"  skip {name}: {dst} already exists (use --force to refresh)")
             skipped += 1
             continue
+        existed = dst.exists()
 
-        dst.mkdir(parents=True)
+        dst.mkdir(parents=True, exist_ok=True)
 
         # 1. Credentials — whole-file copy with 0600 permissions
         src_creds = src_dir / ".credentials.json"
@@ -1381,20 +1389,28 @@ def init(dry_run: bool) -> None:
             identity = extract_identity(cj_path)
         write_json(dst / "claude-identity.json", identity)
 
-        # 3. Meta — human-readable, editable
+        # 3. Meta — preserve user-edited fields (priority, locked_sessions),
+        # refresh the system-managed fields. Only happens on --force refresh.
+        meta_path = dst / "meta.yaml"
+        prior_meta = read_yaml(meta_path) if meta_path.exists() else {}
         oauth = identity.get("oauthAccount") or {}
         meta = {
             "name": name,
             "source_dir": str(src_dir),
             "oauth_email": oauth.get("emailAddress", "unknown") if isinstance(oauth, dict) else "unknown",
             "oauth_account_uuid": oauth.get("accountUuid", "unknown") if isinstance(oauth, dict) else "unknown",
-            "priority": 1,
-            "locked_sessions": [],
-            "imported_ts": now_iso(),
+            "priority": prior_meta.get("priority", 1),
+            "locked_sessions": prior_meta.get("locked_sessions", []),
+            "imported_ts": prior_meta.get("imported_ts", now_iso()) if existed else now_iso(),
+            "refreshed_ts": now_iso() if existed else None,
         }
         write_yaml(dst / "meta.yaml", meta)
-        click.echo(f"  imported {name} -> {dst}")
-        imported += 1
+        if existed:
+            click.echo(f"  refreshed {name} -> {dst}")
+            refreshed += 1
+        else:
+            click.echo(f"  imported {name} -> {dst}")
+            imported += 1
 
     # 4. state.json — runtime state for the (future) daemon
     if not STATE_JSON.exists():
@@ -1430,8 +1446,8 @@ def init(dry_run: bool) -> None:
         click.echo(f"  wrote {CONFIG_YAML}")
 
     click.echo()
-    click.echo(f"Done. Imported {imported}, skipped {skipped}.")
-    if imported and any(n == "default" for n, _ in candidates):
+    click.echo(f"Done. Imported {imported}, refreshed {refreshed}, skipped {skipped}.")
+    if (imported or refreshed) and any(n == "default" for n, _ in candidates):
         click.echo("Live ~/.claude/ is registered as 'default' (the currently-active account).")
 
 
