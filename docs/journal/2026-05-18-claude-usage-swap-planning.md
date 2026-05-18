@@ -78,8 +78,33 @@ print('Keys that differ:', diffs)
 
 - Plan: 1 file, ~220 lines, 6 phases + 7 open questions
 - Journal: 1 file (this one)
-- Inbox entries: 3 (1 flag + 2 decisions)
-- Research agents dispatched: 5 (2 cux/competitor surveys + 1 AIMUX mechanism + 1 deep alternatives + 1 verification of dangerouslySkipPermissions)
-- Bash inspections of local config: 4 (~/.claude/ structure, ~/.claude-merkos/ structure, credentials file structures, claude.json key list)
-- Tools used: AVC (`check_hook_status`, `start_journal`, `post_inbox_entry` ×3), TaskCreate ×5, TaskUpdate ×4, Bash, Read, Write, Edit, Agent
-- Effort estimate produced for the actual build: ~16-22 hours across Phases 1-5; ~3 hours for Phase 6 if shipped in parallel
+- Inbox entries: 5 total (1 flag + 4 ARCH/scope decisions)
+- Research agents dispatched: 6 (cux internals, cux competitors, AIMUX mechanism, deep alternatives, dangerouslySkipPermissions hook interaction, ccusage JSON format, cux OAuth API source)
+- Bash inspections of local config: 4 (~/.claude/ structure, ~/.claude-merkos/ structure, credentials file structures, claude.json key diff)
+- Tools used: AVC (`check_hook_status`, `start_journal`, `post_inbox_entry` ×5), TaskCreate ×16, TaskUpdate ×16, Bash, Read, Write, Edit, Agent
+- Commits: 4 (planning artifacts, Phase 1 init+switch, Phase 2 daemon+OAuth+hooks, Phases 3-6 hot-swap+controls)
+- Lines shipped: cus.py 1936 LOC + hooks 5×~30 LOC bash + docs (plan 202 + journal 87 + architecture 165) + README + inbox
+
+## Phase ship summary (final)
+
+All 6 phases shipped in this single session:
+
+- **Phase 1 — Foundations.** `cus init`, `cus list`, `cus status`, `cus switch`. Two-file surgical swap (`.credentials.json` whole-file + `userID`+`oauthAccount` keys in `~/.claude.json`). Atomic via tempfile+rename.
+- **Phase 2 — Auto-rotation daemon.** `cus daemon`, `cus poll`, `cus config`, `cus hooks install/uninstall/list`. Direct Anthropic OAuth usage API call (lifted from cux). Strategy picker: `lowest_usage` / `drain` / `strict_priority` / `round_robin`. Progressive per-account threshold ladder 50→75→90→100. 5 hook scripts shipped, signature-keyed installer.
+- **Phase 3 — Hot-swap Tier 1.** `find_live_sessions`, tmux integration, cache-bust window detector (5-min default), `hot_swap_orchestrate`. Live sessions waited-for-Stop, exited + relaunched via `claude --resume <id> "Continue."`.
+- **Phase 4 — Tier 2.** Pause-message injection via `tmux send-keys -l` + Enter, with configurable `pause_message` and `pause_response_timeout_seconds`.
+- **Phase 5 — Tier 3 + 429 reactive + subagent skip-guard.** `Escape` to interrupt running tools; shell context logged to `inbox.md` with walk-back. `check_rate_limit_reactive()` reads `429.log` against a watermark for sub-poll-interval reactive swaps. `subagent_active()` reads `tool_use.log` PreToolUse/SubagentStop counters.
+- **Phase 6 — Operator controls.** `cus pin/unpin` (config-driven session_locks), `cus statusline`, `cus init-systemd --enable`, enriched `cus status` output with TOKEN_EXPIRED/RATE_LIMITED/POLL_ERROR flags.
+
+Notable bug surfaced + fixed during smoke testing: HTTP 429 from the OAuth usage endpoint is *rate-limited account*, not *token expired*. Original code zeroed out `current_*_pct`, which made the strategy picker pick the rate-limited account as swap target. Fixed: 429 → set utilization to 100/100 + flag `rate_limited: true`; strategy picker filters these out. Verified live on rayi's setup (`merkos` is currently rate-limited; daemon correctly refuses to swap to it).
+
+## Hand-off — testing on real workload
+
+Before enabling hot_swap or installing hooks, the user should:
+
+1. Re-login merkos (or whichever stale account) via `CLAUDE_CONFIG_DIR=~/.claude-merkos claude` to refresh creds, then `python3 cus.py init` to re-import the fresh token.
+2. Run `python3 cus.py poll` to confirm both accounts return non-error utilization.
+3. Run `python3 cus.py daemon --once --no-execute` repeatedly to watch the decision engine react.
+4. When confident, `python3 cus.py daemon` in a dedicated tmux pane and let it run.
+5. For hot-swap testing: `python3 cus.py hooks install`, edit `~/claude-accounts/config.yaml` `hot_swap.enabled: true`, then run a real Claude Code session and force it past threshold.
+6. systemd setup once stable: `python3 cus.py init-systemd --enable`.
