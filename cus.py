@@ -727,12 +727,16 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     state["active"] = target_name
     state["accounts"][target_name]["last_swap_ts"] = ts
 
-    # Bump current account's next_swap_at_pct ladder
+    # Bump current account's next_swap_at_pct ladder using CONFIG steps.
+    # Falls back to the hardcoded default ladder if config is missing.
+    config = load_config()
+    cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    ladder = list(cfg_steps) + [100]  # 100 = force sentinel
     current_acct = state["accounts"][current]
-    cur_step = current_acct.get("next_swap_at_pct", THRESHOLD_STEPS[0])
-    next_idx = THRESHOLD_STEPS.index(cur_step) + 1 if cur_step in THRESHOLD_STEPS else len(THRESHOLD_STEPS) - 1
-    next_idx = min(next_idx, len(THRESHOLD_STEPS) - 1)
-    current_acct["next_swap_at_pct"] = THRESHOLD_STEPS[next_idx]
+    cur_step = current_acct.get("next_swap_at_pct", ladder[0])
+    # Find next step strictly greater than cur_step; if none, stay at last (force)
+    next_step = next((s for s in ladder if s > cur_step), ladder[-1])
+    current_acct["next_swap_at_pct"] = next_step
 
     state.setdefault("swap_history", []).append({
         "ts": ts, "from": current, "to": target_name, "trigger": trigger,
@@ -1116,17 +1120,31 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
 
 
 def maybe_reset_thresholds(state: dict, config: dict) -> None:
-    """Reset next_swap_at_pct to the first step when both windows are well under it.
+    """Reset next_swap_at_pct to config's first step under two conditions:
+      1. Both windows have dropped below `reset_below_pct` (window-reset case).
+      2. The current value isn't in the configured ladder (config was edited
+         since last state save) — migrate to the nearest matching step.
 
-    Without this, after a week's reset an account's ladder stays at 90 and
-    we'd never use the gentle Tier 1 again.
+    Without this, after a week's reset an account's ladder stays at 95 and
+    we'd never use the gentle Tier 1 again. AND, without the migration arm,
+    editing `thresholds.steps` in config.yaml wouldn't take effect on
+    already-populated state.
     """
+    cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    first_step = cfg_steps[0]
+    ladder = list(cfg_steps) + [100]
     reset_below = config.get("thresholds", {}).get("reset_below_pct", 50)
-    first_step = THRESHOLD_STEPS[0]
     for name, acct in state["accounts"].items():
+        cur = acct.get("next_swap_at_pct", first_step)
+        # Window-reset case
         if acct.get("current_5h_pct", 0) < reset_below and acct.get("current_7d_pct", 0) < reset_below:
-            if acct.get("next_swap_at_pct", first_step) > first_step:
+            if cur > first_step:
                 acct["next_swap_at_pct"] = first_step
+                continue
+        # Stale-config-value migration
+        if cur not in ladder:
+            # Snap to the nearest step >= current value (don't lower thresholds silently)
+            acct["next_swap_at_pct"] = next((s for s in ladder if s >= cur), first_step)
 
 
 # --------------------------------------------------------------------------
