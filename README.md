@@ -286,8 +286,10 @@ The skill orients itself first (runs `cus sos` + `cus status`), interprets your 
 ## Documentation
 
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) — day-to-day operations
+- [docs/STRATEGIES.md](docs/STRATEGIES.md) — swap strategy reference + future directions (`staggered_straddle`, `cost_aware`, `quota_predictive`, multi-machine coordination, ...)
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — SOS catalog + common issues
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — file layout, swap algorithm, state machine
+- [docs/AUDIT.md](docs/AUDIT.md) — code audit findings; known issues tracked for future work
 - [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) — PR / development guide
 - [docs/plans/](docs/plans/) — original build plan (AVC methodology)
 - [docs/journal/](docs/journal/) — session-scoped writeups

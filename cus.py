@@ -138,12 +138,25 @@ USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "poll_interval_seconds": 300,
-    "strategy": "lowest_usage",  # lowest_usage | drain | strict_priority | round_robin
+    "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
     "thresholds": {
         "steps": [50, 75, 90],   # 100 force is implicit
         "five_hour": True,       # apply progressive thresholds to 5h window
         "seven_day": True,       # apply progressive thresholds to 7d window
         "reset_below_pct": 50,   # when both windows drop below this, reset next_swap_at to first step
+    },
+    "smart_strategy": {
+        "hard_7d_cap_pct": 80,           # force-swap active when 7d crosses this; never SWAP TO an account above
+        "burn_window_hours": 2,          # if 5h resets within N hours and clock is ticking, boost score
+        "burn_soon_weight": 1.0,         # multiplier on burn-soon bonus
+        "five_hour_headroom_weight": 0.6,
+        "seven_day_headroom_weight": 0.4,
+        "cold_account_penalty": 0,       # 0 = none; >0 deprioritizes accounts with 5h=0% (clock not ticking)
+    },
+    "headroom_strategy": {
+        "hard_7d_cap_pct": 80,
+        "five_hour_weight": 0.7,
+        "seven_day_weight": 0.3,
     },
     "hot_swap": {
         "enabled": False,        # Phase 3+ — opt-in
@@ -210,6 +223,19 @@ def atomic_write_bytes(path: Path, content: bytes, mode: int = 0o644) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def atomic_copy(src: Path, dst: Path, mode: int = 0o644) -> None:
+    """Atomic file copy: read src into memory, atomic-write dst.
+
+    Avoids the partial-content window of shutil.copy2 (which writes to dst
+    in chunks; another process reading dst mid-copy sees truncated bytes).
+    Critical for ~/.claude/.credentials.json which Claude reads to decide
+    OAuth refresh — a half-written creds file would crash any session.
+    """
+    with src.open("rb") as f:
+        content = f.read()
+    atomic_write_bytes(dst, content, mode=mode)
 
 
 def read_json(path: Path) -> dict:
@@ -656,6 +682,89 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         nxt = names[(idx + 1) % len(names)]
         return SwapTarget(name=nxt, reason="round_robin")
 
+    if strategy == "headroom":
+        # Weighted score of 5h + 7d headroom, with hard 7d cap filter.
+        # See docs/STRATEGIES.md for the design rationale.
+        cfg = config.get("headroom_strategy", {})
+        hard_7d = cfg.get("hard_7d_cap_pct", 80)
+        w5 = cfg.get("five_hour_weight", 0.7)
+        w7 = cfg.get("seven_day_weight", 0.3)
+
+        # Hard 7d cap: among candidates, prefer those below cap. If ALL are
+        # at/over cap, fall back to all (we have to swap somewhere).
+        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+        pool = safe_7d if safe_7d else candidates
+
+        def score(acct: dict) -> float:
+            return (100 - acct.get("current_5h_pct", 0.0)) * w5 + (100 - acct.get("current_7d_pct", 0.0)) * w7
+
+        pool.sort(key=lambda kv: -score(kv[1]))
+        chosen, chosen_acct = pool[0]
+        s = score(chosen_acct)
+        note = "" if safe_7d else f" (no 7d-safe targets — best of {len(candidates)})"
+        return SwapTarget(name=chosen, reason=f"headroom: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={s:.1f}{note}")
+
+    if strategy == "smart":
+        # Smart strategy designed for: never go over 80% 7d; route on 5h
+        # dynamics; prefer "burn-before-reset" candidates (those whose 5h
+        # window will reset soon — using them now means we don't waste
+        # remaining capacity). See docs/STRATEGIES.md for the design.
+        cfg = config.get("smart_strategy", {})
+        hard_7d = cfg.get("hard_7d_cap_pct", 80)
+        burn_window_hours = cfg.get("burn_window_hours", 2)
+        burn_soon_weight = cfg.get("burn_soon_weight", 1.0)
+        w5 = cfg.get("five_hour_headroom_weight", 0.6)
+        w7 = cfg.get("seven_day_headroom_weight", 0.4)
+        cold_penalty = cfg.get("cold_account_penalty", 0)  # 0 = no penalty (default)
+
+        # Hard 7d cap filter (same as headroom)
+        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+        pool = safe_7d if safe_7d else candidates
+
+        def smart_score(acct: dict) -> tuple[float, str]:
+            h5 = acct.get("current_5h_pct", 0.0)
+            h7 = acct.get("current_7d_pct", 0.0)
+            reset_at = acct.get("five_hour_resets_at")
+
+            s = (100 - h5) * w5 + (100 - h7) * w7
+            reasons: list[str] = []
+
+            # Burn-soon bonus: if 5h clock is ticking AND reset is within
+            # burn_window, prefer this account (use capacity before reset
+            # would have "wasted" it). KEY INSIGHT: when 5h is at 0%, the
+            # clock isn't ticking — there's no reset deadline.
+            if h5 > 0 and reset_at:
+                try:
+                    reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                    time_to_reset_s = (reset_dt - datetime.now(timezone.utc)).total_seconds()
+                    if 0 < time_to_reset_s < burn_window_hours * 3600:
+                        # bonus is bigger when reset is sooner
+                        bonus = (burn_window_hours * 3600 - time_to_reset_s) / 60  # in minutes
+                        bonus *= burn_soon_weight
+                        s += bonus
+                        reasons.append(f"burn-soon(+{bonus:.0f}, resets in {time_to_reset_s/60:.0f}min)")
+                except (ValueError, AttributeError, TypeError):
+                    pass
+
+            # Cold-account penalty: deprioritize accounts with 5h=0% if
+            # configured (so we don't always pick the "freshest" — useful
+            # for the future "straddle" strategy where you want a mix of
+            # warm/cold accounts).
+            if h5 == 0.0 and cold_penalty:
+                s -= cold_penalty
+                reasons.append(f"cold-penalty(-{cold_penalty})")
+
+            return s, " ".join(reasons) if reasons else "(headroom only)"
+
+        scored = [(n, a, *smart_score(a)) for n, a in pool]
+        scored.sort(key=lambda x: -x[2])
+        chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
+        note = "" if safe_7d else f" [no 7d-safe targets — best of {len(candidates)}]"
+        return SwapTarget(
+            name=chosen,
+            reason=f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={chosen_score:.1f} {chosen_reasons}{note}",
+        )
+
     return None
 
 
@@ -710,8 +819,7 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         existing = {}
     existing.update(current_identity)
     write_json(current_dir / ".claude.json", existing)
-    shutil.copy2(CREDS_JSON, current_dir / ".credentials.json")
-    os.chmod(current_dir / ".credentials.json", 0o600)
+    atomic_copy(CREDS_JSON, current_dir / ".credentials.json", mode=0o600)
 
     # Merge target's account-bound keys into live ~/.claude.json
     target_account_cj = read_json(target_cj)
@@ -719,8 +827,7 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     for k, v in target_identity.items():
         live_cj[k] = v
     write_json(CLAUDE_JSON, live_cj)
-    shutil.copy2(target_creds, CREDS_JSON)
-    os.chmod(CREDS_JSON, 0o600)
+    atomic_copy(target_creds, CREDS_JSON, mode=0o600)
 
     # Update state with progressive-threshold bookkeeping
     ts = now_iso()
@@ -883,19 +990,46 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 
     Returns None if no action needed. Otherwise a SwapDecision with target
     + tier the caller should respect.
+
+    Two trigger paths:
+      1. **Hard 7d cap**: when the active account's 7d utilization exceeds
+         the config'd `smart_strategy.hard_7d_cap_pct` (default 80%), trigger
+         IMMEDIATELY regardless of the progressive threshold ladder. This
+         is the user-stated invariant: "never go over 80% of 7 day usage."
+      2. **Progressive threshold ladder**: the standard path. Trigger when
+         current max(5h, 7d) crosses the active account's next_swap_at_pct.
     """
     current = state.get("active")
     if not current:
         return None
 
     active_acct = state["accounts"][current]
-    threshold = active_acct.get("next_swap_at_pct", THRESHOLD_STEPS[0])
-    if threshold >= 100:  # forced: any usage trips
-        threshold = 0
-
     cur_usage = usage_by_account.get(current)
     if cur_usage is None:
         return None
+
+    # Trigger 1: hard 7d cap.
+    # Active strategy must support this; smart and headroom do via their
+    # respective config blocks. Other strategies pick up the default 80%.
+    strategy_cfg = config.get(f"{config.get('strategy', '')}_strategy", {})
+    hard_7d_cap = strategy_cfg.get("hard_7d_cap_pct") or config.get("smart_strategy", {}).get("hard_7d_cap_pct", 80)
+    cur_7d = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
+    if cur_7d >= hard_7d_cap:
+        target = pick_swap_target(state, config)
+        if target is None:
+            return None
+        return SwapDecision(
+            target=target.name,
+            reason=f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}",
+            tier=determine_tier(active_acct, config),
+        )
+
+    # Trigger 2: progressive ladder.
+    cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    threshold = active_acct.get("next_swap_at_pct", cfg_steps[0])
+    if threshold >= 100:  # force sentinel: any usage trips
+        threshold = 0
+
     cur_pct = current_max_pct(cur_usage, config)
     if cur_pct < threshold:
         return None
@@ -903,7 +1037,11 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     target = pick_swap_target(state, config)
     if target is None:
         return None
-    return SwapDecision(target=target.name, reason=f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%", tier=determine_tier(active_acct, config))
+    return SwapDecision(
+        target=target.name,
+        reason=f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%",
+        tier=determine_tier(active_acct, config),
+    )
 
 
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
@@ -1906,24 +2044,18 @@ def status() -> None:
 def switch(target: str, dry_run: bool, trigger: str) -> None:
     """Atomically swap to a different account.
 
-    Sequence (verified in docs/ARCHITECTURE.md):
-      1. Read current live ~/.claude.json (abort if unparseable).
-      2. Save current account's identity back to its account dir.
-      3. Save current credentials back to its account dir.
-      4. Merge target's identity into live ~/.claude.json.
-      5. Replace live ~/.claude/.credentials.json with target's.
-      6. Update state.json.
+    Delegates to execute_swap() which is the same primitive the daemon uses.
+    Both paths use atomic_copy / atomic_write_bytes for all credential
+    writes — no partial-content window readable by Claude mid-swap.
 
-    Any failure between steps 4 and 5 leaves a window where credentials and
-    identity disagree. Mitigation: steps 4 and 5 use atomic rename, and an
-    error in step 5 leaves step 4's write reversible by re-running
-    `cus switch <original>`.
+    Walk-back: a single failed swap is rewound by `cus switch <previous>`.
+    Every swap is appended to state.json's swap_history.
     """
     if not STATE_JSON.exists():
         click.echo("Not initialized. Run `cus init` first.")
         sys.exit(1)
 
-    state = read_json(STATE_JSON)
+    state = load_state()
     if target not in state["accounts"]:
         click.echo(f"Unknown account '{target}'. Known: {sorted(state['accounts'].keys())}")
         sys.exit(1)
@@ -1936,67 +2068,39 @@ def switch(target: str, dry_run: bool, trigger: str) -> None:
     target_dir = ACCOUNTS_DIR / f"account-{target}"
     current_dir = ACCOUNTS_DIR / f"account-{current}"
 
-    if not (target_dir / "credentials.json").exists():
-        click.echo(f"ERROR: {target_dir}/credentials.json is missing. Re-run `cus init`.")
-        sys.exit(1)
-    if not (target_dir / "claude-identity.json").exists():
-        click.echo(f"ERROR: {target_dir}/claude-identity.json is missing. Re-run `cus init`.")
-        sys.exit(1)
-
-    # Sanity-check live ~/.claude.json is parseable BEFORE doing anything destructive
-    try:
-        live_cj = read_json(CLAUDE_JSON)
-    except json.JSONDecodeError as e:
-        click.echo(f"ERROR: {CLAUDE_JSON} is unparseable ({e}). Aborting.")
-        click.echo("This usually means Claude is mid-write. Wait 1 second and retry.")
-        sys.exit(2)
-
-    target_identity = read_json(target_dir / "claude-identity.json")
-
     if dry_run:
+        target_cj_path = target_dir / ".claude.json"
+        target_creds_path = target_dir / ".credentials.json"
+        if not target_creds_path.exists() or not target_cj_path.exists():
+            click.echo(f"ERROR: Required files missing in {target_dir}. Re-run `cus init --force`.")
+            sys.exit(1)
+        try:
+            live_cj = read_json(CLAUDE_JSON)
+        except json.JSONDecodeError as e:
+            click.echo(f"ERROR: {CLAUDE_JSON} is unparseable ({e}). Aborting.")
+            sys.exit(2)
+        target_account_cj = read_json(target_cj_path)
+        target_identity = {k: target_account_cj[k] for k in ACCOUNT_BOUND_KEYS if k in target_account_cj}
         click.echo(f"(dry-run) Swap plan: {current} -> {target}")
-        click.echo(f"  1. Save current identity from ~/.claude.json into {current_dir}/claude-identity.json")
+        click.echo(f"  1. Save current identity from ~/.claude.json into {current_dir}/.claude.json")
         for k in ACCOUNT_BOUND_KEYS:
             if k in live_cj:
                 preview = json.dumps(live_cj[k])[:60]
                 click.echo(f"       {k}: {preview}...")
-        click.echo(f"  2. Save current credentials from {CREDS_JSON} into {current_dir}/credentials.json")
+        click.echo(f"  2. Save current credentials from {CREDS_JSON} into {current_dir}/.credentials.json")
         click.echo(f"  3. Merge into live ~/.claude.json:")
         for k, v in target_identity.items():
             preview = json.dumps(v)[:60]
             click.echo(f"       {k}: {preview}...")
-        click.echo(f"  4. Replace live {CREDS_JSON} with {target_dir}/credentials.json")
+        click.echo(f"  4. Replace live {CREDS_JSON} with {target_dir}/.credentials.json")
         click.echo(f"  5. Mark state.json active = {target}")
         return
 
-    # 1. Save current identity
-    current_identity = {k: live_cj[k] for k in ACCOUNT_BOUND_KEYS if k in live_cj}
-    write_json(current_dir / "claude-identity.json", current_identity)
-
-    # 2. Save current credentials
-    shutil.copy2(CREDS_JSON, current_dir / "credentials.json")
-    os.chmod(current_dir / "credentials.json", 0o600)
-
-    # 3. Merge target identity into live ~/.claude.json
-    for k, v in target_identity.items():
-        live_cj[k] = v
-    write_json(CLAUDE_JSON, live_cj)
-
-    # 4. Replace live credentials.json
-    shutil.copy2(target_dir / "credentials.json", CREDS_JSON)
-    os.chmod(CREDS_JSON, 0o600)
-
-    # 5. Update state.json (atomic)
-    ts = now_iso()
-    state["active"] = target
-    state["accounts"][target]["last_swap_ts"] = ts
-    state.setdefault("swap_history", []).append({
-        "ts": ts,
-        "from": current,
-        "to": target,
-        "trigger": trigger,
-    })
-    write_json(STATE_JSON, state)
+    try:
+        execute_swap(target, trigger=trigger)
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        click.echo(f"ERROR: {e}")
+        sys.exit(1)
 
     click.echo(f"Swapped: {current} -> {target}")
     click.echo(f"  ~/.claude.json: userID + oauthAccount updated")
@@ -2224,9 +2328,11 @@ def hooks_list_cmd() -> None:
 
 CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
-    "poll_interval_seconds": "How often the daemon calls Anthropic's OAuth usage endpoint per account. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 300 (5 min) is the recommended default.",
-    "strategy": "Swap target picker. `lowest_usage` picks the account with the lowest 7d util (cux's 'balanced'). `drain` deplete-current. `strict_priority` respects priority order. `round_robin` cycles by name.",
-    "thresholds": "Progressive per-account thresholds. `steps: [50, 75, 90]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
+    "poll_interval_seconds": "How often the daemon calls Anthropic's OAuth usage endpoint per account. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default.",
+    "strategy": "Swap target picker — see docs/STRATEGIES.md. `smart` (recommended): hard 7d cap + burn-before-reset for 5h windows about to expire. `headroom`: weighted 5h+7d score with hard 7d cap. `lowest_usage`: cux balanced — sort by 7d util only. `drain`: deplete-current. `strict_priority`: priority order. `round_robin`: cycle by name.",
+    "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
+    "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
+    "thresholds": "Progressive per-account thresholds. `steps: [70, 85, 95]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 defer when subagent active; Tier 3 (force) proceeds regardless.",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
