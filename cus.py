@@ -2284,17 +2284,27 @@ def check_orchestrate_cmd(target: str | None) -> None:
             click.echo(f"    would: orchestrate")
 
     click.echo()
-    # Show planned relaunch commands
+    # Show planned relaunch commands — honor the same config knobs the
+    # orchestrator uses.
     flags = hot.get("relaunch_flags", "").strip()
     flag_part = f" {flags}" if flags else ""
+    use_resume = hot.get("relaunch_with_resume", True)
+    wake = hot.get("wake_up_message", "").strip()
+    wake_part = f" {shlex.quote(wake)}" if wake else ""
     click.echo(click.style("Planned relaunch commands (would be typed via `tmux send-keys`):", bold=True))
     for s in live_panes:
         pinned, _ = session_is_pinned(s, config)
         wl, _ = session_matches_whitelist(s, config)
         if pinned or wl:
             continue
-        cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}"
+        if use_resume:
+            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}{wake_part}"
+        else:
+            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part}{wake_part}"
         click.echo(f"  pane {s.pane}: {cmd}")
+    if not use_resume:
+        click.echo()
+        click.echo(click.style("  (relaunch_with_resume: false → no --resume; fresh sessions)", fg="yellow"))
     click.echo()
     click.echo(click.style("Tier-by-tier preview (assumes default's next_swap_at_pct → tier):", bold=True))
     active_acct = state.get("accounts", {}).get(current, {})
