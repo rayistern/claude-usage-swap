@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -159,7 +160,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seven_day_weight": 0.3,
     },
     "hot_swap": {
-        "enabled": False,        # Phase 3+ — opt-in
+        "enabled": False,        # Phase 3+ — opt-in. Smoke-test before enabling (see 2026-05-19 incident notes).
         "tier_2_at_pct": 75,
         "tier_3_at_pct": 90,
         "pause_message": (
@@ -167,11 +168,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "accounts to avoid hitting the usage cap. You'll resume on the "
             "other side; finish what you're saying briefly and stop."
         ),
-        "wake_up_message": "Continue where you left off.",
+        # wake_up_message: kept in config for backward-compat but NOT sent
+        # as a positional arg after 2026-05-19 rewrite — the positional
+        # became a billed first user message + triggered Stop hook fire.
+        "wake_up_message": "",
         "cache_bust_window_seconds": 300,   # defer Tier 1 swap if last msg < this old
         "mid_turn_idle_seconds": 30,        # session counted idle if no JSONL line in N s
         "stop_wait_timeout_seconds": 300,   # Tier 1 max wait for Stop signal
         "pause_response_timeout_seconds": 120,  # Tier 2 wait after pause-message
+        "shell_return_timeout_seconds": 10, # poll pane_current_command after /exit, up to N seconds
+        # Flags passed to relaunched `claude` invocation. Empty by default;
+        # set to "--dangerously-skip-permissions" if that's how you normally
+        # run claude. Space-separated string; passed as-is to the shell.
+        "relaunch_flags": "",
     },
     "subagent_skip": {
         "enabled": True,
@@ -1612,127 +1621,258 @@ def session_is_idle(session: LiveSession, idle_seconds: int) -> bool:
         return False
 
 
+def find_live_panes(account_filter: str | None = None) -> list[LiveSession]:
+    """One LiveSession entry per tmux pane currently running claude.
+
+    Differs from `find_live_sessions` (which dedups by session_id) — that
+    function will return N entries for a pane that's had N historical
+    claude invocations. For hot-swap, we want EXACTLY one entry per pane,
+    using the pane's MOST RECENT session_id.
+
+    The post-mortem on the 2026-05-19 hot-swap incident showed why this
+    matters: orchestrator iterated find_live_sessions and typed N relaunch
+    commands into the same pane with stale session-ids, none matching the
+    one currently running. See docs/AUDIT.md item 11 and inbox.md.
+
+    For each candidate pane:
+      1. Read sessions.log entries, group by pane, take latest per pane.
+      2. Account filter: drop panes whose latest session is on a different
+         account than `account_filter`.
+      3. Verify pane still exists in tmux (it may have been closed).
+      4. Verify pane's current command is claude/node (i.e. claude is
+         actually running there — not back to shell from a manual /exit).
+      5. Optional liveness signal: recent Stop or recent transcript mtime.
+    """
+    entries = _parse_sessions_log()
+    latest_stops = _latest_stops_per_session()
+    now = datetime.now(timezone.utc)
+
+    # Group by pane; latest entry overwrites (entries are oldest-first).
+    by_pane: dict[str, dict] = {}
+    for e in entries:
+        pane = e.get("pane", "")
+        if not pane or pane == "no-tmux":
+            continue
+        by_pane[pane] = e
+
+    out: list[LiveSession] = []
+    for pane, e in by_pane.items():
+        if account_filter and e["account"] != account_filter:
+            continue
+        if not tmux_pane_exists(pane):
+            continue
+        pane_cmd = tmux_pane_name(pane)
+        if pane_cmd not in ("claude", "node"):
+            # Pane is back to shell (or running something else). No live claude.
+            continue
+
+        sid = e["session_id"]
+        transcript = _find_transcript(sid, e.get("cwd", ""))
+        last_stop_at = latest_stops.get(sid)
+
+        # Liveness double-check — even though we confirmed pane_current_command
+        # is claude/node, also require some recent (within 1h) signal of life.
+        # This catches the case where claude is wedged or frozen.
+        is_live = False
+        if last_stop_at:
+            try:
+                last_stop_dt = datetime.fromisoformat(last_stop_at.replace("Z", "+00:00"))
+                if (now - last_stop_dt).total_seconds() < 3600:
+                    is_live = True
+            except ValueError:
+                pass
+        if transcript and transcript.exists():
+            mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+            if (now - mtime).total_seconds() < 3600:
+                is_live = True
+        # If pane_current_command says claude but no recent activity, still
+        # treat as live — better to attempt orchestration on a quiet pane
+        # than to skip it and leave it stuck on the old account.
+        if not is_live:
+            is_live = True  # pane_cmd already confirmed claude is up
+
+        out.append(LiveSession(
+            session_id=sid,
+            account=e["account"],
+            pane=pane,
+            cwd=e["cwd"],
+            started_at=e["ts"],
+            last_stop_at=last_stop_at,
+            transcript_path=transcript,
+        ))
+    return out
+
+
+def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25) -> bool:
+    """Poll until the tmux pane's current command is no longer claude/node.
+
+    Replaces the original hard-coded `time.sleep(2)` between /exit and the
+    relaunch command. The fixed sleep was too short on slow machines (claude
+    hadn't exited yet) — the relaunch text got typed INTO the still-loading
+    claude TUI. Polling pane_current_command instead waits exactly long
+    enough for the actual transition.
+
+    Returns True if pane returned to shell within timeout, False on timeout.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        cmd = tmux_pane_name(pane)
+        if cmd not in ("claude", "node", ""):
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
 def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> None:
-    """Hot-swap orchestrator. Called by daemon when config.hot_swap.enabled=true.
+    """Hot-swap orchestrator (rewritten 2026-05-19 after the find_live_sessions incident).
+
+    Per-pane iteration (not per-session-id), drops the wake-up positional
+    arg, polls pane_current_command instead of sleeping, optionally passes
+    relaunch flags (--dangerously-skip-permissions etc.).
 
     Sequence:
-      1. Enumerate live sessions on the swap-out account.
-      2. Filter: skip pinned, whitelisted, no-tmux sessions.
-      3. Subagent skip-guard: if any swappable session has active subagent
-         AND tier < config.subagent_skip.defer_below_tier, defer the swap.
-      4. Cache-bust window: if tier == 1 and ANY session has warm cache,
-         defer.
-      5. Tier-specific action (per session):
-         - Tier 1: wait_for_stop with config timeout, exit + relaunch.
-         - Tier 2: send pause-message, wait for resulting Stop, exit + relaunch.
-         - Tier 3: send Escape (interrupt running tool), log shells to inbox,
-           exit + relaunch.
-      6. After all sessions exited, call execute_swap.
-      7. Relaunch each session via `claude --resume <id> "Continue."`.
+      1. Enumerate panes with live claude on the swap-out account.
+      2. Filter: skip pinned panes, whitelist-matched panes.
+      3. Subagent skip-guard: defer if any pane has active subagent and
+         tier < config.subagent_skip.defer_below_tier.
+      4. Cache-bust window (Tier 1 only, non-idle panes only): defer if any
+         pane is mid-turn AND its transcript was written < cache_bust_window
+         seconds ago (cache still warm — swap would burn rebuild cost).
+      5. Per-tier prep (per pane):
+         - Tier 1: if idle, no-op (already at turn boundary); else wait_for_stop.
+         - Tier 2: inject pause-message, wait for resulting Stop.
+         - Tier 3: double-Escape to interrupt running tool, log shell context.
+      6. /exit each pane's claude.
+      7. Poll each pane until its current command is back to shell (replaces
+         the prior hard-coded sleep(2) which raced).
+      8. Atomic credential swap.
+      9. Per-pane relaunch: `cd <cwd> && claude [relaunch_flags] --resume <id>`.
+         No positional wake-up message (that previously became a billed first
+         user prompt + triggered Stop hook).
 
-    Sessions running outside tmux (pane='no-tmux') are SKIPPED — we can't
-    drive them. They'll keep running on the old account until they exit
-    naturally and the user restarts; at that point the wrapper picks up
-    the new active account.
+    Hot-swap remains disabled by default (`hot_swap.enabled: false`) until the
+    user explicitly opts in. Even after the rewrite, smoke-test on a single
+    pane before scaling up.
     """
     current = state["active"]
     hot = config.get("hot_swap", {})
     tier = decision.tier
 
-    live = find_live_sessions(account_filter=current)
-    click.echo(f"  hot_swap: {len(live)} live session(s) on {current}")
+    live_panes = find_live_panes(account_filter=current)
+    click.echo(f"  hot_swap: {len(live_panes)} pane(s) with live claude on {current}")
 
     swappable: list[LiveSession] = []
-    for s in live:
+    for s in live_panes:
         pinned, reason = session_is_pinned(s, config)
         if pinned:
-            click.echo(f"    skip {s.session_id[:8]} ({reason})")
+            click.echo(f"    skip pane {s.pane} ({reason})")
             continue
         wl, reason = session_matches_whitelist(s, config)
         if wl:
-            click.echo(f"    skip {s.session_id[:8]} ({reason})")
-            continue
-        if s.pane == "no-tmux" or not tmux_pane_exists(s.pane):
-            click.echo(f"    skip {s.session_id[:8]} (no tmux pane — cannot drive)")
+            click.echo(f"    skip pane {s.pane} ({reason})")
             continue
         swappable.append(s)
 
-    # Subagent skip-guard
+    if not swappable:
+        # No live tmux panes to orchestrate — just swap creds. Sessions outside
+        # tmux (or no-claude panes) are unaffected.
+        click.echo(f"    no swappable panes; doing simple cred swap")
+        execute_swap(decision.target, trigger=f"auto-tier{tier}-simple")
+        return
+
+    # Subagent skip-guard (per-pane)
     if config.get("subagent_skip", {}).get("enabled", True):
         defer_below = config["subagent_skip"].get("defer_below_tier", 3)
         if tier < defer_below:
             for s in swappable:
                 if subagent_active(s, config):
-                    click.echo(f"    DEFER: subagent active in {s.session_id[:8]} (tier={tier} < defer_below={defer_below})")
+                    click.echo(f"    DEFER: subagent active in pane {s.pane} (session {s.session_id[:8]}); tier={tier} < {defer_below}")
                     return
 
-    # Cache-bust window — Tier 1 only, AND only for non-idle sessions.
-    # If a session is idle (no JSONL writes in mid_turn_idle_seconds), its
-    # cache will go cold by the time the user types next — no cost to swap
-    # now. Only ACTIVE sessions with warm cache are worth deferring for.
+    # Cache-bust window (Tier 1 only, non-idle panes only)
     if tier == 1:
         window = hot.get("cache_bust_window_seconds", 300)
         idle_seconds = hot.get("mid_turn_idle_seconds", 30)
         for s in swappable:
             if session_is_idle(s, idle_seconds):
-                continue  # idle session — its cache cost is hypothetical
+                continue
             if s.transcript_path and cache_warm(s.transcript_path, window):
-                click.echo(f"    DEFER: cache warm for active session {s.session_id[:8]} (Tier 1 swap would burn cache)")
+                click.echo(f"    DEFER: cache warm for active pane {s.pane} (Tier 1 swap would burn cache)")
                 return
 
-    # Per-tier pause behavior
+    # Per-tier prep
     for s in swappable:
         if tier == 2:
-            click.echo(f"    {s.session_id[:8]}: injecting pause-message")
+            click.echo(f"    pane {s.pane}: injecting pause-message")
             tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
             ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
             if not ok:
                 click.echo(f"      timed out waiting for Stop; proceeding anyway")
         elif tier == 3:
-            click.echo(f"    {s.session_id[:8]}: force interrupt (Escape)")
+            click.echo(f"    pane {s.pane}: force interrupt (double Escape)")
+            # Single Escape may not interrupt — Claude's TUI sometimes needs
+            # two to dismiss running tool calls.
+            tmux_send_keys(s.pane, "Escape")
+            time.sleep(0.3)
             tmux_send_keys(s.pane, "Escape")
             time.sleep(0.5)
-            # Log shell context to inbox so user can recover any in-flight work
             shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
             if shell_note:
                 append_inbox(
                     "deviation",
-                    f"Force-interrupted session {s.session_id[:8]} (tier 3, threshold {decision.tier})",
-                    f"Account `{current}` was force-swapped to `{decision.target}` while session had active tool calls:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` if you'd rather keep going on the original account.",
+                    f"Force-interrupted pane {s.pane} (tier 3)",
+                    f"Account `{current}` was force-swapped to `{decision.target}` while pane {s.pane} (session {s.session_id[:8]}) had active tool calls:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` to go back to the original.",
                 )
         else:  # tier 1
             idle_seconds = hot.get("mid_turn_idle_seconds", 30)
             if session_is_idle(s, idle_seconds):
-                # Session is between turns — no Stop will fire until user
-                # types again. Don't wait; swap immediately.
-                click.echo(f"    {s.session_id[:8]}: idle (>{idle_seconds}s since last activity); swapping immediately")
+                click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — already at turn boundary, no wait")
             else:
-                click.echo(f"    {s.session_id[:8]}: mid-turn — waiting for natural Stop (up to {hot.get('stop_wait_timeout_seconds', 300)}s)")
-                ok = wait_for_stop(s.session_id, hot.get("stop_wait_timeout_seconds", 300))
+                stop_timeout = hot.get("stop_wait_timeout_seconds", 300)
+                click.echo(f"    pane {s.pane}: mid-turn — waiting for Stop (up to {stop_timeout}s)")
+                ok = wait_for_stop(s.session_id, stop_timeout)
                 if not ok:
-                    click.echo(f"      timed out; aborting hot-swap (will retry next cycle)")
+                    click.echo(f"      timed out; aborting (will retry next cycle)")
                     return
 
-    # All swappable sessions are now at a turn boundary (or force-interrupted).
-    # Exit each pane's claude process.
+    # /exit each pane
     for s in swappable:
-        click.echo(f"    {s.session_id[:8]}: sending /exit to pane {s.pane}")
+        click.echo(f"    pane {s.pane}: /exit")
         tmux_send_text(s.pane, "/exit")
-        time.sleep(0.5)
 
-    # Wait briefly for processes to die before swapping files
-    time.sleep(2)
+    # Poll each pane until shell prompt is back. Replaces the original
+    # sleep(2) which raced — claude wasn't always done exiting when the
+    # relaunch command got typed, so the relaunch ended up as text INSIDE
+    # the still-loading new claude.
+    shell_timeout = hot.get("shell_return_timeout_seconds", 10)
+    panes_ready: list[LiveSession] = []
+    for s in swappable:
+        if wait_for_shell(s.pane, timeout_seconds=shell_timeout):
+            panes_ready.append(s)
+        else:
+            click.echo(f"    WARN: pane {s.pane} didn't return to shell in {shell_timeout}s; skipping relaunch")
 
-    # Actually swap the credentials
+    if not panes_ready:
+        click.echo(f"    no panes reached shell prompt; doing cred swap only (no relaunch)")
+        execute_swap(decision.target, trigger=f"auto-tier{tier}-noreloaunch")
+        return
+
+    # Atomic credential swap
     execute_swap(decision.target, trigger=f"auto-tier{tier}")
 
-    # Relaunch each session with --resume
-    wake_msg = hot.get("wake_up_message", "Continue.")
-    for s in swappable:
-        click.echo(f"    {s.session_id[:8]}: relaunching with --resume")
-        # Construct the command. Use sh -c so we can cd to the cwd first.
-        # The wake message is a positional argument to `claude`, per cux's pattern.
-        cmd = f"cd {shlex_quote(s.cwd)} && claude --resume {shlex_quote(s.session_id)} {shlex_quote(wake_msg)}"
+    # Per-pane relaunch — no positional wake-up. The original "Continue
+    # where you left off." positional caused: (a) Claude to respond
+    # (Opus, billed), (b) validator Stop hook to fire (Haiku, billed).
+    # With no wake-up, the relaunched claude opens at empty prompt; user
+    # types whatever they want next (cost: zero).
+    #
+    # relaunch_flags lets the user inject `--dangerously-skip-permissions`
+    # etc. via config — defaults to empty (no flags) for safety.
+    flags = hot.get("relaunch_flags", "").strip()
+    flag_part = f" {flags}" if flags else ""
+    for s in panes_ready:
+        cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}"
+        click.echo(f"    pane {s.pane}: relaunch → {cmd}")
         tmux_send_text(s.pane, cmd)
 
 
@@ -2073,6 +2213,84 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+@cli.command(name="check-orchestrate")
+@click.option("--target", default=None, help="Pretend we're swapping to this account (for relaunch-command preview).")
+def check_orchestrate_cmd(target: str | None) -> None:
+    """Dry-run the hot-swap orchestrator. PRINTS what would happen without doing it.
+
+    Use BEFORE enabling `hot_swap.enabled: true` to verify:
+      - The right tmux panes are detected as having live claude
+      - The session-id for each pane matches what you expect (most recent
+        SessionStart per pane, not stale from earlier claude runs)
+      - The relaunch command is what you want (especially `relaunch_flags`)
+
+    After the 2026-05-19 incident, this is the safe way to validate
+    orchestrator behavior on your real setup before letting the daemon
+    do it autonomously.
+    """
+    state = load_state() if STATE_JSON.exists() else {"active": None, "accounts": {}}
+    config = load_config()
+    current = state.get("active") or "(no active)"
+    hot = config.get("hot_swap", {})
+
+    click.echo(click.style(f"Hot-swap dry-run for active account: {current}", bold=True))
+    click.echo()
+
+    live_panes = find_live_panes(account_filter=current if current != "(no active)" else None)
+    click.echo(f"Detected {len(live_panes)} pane(s) with live claude on {current}:")
+    if not live_panes:
+        click.echo("  (none — orchestrator would do simple cred swap with no relaunch)")
+        return
+    for s in live_panes:
+        pane_cmd = tmux_pane_name(s.pane)
+        idle = session_is_idle(s, hot.get("mid_turn_idle_seconds", 30))
+        pinned, pin_reason = session_is_pinned(s, config)
+        wl, wl_reason = session_matches_whitelist(s, config)
+        click.echo(f"  pane {s.pane}:")
+        click.echo(f"    session_id: {s.session_id}")
+        click.echo(f"    cwd: {s.cwd}")
+        click.echo(f"    pane_current_command: {pane_cmd}")
+        click.echo(f"    started_at: {s.started_at}")
+        click.echo(f"    last_stop_at: {s.last_stop_at or '(never)'}")
+        click.echo(f"    idle (>{hot.get('mid_turn_idle_seconds', 30)}s since transcript write): {idle}")
+        if pinned:
+            click.echo(f"    PINNED: {pin_reason} → would SKIP")
+        if wl:
+            click.echo(f"    WHITELISTED: {wl_reason} → would SKIP")
+        if not pinned and not wl:
+            click.echo(f"    would: orchestrate")
+
+    click.echo()
+    # Show planned relaunch commands
+    flags = hot.get("relaunch_flags", "").strip()
+    flag_part = f" {flags}" if flags else ""
+    click.echo(click.style("Planned relaunch commands (would be typed via `tmux send-keys`):", bold=True))
+    for s in live_panes:
+        pinned, _ = session_is_pinned(s, config)
+        wl, _ = session_matches_whitelist(s, config)
+        if pinned or wl:
+            continue
+        cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}"
+        click.echo(f"  pane {s.pane}: {cmd}")
+    click.echo()
+    click.echo(click.style("Tier-by-tier preview (assumes default's next_swap_at_pct → tier):", bold=True))
+    active_acct = state.get("accounts", {}).get(current, {})
+    inferred_tier = determine_tier(active_acct, config) if active_acct else 1
+    click.echo(f"  inferred tier: {inferred_tier}")
+    if inferred_tier == 1:
+        click.echo("    Tier 1: idle panes → swap immediately; mid-turn panes → wait_for_stop")
+    elif inferred_tier == 2:
+        click.echo("    Tier 2: inject pause_message via tmux send-keys, then wait_for_stop")
+    elif inferred_tier == 3:
+        click.echo("    Tier 3: double-Escape to interrupt running tool, log shells to inbox.md")
+
+    if not hot.get("enabled", False):
+        click.echo()
+        click.echo(click.style("Note: hot_swap.enabled is FALSE in your config.", fg="yellow"))
+        click.echo("The above is purely a preview. The daemon will not execute orchestration.")
+        click.echo("To enable: edit ~/claude-accounts/config.yaml → hot_swap.enabled: true")
 
 
 @cli.command(name="auto-swap")

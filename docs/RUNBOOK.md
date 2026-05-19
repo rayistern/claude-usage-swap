@@ -81,6 +81,51 @@ session_locks:
 
 Matching panes are skipped during hot-swap (the daemon doesn't `/exit` and relaunch them).
 
+## Hot-swap (Level 4) — opt-in, smoke-test first
+
+Hot-swap of live sessions is **disabled by default** since the 2026-05-19 incident. The orchestrator was rewritten on the same day with 4 fixes; verify on your setup before enabling.
+
+Steps to safely enable:
+
+```bash
+# 1. Dry-run: print what the orchestrator WOULD do (no actual changes)
+cus check-orchestrate
+```
+
+The dry-run lists every tmux pane with live claude, the session-id it would use for `--resume`, and the exact relaunch command. **Verify:**
+
+- One entry per pane (no duplicates)
+- The session-id in the "Planned relaunch" line is the CURRENT claude session in that pane (cross-check against the "Resume this session with:" output shown when you `/exit` claude)
+- `relaunch_flags` contains `--dangerously-skip-permissions` if you normally launch with it
+- No positional wake-up message in the relaunch (deliberately removed after the 2026-05-19 incident)
+
+If dry-run looks correct:
+
+```bash
+# 2. Enable in config
+cus config --edit       # change hot_swap.enabled to true
+systemctl --user restart cus.service
+
+# 3. Monitor first few swaps closely
+journalctl --user -u cus.service -f
+```
+
+To disable: flip `hot_swap.enabled: false`, restart daemon. Hot-swap-related config knobs:
+
+| Knob | Default | What |
+|---|---|---|
+| `hot_swap.enabled` | `false` | Master switch |
+| `hot_swap.tier_2_at_pct` | `75` | Step at which Tier 2 (pause-message) kicks in |
+| `hot_swap.tier_3_at_pct` | `90` | Step at which Tier 3 (force interrupt) kicks in |
+| `hot_swap.pause_message` | (long) | Text sent via tmux send-keys to nudge Claude at Tier 2 |
+| `hot_swap.wake_up_message` | `""` (empty) | KEPT in config but NOT sent as positional after rewrite. Set non-empty only if you understand the cost. |
+| `hot_swap.cache_bust_window_seconds` | `300` | Defer Tier 1 if cache still warm (set EQUAL to Anthropic's 5-min cache TTL or slightly more) |
+| `hot_swap.mid_turn_idle_seconds` | `30` | Session counts as "between turns" if no transcript write for N seconds |
+| `hot_swap.stop_wait_timeout_seconds` | `300` | Max wait for Stop signal in Tier 1 |
+| `hot_swap.pause_response_timeout_seconds` | `120` | Max wait after Tier 2 pause-message |
+| `hot_swap.shell_return_timeout_seconds` | `10` | Max poll for pane to return to shell after `/exit` |
+| `hot_swap.relaunch_flags` | `""` | Flags passed to relaunched `claude` — set to `"--dangerously-skip-permissions"` if you use it |
+
 ## Starting / stopping the daemon
 
 If installed via systemd (`cus init-systemd --enable`):
