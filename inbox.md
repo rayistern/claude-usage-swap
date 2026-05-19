@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found](#2026-05-19-flag-second-hot-swap-test-2026-05-19-21-00-orchestrator-correctness-ok-3-new-bugs-found)
 - [2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch](#2026-05-19-deviation-hot-swap-orchestration-disabled-2026-05-19-after-burning-4-of-user-s-5h-on-bungled-live-session-relaunch)
 - [2026-05-19 — decision — **ARCH DECISION** — Unified-tree storage: each account-* dir is a valid CLAUDE_CONFIG_DIR](#2026-05-19-decision-arch-decision-unified-tree-storage-each-account-dir-is-a-valid-claude-config-dir)
 - [2026-05-18 — decision — **ARCH DECISION** — Phases 3-6 single-file: hot-swap orchestrator + Phase 6 controls in cus.py, not split](#2026-05-18-decision-arch-decision-phases-3-6-single-file-hot-swap-orchestrator-phase-6-controls-in-cus-py-not-split)
@@ -15,6 +16,45 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #incident #hot-swap #postmortem
+
+### What I noticed
+Second hot-swap test (after the 20:25 incident and the orchestrator rewrite). Smoke-tested via `systemd-run --user --unit=cus-orchtest python3 /tmp/orch_test.py` calling `hot_swap_orchestrate` directly.
+
+### What worked correctly (the rewrite achievements)
+- `find_live_panes` returned exactly one entry per pane (no per-session-id duplication)
+- The relaunch command used the CORRECT current session-id (`f9bd536d` matched what claude printed on `/exit`)
+- No positional wake-up message (relaunch was just `claude --dangerously-skip-permissions --resume <id>`)
+- `wait_for_shell` correctly detected pane %3 didn't exit and skipped relaunch (defensive)
+
+### What broke
+1. **Orchestration race** — my detached orchestrator at 21:00:31 succeeded; daemon at 21:02:30 ran AGAIN (default's `next_swap_at_pct` had been bumped to 85 by my first swap, so daemon's threshold tripped and it orchestrated a second swap default→merkos tier 2). Result: pane %2's claude got `/exit`'d twice, second resume created a fresh session-id `7e52dabf`. Tracked as audit P0 item 11c.
+
+2. **`/exit` typed but not executed** — pane %3's claude was probably in input-box-focused state, so `/exit` got typed AS TEXT not interpreted as a slash command. The defensive `wait_for_shell` correctly noticed and skipped relaunch, but pane %3 was left with `/exit` text in its input box. Tracked as audit P1 item 11d.
+
+3. **Validator template appearing as user-message in JSONL history** — NOT our bug. Root cause: user's `~/.claude/hooks/validator.sh` calls `claude -p --model haiku "$PROMPT"` as a subprocess, but the subprocess inherits `$CLAUDE_CODE_SESSION_ID` from the parent claude. Child claude (Haiku) writes the validator template as a user message into the PARENT'S JSONL. **User-fix**: `env -u CLAUDE_CODE_SESSION_ID claude -p ...` in validator.sh. Tracked as audit item 11e.
+
+### What I decided (after seeing this)
+- Disabled `hot_swap.enabled` in user's config.yaml again (level 3 only until 11c/11d are fixed)
+- Re-enabled `subagent_skip` (had disabled for test)
+- Daemon restarted at level 3
+
+### Walk-back path
+- `hot_swap.enabled: false` in ~/claude-accounts/config.yaml — restored to pre-test state
+- Daemon running at level 3 (cred swap for new sessions only; no live-session orchestration)
+- To enable hot-swap again: first fix audit items 11c (race lock) and 11d (input-box clear before /exit). Then `cus check-orchestrate` to verify session-id assignments still look right. Then flip `hot_swap.enabled: true`.
+
+### Flags for follow-up
+- User's `validator.sh` env leak is benign but causes confusing UX during hot-swap testing. Worth fixing in their hygiene repo.
+- The "Continue from where you left off." appearing in JSONL is built-in claude `--resume` behavior, not from our orchestrator.
+
+---
+
 
 ## 2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch
 

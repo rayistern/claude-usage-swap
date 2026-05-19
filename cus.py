@@ -2296,7 +2296,9 @@ def check_orchestrate_cmd(target: str | None) -> None:
 @cli.command(name="auto-swap")
 @click.argument("target", required=False)
 @click.option("--trigger", default="manual-auto", help="Tag for the swap history entry.")
-def auto_swap_cmd(target: str | None, trigger: str) -> None:
+@click.option("--orchestrate", is_flag=True, help="Run the full hot-swap orchestrator (level 4): /exit + relaunch live tmux panes. Without this flag, level 3 (just swap creds for new sessions).")
+@click.option("--tier", type=int, default=1, help="Orchestration tier (1=wait-for-stop, 2=pause-message, 3=force-interrupt). Only used with --orchestrate.")
+def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int) -> None:
     """Force-swap NOW, bypassing the threshold check.
 
     Two modes:
@@ -2342,13 +2344,27 @@ def auto_swap_cmd(target: str | None, trigger: str) -> None:
 
     click.echo(f"Swapping {current} -> {chosen_name}")
     click.echo(f"  reason: {reason}")
-    try:
-        execute_swap(chosen_name, trigger=trigger)
-    except (FileNotFoundError, ValueError, RuntimeError) as e:
-        click.echo(f"ERROR: {e}")
-        sys.exit(1)
+    click.echo(f"  mode: {'orchestrated hot-swap (level 4)' if orchestrate else 'cred swap only (level 3)'}")
+    if orchestrate:
+        # Build a synthetic SwapDecision and run the orchestrator. This is
+        # the level-4 path the daemon would normally take when hot_swap.enabled
+        # is true and a threshold trips — but here, manually invoked.
+        decision = SwapDecision(target=chosen_name, reason=reason, tier=tier)
+        try:
+            hot_swap_orchestrate(decision, state, config)
+        except Exception as e:
+            click.echo(f"ERROR in orchestrator: {type(e).__name__}: {e}")
+            click.echo("Falling back to plain cred swap.")
+            execute_swap(chosen_name, trigger=trigger)
+    else:
+        try:
+            execute_swap(chosen_name, trigger=trigger)
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            click.echo(f"ERROR: {e}")
+            sys.exit(1)
     click.echo(f"✓ Swapped. Next `claude` invocation uses {chosen_name}.")
-    click.echo(f"  Live sessions keep their loaded tokens until refresh — restart them to immediately use {chosen_name}.")
+    if not orchestrate:
+        click.echo(f"  Live sessions keep their loaded tokens until refresh — restart them to immediately use {chosen_name}.")
 
 
 @cli.command()
