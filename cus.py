@@ -1990,19 +1990,30 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     current = state["active"]
     hot = config.get("hot_swap", {})
     tier = decision.tier
+    target = decision.target
 
-    live_panes = find_live_panes(account_filter=current)
-    click.echo(f"  hot_swap: {len(live_panes)} pane(s) with live claude on {current}")
+    # CHANGED 2026-05-20 (issue #2 fix): query EVERY live pane, then keep only
+    # those whose loaded account doesn't match the target. The pane's loaded
+    # account is its latest SessionStart-recorded account (sessions.log,
+    # latest entry per pane). Previous behavior filtered by account_filter=current
+    # at the find_live_panes level, which missed panes that had drifted (their
+    # SessionStart-recorded account differed from current.active after a
+    # non-orchestrated swap). The new logic restarts panes that need to align
+    # with the target, regardless of which account they're currently on.
+    all_panes = find_live_panes(account_filter=None)
+    already_aligned = [s for s in all_panes if s.account == target]
+    misaligned = [s for s in all_panes if s.account != target]
+    click.echo(f"  hot_swap: {len(all_panes)} live pane(s), {len(misaligned)} need restart to align with {target} ({len(already_aligned)} already on {target})")
 
     swappable: list[LiveSession] = []
-    for s in live_panes:
+    for s in misaligned:
         pinned, reason = session_is_pinned(s, config)
         if pinned:
-            click.echo(f"    skip pane {s.pane} ({reason})")
+            click.echo(f"    skip pane {s.pane} on {s.account} ({reason})")
             continue
         wl, reason = session_matches_whitelist(s, config)
         if wl:
-            click.echo(f"    skip pane {s.pane} ({reason})")
+            click.echo(f"    skip pane {s.pane} on {s.account} ({reason})")
             continue
         swappable.append(s)
 
@@ -2489,8 +2500,12 @@ def check_orchestrate_cmd(target: str | None) -> None:
     click.echo(click.style(f"Hot-swap dry-run for active account: {current}", bold=True))
     click.echo()
 
-    live_panes = find_live_panes(account_filter=current if current != "(no active)" else None)
-    click.echo(f"Detected {len(live_panes)} pane(s) with live claude on {current}:")
+    # Query ALL live panes (regardless of recorded account). Per-pane
+    # alignment is shown in the output: each pane's recorded account vs
+    # current.active. Panes whose recorded account ≠ current.active are
+    # "misaligned" — drift, fixed by orchestrator restart.
+    live_panes = find_live_panes(account_filter=None)
+    click.echo(f"Detected {len(live_panes)} pane(s) with live claude:")
     if not live_panes:
         click.echo("  (none — orchestrator would do simple cred swap with no relaunch)")
         return
@@ -2499,19 +2514,23 @@ def check_orchestrate_cmd(target: str | None) -> None:
         idle = session_is_idle(s, hot.get("mid_turn_idle_seconds", 30))
         pinned, pin_reason = session_is_pinned(s, config)
         wl, wl_reason = session_matches_whitelist(s, config)
+        aligned = s.account == current
         click.echo(f"  pane {s.pane}:")
         click.echo(f"    session_id: {s.session_id}")
         click.echo(f"    cwd: {s.cwd}")
+        click.echo(f"    account: {s.account}{' (aligned with current)' if aligned else f' (DRIFT — current is {current})'}")
         click.echo(f"    pane_current_command: {pane_cmd}")
         click.echo(f"    started_at: {s.started_at}")
         click.echo(f"    last_stop_at: {s.last_stop_at or '(never)'}")
         click.echo(f"    idle (>{hot.get('mid_turn_idle_seconds', 30)}s since transcript write): {idle}")
         if pinned:
             click.echo(f"    PINNED: {pin_reason} → would SKIP")
-        if wl:
+        elif wl:
             click.echo(f"    WHITELISTED: {wl_reason} → would SKIP")
-        if not pinned and not wl:
-            click.echo(f"    would: orchestrate")
+        elif aligned:
+            click.echo(f"    aligned with current — orchestrator would SKIP (no restart needed)")
+        else:
+            click.echo(f"    would: orchestrate (restart to align)")
 
     click.echo()
     # Show planned relaunch commands — honor the same config knobs the
@@ -2522,7 +2541,10 @@ def check_orchestrate_cmd(target: str | None) -> None:
     wake = hot.get("wake_up_message", "").strip()
     wake_part = f" {shlex.quote(wake)}" if wake else ""
     click.echo(click.style("Planned relaunch commands (would be typed via `tmux send-keys`):", bold=True))
+    relaunch_count = 0
     for s in live_panes:
+        if s.account == current:
+            continue  # already aligned — no restart needed
         pinned, _ = session_is_pinned(s, config)
         wl, _ = session_matches_whitelist(s, config)
         if pinned or wl:
@@ -2532,6 +2554,9 @@ def check_orchestrate_cmd(target: str | None) -> None:
         else:
             cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part}{wake_part}"
         click.echo(f"  pane {s.pane}: {cmd}")
+        relaunch_count += 1
+    if relaunch_count == 0:
+        click.echo("  (no panes need restart — all aligned)")
     if not use_resume:
         click.echo()
         click.echo(click.style("  (relaunch_with_resume: false → no --resume; fresh sessions)", fg="yellow"))
