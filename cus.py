@@ -2044,32 +2044,44 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    DEFER: cache warm for active pane {s.pane} (Tier 1 swap would burn cache)")
                 return
 
-    # Per-tier prep
+    # Per-tier prep. All tiers now check session_is_idle FIRST and skip
+    # the disruptive action (pause-message, Escape) when the session is
+    # already at a turn boundary. Issue #4: previously tier 2/3 sent their
+    # signals unconditionally, billing tokens on idle sessions.
+    idle_seconds = hot.get("mid_turn_idle_seconds", 30)
     for s in swappable:
+        is_idle = session_is_idle(s, idle_seconds)
         if tier == 2:
-            click.echo(f"    pane {s.pane}: injecting pause-message")
-            tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
-            ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
-            if not ok:
-                click.echo(f"      timed out waiting for Stop; proceeding anyway")
+            if is_idle:
+                # Idle — no pause-message needed; session already at turn boundary.
+                click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping pause-message (no need)")
+            else:
+                click.echo(f"    pane {s.pane}: mid-turn — injecting pause-message")
+                tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+                ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
+                if not ok:
+                    click.echo(f"      timed out waiting for Stop; proceeding anyway")
         elif tier == 3:
-            click.echo(f"    pane {s.pane}: force interrupt (double Escape)")
-            # Single Escape may not interrupt — Claude's TUI sometimes needs
-            # two to dismiss running tool calls.
-            tmux_send_keys(s.pane, "Escape")
-            time.sleep(0.3)
-            tmux_send_keys(s.pane, "Escape")
-            time.sleep(0.5)
-            shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
-            if shell_note:
-                append_inbox(
-                    "deviation",
-                    f"Force-interrupted pane {s.pane} (tier 3)",
-                    f"Account `{current}` was force-swapped to `{decision.target}` while pane {s.pane} (session {s.session_id[:8]}) had active tool calls:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` to go back to the original.",
-                )
+            if is_idle:
+                # Idle — no running tool to interrupt; skip Escape.
+                click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping force-interrupt (no running tool)")
+            else:
+                click.echo(f"    pane {s.pane}: mid-turn — force interrupt (double Escape)")
+                # Single Escape may not interrupt — Claude's TUI sometimes
+                # needs two to dismiss running tool calls.
+                tmux_send_keys(s.pane, "Escape")
+                time.sleep(0.3)
+                tmux_send_keys(s.pane, "Escape")
+                time.sleep(0.5)
+                shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
+                if shell_note:
+                    append_inbox(
+                        "deviation",
+                        f"Force-interrupted pane {s.pane} (tier 3)",
+                        f"Account `{current}` was force-swapped to `{decision.target}` while pane {s.pane} (session {s.session_id[:8]}) had active tool calls:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` to go back to the original.",
+                    )
         else:  # tier 1
-            idle_seconds = hot.get("mid_turn_idle_seconds", 30)
-            if session_is_idle(s, idle_seconds):
+            if is_idle:
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — already at turn boundary, no wait")
             else:
                 stop_timeout = hot.get("stop_wait_timeout_seconds", 300)
