@@ -1669,6 +1669,103 @@ def tmux_send_keys(pane: str, *keys: str) -> bool:
         return False
 
 
+def _pane_pid(pane: str) -> int | None:
+    """Return the shell PID running inside the given tmux pane, or None.
+
+    Uses `tmux display-message #{pane_pid}`. That's the PID of the shell tmux
+    spawned for the pane; the live claude/node process is a descendant.
+    """
+    if not tmux_is_available() or not pane or pane == "no-tmux":
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pid_str = result.stdout.strip()
+        return int(pid_str) if pid_str else None
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError):
+        return None
+
+
+def _find_descendant_claude_pid(root_pid: int) -> int | None:
+    """Walk /proc to find a descendant claude/node process under root_pid.
+
+    Linux-only (uses /proc). Returns the deepest matching pid, since claude
+    code typically runs as `node <claude-js>` and we want the leaf claude
+    process. Returns None if /proc isn't available or no descendant matches.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return None
+    children: dict[int, list[int]] = {}
+    comm: dict[int, str] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat_text = (entry / "stat").read_text()
+            close_paren = stat_text.rfind(")")
+            if close_paren == -1:
+                continue
+            comm_part = stat_text[: close_paren + 1]
+            after = stat_text[close_paren + 2 :].split()
+            ppid = int(after[1])
+            children.setdefault(ppid, []).append(pid)
+            name_start = comm_part.find("(")
+            comm[pid] = comm_part[name_start + 1 : -1]
+        except (OSError, ValueError, IndexError):
+            continue
+    found: list[int] = []
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        name = comm.get(pid, "")
+        if name in ("claude", "node"):
+            found.append(pid)
+        stack.extend(children.get(pid, []))
+    if not found:
+        return None
+    return max(found)
+
+
+def _read_claude_session_id_from_environ(pid: int) -> str | None:
+    """Parse /proc/<pid>/environ for CLAUDE_CODE_SESSION_ID.
+
+    The environ file is NUL-separated KEY=VALUE pairs. Returns None on any
+    read failure (process gone, permission denied, key absent).
+    """
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except (OSError, PermissionError):
+        return None
+    for chunk in raw.split(b"\x00"):
+        if chunk.startswith(b"CLAUDE_CODE_SESSION_ID="):
+            return chunk[len(b"CLAUDE_CODE_SESSION_ID=") :].decode("utf-8", errors="replace")
+    return None
+
+
+def pane_live_session_id(pane: str) -> str | None:
+    """Authoritative current session-id for a tmux pane, read from the live
+    claude process's environ. Falls back to None if anything goes wrong;
+    callers should then fall back to the sessions.log heuristic.
+
+    See GH #10: the sessions.log heuristic (latest entry per pane) can pick a
+    stale session-id when a pane has had multiple claude sessions over time,
+    e.g. user manually started a new --resume in the pane without SessionStart
+    firing. Reading the live process's CLAUDE_CODE_SESSION_ID gives the
+    canonical answer for what's actually running RIGHT NOW.
+    """
+    pid = _pane_pid(pane)
+    if pid is None:
+        return None
+    claude_pid = _find_descendant_claude_pid(pid)
+    if claude_pid is None:
+        return None
+    return _read_claude_session_id_from_environ(claude_pid)
+
+
 def tmux_pane_name(pane: str) -> str:
     """Return the tmux pane's command/process name, for whitelist matching."""
     if not tmux_is_available() or not pane:
@@ -1788,7 +1885,7 @@ def session_is_idle(session: LiveSession, idle_seconds: int) -> bool:
         return False
 
 
-def find_live_panes(account_filter: str | None = None) -> list[LiveSession]:
+def find_live_panes(account_filter: str | None = None, verbose: bool = False) -> list[LiveSession]:
     """One LiveSession entry per tmux pane currently running claude.
 
     Differs from `find_live_sessions` (which dedups by session_id) — that
@@ -1833,7 +1930,21 @@ def find_live_panes(account_filter: str | None = None) -> list[LiveSession]:
             # Pane is back to shell (or running something else). No live claude.
             continue
 
-        sid = e["session_id"]
+        # Prefer the live claude process's CLAUDE_CODE_SESSION_ID over the
+        # latest sessions.log entry — see GH #10. The sessions.log heuristic
+        # is stale when a pane has had multiple sessions and the live one
+        # wasn't recorded (or was recorded earlier than another now-dead one).
+        live_sid = pane_live_session_id(pane)
+        sid = live_sid or e["session_id"]
+        if verbose and live_sid and live_sid != e["session_id"]:
+            # Log the discrepancy so we have evidence that the /proc-based
+            # lookup is correcting a real mismatch — useful for validating
+            # the fix in production logs. Verbose-only to avoid spamming
+            # `cus status` / statusline callers.
+            click.echo(
+                f"    pane {pane}: live session-id {live_sid[:8]} differs "
+                f"from sessions.log latest {e['session_id'][:8]}; using live"
+            )
         transcript = _find_transcript(sid, e.get("cwd", ""))
         last_stop_at = latest_stops.get(sid)
 
@@ -2051,7 +2162,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     # SessionStart-recorded account differed from current.active after a
     # non-orchestrated swap). The new logic restarts panes that need to align
     # with the target, regardless of which account they're currently on.
-    all_panes = find_live_panes(account_filter=None)
+    all_panes = find_live_panes(account_filter=None, verbose=True)
     already_aligned = [s for s in all_panes if s.account == target]
     misaligned = [s for s in all_panes if s.account != target]
     click.echo(f"  hot_swap: {len(all_panes)} live pane(s), {len(misaligned)} need restart to align with {target} ({len(already_aligned)} already on {target})")
