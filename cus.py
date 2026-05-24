@@ -802,6 +802,44 @@ class SwapTarget:
     reason: str
 
 
+def _hard_7d_cap_for_config(config: dict) -> float:
+    """Resolve the active strategy's hard_7d_cap_pct, with smart_strategy's
+    value as the cross-strategy fallback. Used as a universal target filter
+    so NO strategy picks an account at or above the user-stated weekly
+    ceiling. Surfaced 2026-05-24 (GH #17) after the strategy audit found
+    lowest_usage/drain/round_robin had no such filter."""
+    strategy_cfg = config.get(f"{config.get('strategy', '')}_strategy", {})
+    return strategy_cfg.get("hard_7d_cap_pct") or config.get("smart_strategy", {}).get("hard_7d_cap_pct", 80)
+
+
+def _account_effective_pct(acct: dict, config: dict) -> float:
+    """Apply thresholds.{five_hour,seven_day} config when computing an
+    account's "effective" usage % — i.e. the value the ladder logic actually
+    cares about. Mirrors current_max_pct but operates on the dict-level
+    state.json data instead of AccountUsage objects. Used by strategies
+    (drain, strict_priority) that previously hardcoded both-windows checks
+    and produced inconsistent behavior with the user's config (GH #17)."""
+    thr_cfg = config.get("thresholds", {})
+    candidates = []
+    if thr_cfg.get("five_hour", True):
+        candidates.append(acct.get("current_5h_pct", 0.0))
+    if thr_cfg.get("seven_day", True):
+        candidates.append(acct.get("current_7d_pct", 0.0))
+    return max(candidates) if candidates else 0.0
+
+
+def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
+    """Return True if this candidate would re-trip its own ladder right
+    after we swap to it (effective_pct >= next_swap_at_pct). Used to prune
+    "doomed" candidates that would cause a swap-back loop. GH #17."""
+    threshold = acct.get("next_swap_at_pct", 70)
+    if threshold >= 100:
+        # Sentinel: behaves as last configured step (see decide_swap).
+        cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+        threshold = cfg_steps[-1]
+    return _account_effective_pct(acct, config) >= threshold
+
+
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     """Pick which account to swap to, based on configured strategy.
 
@@ -813,6 +851,16 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
       - strict_priority: respect priority order; only fall through if
         higher-priority accounts are over threshold.
       - round_robin: pick next-in-list (wrapping). Ignores usage.
+      - headroom / smart: weighted-score over 5h + 7d headroom.
+
+    Universal filters applied across ALL strategies (GH #17 — strategy audit
+    2026-05-24):
+      1. token_expired / poll_error always excluded.
+      2. rate_limited excluded unless smart_strategy.allow_rate_limited_targets.
+      3. hard_7d_cap: never pick an account at/above the user-stated 80%
+         weekly ceiling (was only enforced by headroom/smart before).
+      4. would_re_trip: never pick an account whose own ladder would trip
+         immediately on swap-arrival (would cause swap-back loop).
     """
     current = state.get("active")
     accounts = state.get("accounts", {})
@@ -846,87 +894,132 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     if not candidates:
         return None
 
+    # Universal filter (GH #17, all strategies): exclude candidates above
+    # the user-stated weekly ceiling. Previously only headroom/smart applied
+    # this — lowest_usage/drain/round_robin would happily pick an exhausted
+    # account. Falls back to "any candidate" if ALL are above cap (system
+    # is degraded; swap somewhere rather than stay on a hot active).
+    hard_7d = _hard_7d_cap_for_config(config)
+    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
+    cap_fallback = not safe_7d
+    if safe_7d:
+        candidates = safe_7d
+
+    # Universal filter (GH #17, all strategies): prune candidates that
+    # would immediately re-trip their own ladder. Otherwise we'd swap
+    # A→B and decide_swap on the next cycle would swap B→A → ping-pong.
+    # Falls back to "any candidate" if NONE have headroom; the hysteresis
+    # gate (GH #16) and usage-growth gate (GH #15) protect against the
+    # resulting potential loop.
+    with_headroom = [(n, a) for n, a in candidates if not _target_would_immediately_re_trip(a, config)]
+    headroom_fallback = not with_headroom
+    if with_headroom:
+        candidates = with_headroom
+
     strategy = config.get("strategy", "lowest_usage")
 
+    def _annotate(reason: str) -> str:
+        """Tack on degraded-mode notes so the operator sees when we fell
+        back to less-safe candidate pools."""
+        notes = []
+        if cap_fallback:
+            notes.append(f"no targets below 7d cap {hard_7d}%")
+        if headroom_fallback:
+            notes.append("all candidates would re-trip own ladder")
+        return reason + (f" [DEGRADED: {'; '.join(notes)}]" if notes else "")
+
     if strategy == "lowest_usage":
-        # cux balanced: sort ascending by 7d util, ties broken by 5h util
-        candidates.sort(key=lambda kv: (kv[1].get("current_7d_pct", 0.0), kv[1].get("current_5h_pct", 0.0)))
+        # cux balanced. Sort by the user's effective threshold metric
+        # (honors thresholds.{five_hour,seven_day}), then secondary tiebreak
+        # by 5h for stability.
+        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config), kv[1].get("current_5h_pct", 0.0)))
         chosen, _ = candidates[0]
-        return SwapTarget(name=chosen, reason="lowest_usage: lowest 7d util")
+        return SwapTarget(name=chosen, reason=_annotate("lowest_usage: lowest effective util"))
 
     if strategy == "drain":
-        # cux drain: prefer candidates with both windows under their own next_swap_at
+        # cux drain: pass 1 = candidates with effective_pct under their own
+        # next_swap_at (i.e. headroom for an arrival). Pass 2 = any candidate
+        # below 100% 5h. Pass 2 still applies the universal cap_fallback /
+        # headroom_fallback filters above.
         ordered = [
-            (name, acct) for name, acct in candidates
-            if acct.get("current_5h_pct", 0.0) < acct.get("next_swap_at_pct", 50)
-            and acct.get("current_7d_pct", 0.0) < acct.get("next_swap_at_pct", 50)
+            (n, a) for n, a in candidates
+            if _account_effective_pct(a, config) < a.get("next_swap_at_pct", 50)
         ]
         if ordered:
             ordered.sort(key=lambda kv: (-kv[1].get("current_7d_pct", 0.0),))  # closest-to-cap first
             chosen, _ = ordered[0]
-            return SwapTarget(name=chosen, reason="drain: 7d under cap")
-        # Pass 2: any candidate with 5h headroom
+            return SwapTarget(name=chosen, reason=_annotate("drain: under own threshold"))
+        # Pass 2: any candidate with some 5h room
         ordered = [(n, a) for n, a in candidates if a.get("current_5h_pct", 0.0) < 100]
         if ordered:
             ordered.sort(key=lambda kv: -kv[1].get("current_7d_pct", 0.0))
             chosen, _ = ordered[0]
-            return SwapTarget(name=chosen, reason="drain: 5h has room")
+            return SwapTarget(name=chosen, reason=_annotate("drain: 5h has room"))
         return None
 
     if strategy == "strict_priority":
-        # Sort by priority ascending (1 = highest); pick first with room
+        # Sort by priority asc (1 = highest); pick first with effective
+        # headroom. Honors thresholds.{five_hour,seven_day} config (was
+        # hardcoded both-windows before — GH #17).
         cfg_accounts = {a["name"]: a for a in config.get("accounts", [])}
         candidates.sort(key=lambda kv: cfg_accounts.get(kv[0], {}).get("priority", 99))
         for name, acct in candidates:
-            if acct.get("current_5h_pct", 0.0) < acct.get("next_swap_at_pct", 50) \
-               and acct.get("current_7d_pct", 0.0) < acct.get("next_swap_at_pct", 50):
-                return SwapTarget(name=name, reason="strict_priority: highest priority with headroom")
+            if _account_effective_pct(acct, config) < acct.get("next_swap_at_pct", 50):
+                return SwapTarget(name=name, reason=_annotate("strict_priority: highest priority with headroom"))
         return None
 
     if strategy == "round_robin":
-        names = sorted(accounts.keys())
-        idx = names.index(current)
-        nxt = names[(idx + 1) % len(names)]
-        return SwapTarget(name=nxt, reason="round_robin")
+        # Pick the next account by name AMONG REMAINING candidates (not all
+        # accounts blindly). Previously took next-in-list which could include
+        # token_expired/over-cap/would-re-trip accounts. Now respects the
+        # universal filters; if the "next" account was filtered out, we skip
+        # to the next surviving one.
+        survived_names = sorted(n for n, _ in candidates)
+        if current in survived_names:
+            survived_names.remove(current)
+        if not survived_names:
+            return None
+        all_names_sorted = sorted(accounts.keys())
+        try:
+            cur_idx = all_names_sorted.index(current)
+        except ValueError:
+            cur_idx = -1
+        for offset in range(1, len(all_names_sorted) + 1):
+            cand = all_names_sorted[(cur_idx + offset) % len(all_names_sorted)]
+            if cand in survived_names:
+                return SwapTarget(name=cand, reason=_annotate("round_robin"))
+        return None
 
     if strategy == "headroom":
-        # Weighted score of 5h + 7d headroom, with hard 7d cap filter.
-        # See docs/STRATEGIES.md for the design rationale.
+        # Weighted score of 5h + 7d headroom. Hard 7d cap already applied
+        # universally above; this strategy's own hard_7d_cap_pct setting is
+        # respected via _hard_7d_cap_for_config which prefers the active
+        # strategy's value over smart_strategy's default.
         cfg = config.get("headroom_strategy", {})
-        hard_7d = cfg.get("hard_7d_cap_pct", 80)
         w5 = cfg.get("five_hour_weight", 0.7)
         w7 = cfg.get("seven_day_weight", 0.3)
-
-        # Hard 7d cap: among candidates, prefer those below cap. If ALL are
-        # at/over cap, fall back to all (we have to swap somewhere).
-        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
-        pool = safe_7d if safe_7d else candidates
 
         def score(acct: dict) -> float:
             return (100 - acct.get("current_5h_pct", 0.0)) * w5 + (100 - acct.get("current_7d_pct", 0.0)) * w7
 
-        pool.sort(key=lambda kv: -score(kv[1]))
-        chosen, chosen_acct = pool[0]
+        candidates.sort(key=lambda kv: -score(kv[1]))
+        chosen, chosen_acct = candidates[0]
         s = score(chosen_acct)
-        note = "" if safe_7d else f" (no 7d-safe targets — best of {len(candidates)})"
-        return SwapTarget(name=chosen, reason=f"headroom: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={s:.1f}{note}")
+        return SwapTarget(name=chosen, reason=_annotate(f"headroom: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={s:.1f}"))
 
     if strategy == "smart":
         # Smart strategy designed for: never go over 80% 7d; route on 5h
         # dynamics; prefer "burn-before-reset" candidates (those whose 5h
         # window will reset soon — using them now means we don't waste
         # remaining capacity). See docs/STRATEGIES.md for the design.
+        # Hard 7d cap + would-re-trip filters are now applied universally
+        # above (GH #17); this block just handles the scoring.
         cfg = config.get("smart_strategy", {})
-        hard_7d = cfg.get("hard_7d_cap_pct", 80)
         burn_window_hours = cfg.get("burn_window_hours", 2)
         burn_soon_weight = cfg.get("burn_soon_weight", 1.0)
         w5 = cfg.get("five_hour_headroom_weight", 0.6)
         w7 = cfg.get("seven_day_headroom_weight", 0.4)
         cold_penalty = cfg.get("cold_account_penalty", 0)  # 0 = no penalty (default)
-
-        # Hard 7d cap filter (same as headroom)
-        safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
-        pool = safe_7d if safe_7d else candidates
 
         def smart_score(acct: dict) -> tuple[float, str]:
             h5 = acct.get("current_5h_pct", 0.0)
@@ -963,13 +1056,12 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
             return s, " ".join(reasons) if reasons else "(headroom only)"
 
-        scored = [(n, a, *smart_score(a)) for n, a in pool]
+        scored = [(n, a, *smart_score(a)) for n, a in candidates]
         scored.sort(key=lambda x: -x[2])
         chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
-        note = "" if safe_7d else f" [no 7d-safe targets — best of {len(candidates)}]"
         return SwapTarget(
             name=chosen,
-            reason=f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={chosen_score:.1f} {chosen_reasons}{note}",
+            reason=_annotate(f"smart: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={chosen_score:.1f} {chosen_reasons}"),
         )
 
     return None
