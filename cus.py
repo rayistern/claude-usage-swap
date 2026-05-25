@@ -198,6 +198,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # don't need conversation continuity, and avoids loading the old
         # JSONL (which may have hook-leaked content from upstream issues).
         "relaunch_with_resume": True,
+        # MCP_TIMEOUT (ms) prefixed onto the relaunch command's env (GH #25).
+        # Claude Code bounds each stdio MCP server's startup connect attempt by
+        # MCP_TIMEOUT (default 30000ms). On `claude --resume`, EVERY MCP server
+        # is re-spawned and re-handshaked from scratch — nothing is inherited.
+        # A slow-cold-starting server (observed: gym ~8s standalone) that misses
+        # this window has its tools dropped for the WHOLE session, with no stdio
+        # retry and no mid-session auto-reconnect. An orchestrated swap relaunches
+        # many panes near-simultaneously, so each pane's MCP cold-starts contend
+        # for CPU and the 8s balloons past 30s — gym's tools silently vanish on
+        # resume while faster servers (avc, orchestra) survive. Raising the
+        # budget to 120s gives slow servers headroom; the high value only costs
+        # wall-time when a server is genuinely hung. Set 0 to not set the env var
+        # at all (inherit Claude Code's 30000ms default).
+        "relaunch_mcp_timeout_ms": 120000,
+        # Seconds to sleep between successive per-pane relaunches (GH #25).
+        # Attacks the root cause of the MCP-cold-start contention above: firing
+        # N `claude --resume` at once means N×(stdio server cold-starts) fight
+        # for the same cores. Staggering lets each pane's MCP servers connect
+        # before the next pane piles on. 0 disables staggering (relaunch all at
+        # once, the pre-GH#25 behavior).
+        "relaunch_stagger_seconds": 2.0,
     },
     "subagent_skip": {
         "enabled": True,
@@ -2578,6 +2599,44 @@ def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 
     return False
 
 
+def build_relaunch_cmd(session: "LiveSession", hot: dict) -> str:
+    """Build the shell command typed into a pane to relaunch claude after a swap.
+
+    Single source of truth for the relaunch string so the live orchestrator and
+    the `check-orchestrate` preview can never drift (they previously duplicated
+    this construction). Shape:
+
+        cd <cwd> && [MCP_TIMEOUT=<n> ]claude[ <flags>][ --resume <id>][ <wake>]
+
+    The optional `MCP_TIMEOUT=<n>` env prefix (GH #25) widens Claude Code's
+    per-stdio-server startup budget so slow-cold-starting MCP servers (e.g. gym)
+    register their tools on resume instead of being silently dropped under the
+    CPU contention of a multi-pane swap. See the `relaunch_mcp_timeout_ms`
+    config comment for the full mechanism.
+    """
+    flags = hot.get("relaunch_flags", "").strip()
+    flag_part = f" {flags}" if flags else ""
+    use_resume = hot.get("relaunch_with_resume", True)
+    wake = hot.get("wake_up_message", "").strip()
+    wake_part = f" {shlex.quote(wake)}" if wake else ""
+
+    # MCP_TIMEOUT env prefix. 0 (or missing) => don't set it; inherit Claude
+    # Code's own default. We set it inline before `claude` so it scopes to that
+    # process only and survives the `cd ... &&` (the env assignment binds to the
+    # claude command, not the cd).
+    mcp_timeout = hot.get("relaunch_mcp_timeout_ms", 0)
+    env_prefix = ""
+    if isinstance(mcp_timeout, int) and mcp_timeout > 0:
+        env_prefix = f"MCP_TIMEOUT={mcp_timeout} "
+
+    if use_resume and session.session_id:
+        return (
+            f"cd {shlex.quote(session.cwd)} && "
+            f"{env_prefix}claude{flag_part} --resume {shlex.quote(session.session_id)}{wake_part}"
+        )
+    return f"cd {shlex.quote(session.cwd)} && {env_prefix}claude{flag_part}{wake_part}"
+
+
 def hot_swap_orchestrate(decision: SwapDecision, state: dict, config: dict) -> None:
     """Hot-swap orchestrator (rewritten 2026-05-19 after the find_live_sessions incident).
 
@@ -2905,21 +2964,21 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     # wake_up_message: defaults to empty — no positional sent. Set non-empty
     # ONLY if you understand the cost (positional becomes a first user
     # message → billed response → post-assistant hooks fire → also billed).
-    flags = hot.get("relaunch_flags", "").strip()
-    flag_part = f" {flags}" if flags else ""
     use_resume = hot.get("relaunch_with_resume", True)
-    wake = hot.get("wake_up_message", "").strip()
-    wake_part = f" {shlex.quote(wake)}" if wake else ""
-    for s in panes_ready:
+    stagger = hot.get("relaunch_stagger_seconds", 0) or 0
+    for i, s in enumerate(panes_ready):
         # GH #21: if we couldn't find a valid session-id with an existing
-        # JSONL, launch plain `claude` (no --resume) — better fresh session
-        # than failed "No conversation found" relaunch.
-        if use_resume and s.session_id:
-            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}{wake_part}"
-        else:
-            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part}{wake_part}"
-            if use_resume and not s.session_id:
-                click.echo(f"    pane {s.pane}: no valid session-id found; relaunching FRESH (no --resume)")
+        # JSONL, build_relaunch_cmd falls back to plain `claude` (no --resume)
+        # — better a fresh session than a failed "No conversation found".
+        if use_resume and not s.session_id:
+            click.echo(f"    pane {s.pane}: no valid session-id found; relaunching FRESH (no --resume)")
+        cmd = build_relaunch_cmd(s, hot)
+        # GH #25: stagger relaunches so N panes' MCP stdio cold-starts don't all
+        # contend for CPU at once (which is what pushes gym's ~8s cold start past
+        # MCP_TIMEOUT and drops its tools). Sleep BEFORE every pane after the
+        # first; the last pane adds no trailing delay.
+        if i > 0 and stagger > 0:
+            time.sleep(stagger)
         click.echo(f"    pane {s.pane}: relaunch → {cmd}")
         tmux_send_text(s.pane, cmd)
 
@@ -3345,11 +3404,7 @@ def check_orchestrate_cmd(target: str | None) -> None:
     click.echo()
     # Show planned relaunch commands — honor the same config knobs the
     # orchestrator uses.
-    flags = hot.get("relaunch_flags", "").strip()
-    flag_part = f" {flags}" if flags else ""
     use_resume = hot.get("relaunch_with_resume", True)
-    wake = hot.get("wake_up_message", "").strip()
-    wake_part = f" {shlex.quote(wake)}" if wake else ""
     click.echo(click.style("Planned relaunch commands (would be typed via `tmux send-keys`):", bold=True))
     relaunch_count = 0
     for s in live_panes:
@@ -3359,10 +3414,8 @@ def check_orchestrate_cmd(target: str | None) -> None:
         wl, _ = session_matches_whitelist(s, config)
         if pinned or wl:
             continue
-        if use_resume:
-            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part} --resume {shlex.quote(s.session_id)}{wake_part}"
-        else:
-            cmd = f"cd {shlex.quote(s.cwd)} && claude{flag_part}{wake_part}"
+        # Same builder the live orchestrator uses — preview can't drift.
+        cmd = build_relaunch_cmd(s, hot)
         click.echo(f"  pane {s.pane}: {cmd}")
         relaunch_count += 1
     if relaunch_count == 0:

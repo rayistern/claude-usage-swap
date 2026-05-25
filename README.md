@@ -241,6 +241,14 @@ hot_swap:
   mid_turn_idle_seconds: 30
   stop_wait_timeout_seconds: 300
   pause_response_timeout_seconds: 120
+  relaunch_mcp_timeout_ms: 120000   # MCP_TIMEOUT (ms) on relaunch; widens the
+                                    # per-stdio-server startup budget so slow MCP
+                                    # servers register their tools on --resume
+                                    # instead of being dropped (GH #25). 0 = use
+                                    # Claude Code's 30000ms default.
+  relaunch_stagger_seconds: 2.0     # sleep between per-pane relaunches so their
+                                    # MCP cold-starts don't all contend for CPU
+                                    # (GH #25). 0 = relaunch all at once.
 
 subagent_skip:
   enabled: true

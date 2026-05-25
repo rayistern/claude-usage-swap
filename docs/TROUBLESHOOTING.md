@@ -136,6 +136,20 @@ If missing, re-run migration:
 cus init --force
 ```
 
+### Hot-swap relaunched session is missing some MCP tools (e.g. `mcp__gym__*` gone)
+
+After a hot-swap relaunch, a slow-cold-starting MCP server's tools can be absent for the entire resumed session, even though `claude mcp list` reports the server as "✓ Connected" (GH #25).
+
+Why: `claude --resume` re-spawns every stdio MCP server from scratch and bounds each one's startup connect attempt by `MCP_TIMEOUT` (Claude Code default **30000ms**). Stdio servers get **no startup retry and no mid-session auto-reconnect** — so a server that misses its window is gone until the next manual relaunch. A swap relaunches many panes near-simultaneously, so their MCP cold-starts contend for CPU; a server that takes ~8s standalone (observed: `gym`) balloons past 30s and gets dropped, while faster servers survive. `claude mcp list` is misleading here — it spawns a *separate* health-check process, so "Connected" there says nothing about your running session.
+
+Fix (on by default since GH #25): cus prefixes the relaunch with a higher `MCP_TIMEOUT` and staggers per-pane relaunches. Tune in config if a server is still dropped:
+```yaml
+hot_swap:
+  relaunch_mcp_timeout_ms: 120000   # raise further if a very slow server still drops
+  relaunch_stagger_seconds: 2.0     # raise to reduce cold-start CPU contention
+```
+Preview the exact relaunch command (now includes the `MCP_TIMEOUT=` prefix) with `cus check-orchestrate`. Workaround for an already-affected session: exit and relaunch that one pane by hand (`claude --resume <id>`), ideally with no other sessions cold-starting at the same moment. Secondary: a server taking 8s to answer `initialize` is itself worth fixing upstream — the cus-side timeout is the robust general defense regardless.
+
 ### Daemon swaps too aggressively
 
 Two knobs:
