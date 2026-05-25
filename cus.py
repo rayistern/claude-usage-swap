@@ -222,7 +222,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "subagent_skip": {
         "enabled": True,
-        "defer_below_tier": 3,   # if a subagent is active, defer Tier 1/2; Tier 3 proceeds anyway
+        # If a subagent (or any in-flight tool) is detected, skip that pane's
+        # restart at tiers below this number. Tier 3 ALWAYS bypasses this
+        # guard (GH #27) — at saturation we cannot afford to defer. Note:
+        # since GH #27 the guard skips just the affected pane, not the whole
+        # orchestration; the cred swap and other panes' restarts proceed.
+        "defer_below_tier": 3,
     },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
@@ -240,6 +245,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "install_stop": True,
         "install_post_tool_use_failure": True,
         "install_pre_tool_use": False,    # only needed if subagent_skip.enabled
+        "install_post_tool_use": False,   # only needed if subagent_skip.enabled — pairs with install_pre_tool_use (GH #27)
         "install_subagent_stop": False,   # only needed if subagent_skip.enabled
     },
     "statusline": {
@@ -1181,6 +1187,9 @@ HOOK_EVENTS = {
     "Stop": ("cus_stop.sh", "install_stop"),
     "PostToolUseFailure": ("cus_post_tool_use_failure.sh", "install_post_tool_use_failure"),
     "PreToolUse": ("cus_pre_tool_use.sh", "install_pre_tool_use"),
+    # PostToolUse(success) closes the start/stop ledger so subagent_active
+    # detects genuinely in-flight tools, not every recent tool call (GH #27).
+    "PostToolUse": ("cus_post_tool_use.sh", "install_post_tool_use"),
     "SubagentStop": ("cus_subagent_stop.sh", "install_subagent_stop"),
 }
 
@@ -2696,8 +2705,10 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     Sequence:
       1. Enumerate panes with live claude on the swap-out account.
       2. Filter: skip pinned panes, whitelist-matched panes.
-      3. Subagent skip-guard: defer if any pane has active subagent and
-         tier < config.subagent_skip.defer_below_tier.
+      3. Subagent skip-guard (per-pane, not whole-abort — GH #27): drop
+         subagent-active panes from `swappable` when tier <
+         config.subagent_skip.defer_below_tier; cred swap and other panes'
+         relaunches still proceed. Tier 3 always bypasses the guard.
       4. Cache-bust window (Tier 1 only, non-idle panes only): defer if any
          pane is mid-turn AND its transcript was written < cache_bust_window
          seconds ago (cache still warm — swap would burn rebuild cost).
@@ -2797,14 +2808,53 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         execute_swap(decision.target, trigger=f"auto-tier{tier}-simple")
         return
 
-    # Subagent skip-guard (per-pane)
-    if config.get("subagent_skip", {}).get("enabled", True):
+    # Subagent skip-guard — per-pane (GH #27).
+    #
+    # Two corrections vs. the original implementation:
+    #
+    # 1. **Per-pane skip, not whole-orchestration abort.** The old code did
+    #    `for s in swappable: if subagent_active(s): return` — a single busy
+    #    pane bailed before the cred swap, before any other pane's relaunch.
+    #    That contradicted the "no swappable panes → simple cred swap" branch
+    #    above and meant one stuck pane held up the whole pool. Now we
+    #    *filter* swappable to drop subagent-active panes and proceed with
+    #    the rest plus the cred swap. Each skipped pane is inbox-logged so
+    #    the operator knows that pane drifted onto the old account until its
+    #    next manual restart.
+    #
+    # 2. **Tier 3 always bypasses the guard.** The code-default
+    #    `defer_below_tier: 3` was intended to mean "Tier 3 (force) proceeds
+    #    regardless," but a config value > 3 (e.g. operators setting 100 to
+    #    be cautious at low tiers) was silently disabling the saturation
+    #    safety valve — at 96% the swap deferred indefinitely behind a busy
+    #    pane. The growth gate already bypasses at saturation; mirror that
+    #    posture here. Tier 3 means "we mean it, swap now even if a pane is
+    #    busy" — exactly what saturation needs.
+    if config.get("subagent_skip", {}).get("enabled", True) and tier < 3:
         defer_below = config["subagent_skip"].get("defer_below_tier", 3)
         if tier < defer_below:
-            for s in swappable:
-                if subagent_active(s, config):
-                    click.echo(f"    DEFER: subagent active in pane {s.pane} (session {s.session_id[:8]}); tier={tier} < {defer_below}")
+            busy = [s for s in swappable if subagent_active(s, config)]
+            if busy:
+                kept = [s for s in swappable if s not in busy]
+                for s in busy:
+                    click.echo(
+                        f"    skip pane {s.pane} (session {s.session_id[:8]}): subagent active; "
+                        f"tier={tier} < {defer_below} — pane will drift onto {current} until next restart"
+                    )
+                    append_inbox(
+                        "deviation",
+                        f"Pane {s.pane} skipped during tier-{tier} swap (subagent active)",
+                        f"Account `{current}` swap to `{decision.target}` proceeded, but pane {s.pane} "
+                        f"(session `{s.session_id[:8]}`) had an active subagent/tool and was left on `{current}` "
+                        f"until its next manual restart. Tier {tier} < `defer_below_tier`={defer_below}.\n\n"
+                        f"**Walk-back**: in the affected pane, `/exit` then `claude --resume {s.session_id}` "
+                        f"to pick up on the new active account; or `cus switch {current}` to revert globally.",
+                    )
+                if not kept:
+                    click.echo(f"    all swappable panes had active subagents; doing simple cred swap")
+                    execute_swap(decision.target, trigger=f"auto-tier{tier}-allskipped")
                     return
+                swappable = kept
 
     # Cache-bust window (Tier 1 only, non-idle panes only)
     if tier == 1:
@@ -3888,7 +3938,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
     "thresholds": "Progressive per-account thresholds. `steps: [70, 85, 95]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
-    "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 defer when subagent active; Tier 3 (force) proceeds regardless.",
+    "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "session_locks": "Per-session pinning. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",

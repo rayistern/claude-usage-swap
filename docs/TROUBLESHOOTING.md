@@ -136,6 +136,25 @@ If missing, re-run migration:
 cus init --force
 ```
 
+### Swap deferred every cycle — daemon log keeps saying "DEFER: subagent active in pane X"
+
+**Symptom (GH #27):** the active account climbs past `next_swap_at_pct` and even past `saturation_pct` (90 %+), but the daemon log shows a `DEFER: subagent active in pane <N> ...; tier=T < <D>` line every cycle and no swap actually executes. Eventually the account hits 100 % and live sessions interrupt.
+
+**Cause:** prior to GH #27, three compounding bugs:
+1. **Whole-orchestration abort on one busy pane** — the subagent skip-guard `return`ed before the cred swap and before *any* other pane's relaunch. One stuck pane held up the entire pool.
+2. **`defer_below_tier: 100` defeated the tier-3 force valve** — the saturation tier deferred behind a busy pane instead of force-proceeding.
+3. **`subagent_active` over-detection** — `tool_use.log` was written with `start` on every tool call but `stop` only on subagent end / failure (missing `PostToolUse` success hook). With ~31× more starts than stops, `subagent_active` effectively reported "any tool ran in the last 60 s," not "in-flight subagent."
+
+**Fix (GH #27 default):** per-pane skip (the cred swap and other panes' relaunches proceed; affected panes are inbox-logged); tier 3 always bypasses the guard regardless of `defer_below_tier`; new `cus_post_tool_use.sh` hook closes the ledger.
+
+**If you see this on older code or with the hook absent:**
+```bash
+cus hooks install         # picks up the new cus_post_tool_use.sh
+cus switch <target>       # manual force-swap to unstick now
+```
+
+The subagent guard at tiers 1–2 is still a per-pane skip (correctly), so a genuinely stuck pane will drift onto the old account until you restart it. An inbox entry tagged "deviation" is written for each skipped pane.
+
 ### Hot-swap relaunched session is missing some MCP tools (e.g. `mcp__gym__*` gone)
 
 After a hot-swap relaunch, a slow-cold-starting MCP server's tools can be absent for the entire resumed session, even though `claude mcp list` reports the server as "✓ Connected" (GH #25).

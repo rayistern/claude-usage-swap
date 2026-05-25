@@ -266,6 +266,9 @@ hooks:
   install_stop: true
   install_post_tool_use_failure: true
   install_pre_tool_use: true
+  install_post_tool_use: true     # GH #27 — pairs with pre_tool_use to close the
+                                  # start/stop ledger so subagent_active doesn't
+                                  # misfire on every successful tool call.
   install_subagent_stop: true
 ```
 
