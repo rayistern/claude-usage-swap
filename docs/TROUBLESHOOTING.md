@@ -121,6 +121,19 @@ gh auth switch --user <correct-account>
 
 This bites repeatedly when you have e.g. a work and personal GitHub account both authed.
 
+### Hot-swap relaunched two panes into the same chat ("No conversation found")
+
+**Symptom (GH #29):** after a hot-swap, two panes that share a cwd open into the same conversation — one "steals" the chat, the other shows `No conversation found with session ID <uuid>` (sometimes called "no session found"). Recurring. GH #22 covered one source of this; GH #29 covers the remaining ones.
+
+**Cause:** the fallback chain that picks each pane's session-id has three sources (`/proc cmdline --resume` → `sessions.log` latest → newest-mtime `.jsonl` in cwd). Any source can emit a duplicate across two panes — especially step 1: once a prior bad swap relaunched two panes with `claude --resume X`, both processes' `/proc/<pid>/cmdline` reads `--resume X` forever, so the collision **self-replicates through every subsequent swap** even after GH #22 deployed (which only guards step 3).
+
+**Fix (GH #29 default):** a post-pass in `find_live_panes` detects any session-id resolved for ≥2 panes and clears it for all of them, so they relaunch fresh on the next swap. You'll see this in `daemon.log`:
+```
+COLLISION: session-id abc12345 resolved for 2 panes (%11, %12); clearing all — they will relaunch FRESH (no --resume) to avoid stealing each other's chat
+```
+
+**Manual recovery for an already-affected pane:** the next swap will demote both panes to fresh; if you don't want to wait, `/exit` and `claude --resume <correct-id>` (or just `claude` for fresh).
+
 ### Hot-swap relaunched session lost conversation context
 
 `claude --resume <id>` reads the JSONL transcript at `~/.claude/projects/<cwd-encoded>/<id>.jsonl`. If your account-* dirs don't have `projects/` symlinked to `~/.claude/projects/`, the new account can't see the transcript and resumption fails.

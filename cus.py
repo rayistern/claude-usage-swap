@@ -2342,6 +2342,15 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
       4. Verify pane's current command is claude/node (i.e. claude is
          actually running there — not back to shell from a manual /exit).
       5. Optional liveness signal: recent Stop or recent transcript mtime.
+
+    After all per-pane resolution, a cross-pane collision post-pass (GH #29)
+    clears any session_id that ended up resolved for more than one pane —
+    every step in the fallback chain can produce duplicates (cmdline gets
+    "stuck" with the same `--resume <id>` for two panes after a prior bad
+    swap; sessions.log can record the same id for two panes after a resume;
+    newest-mtime was guarded by GH #22 but only for that one source). Fresh
+    relaunch for both colliding panes is strictly safer than one stealing
+    the other's chat.
     """
     entries = _parse_sessions_log()
     latest_stops = _latest_stops_per_session()
@@ -2508,6 +2517,43 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             last_stop_at=last_stop_at,
             transcript_path=transcript,
         ))
+
+    # Cross-pane collision detector (GH #29). The fallback chain above is
+    # pane-specific at every step, but each individual source can still emit
+    # duplicate session_ids when prior state is corrupted:
+    #   - step 1 (/proc cmdline): once a bad swap relaunched panes A and B
+    #     with `--resume X`, both processes' cmdline reports X forever.
+    #   - step 2 (sessions.log latest): SessionStart can record the same
+    #     session_id for two panes (e.g. resumed from the same id).
+    #   - step 3 (newest-mtime in cwd): GH #22 guards this case but the
+    #     guard depends on by_pane data quality (cwd field populated, etc.).
+    # GH #22 only fixed step 3 in isolation. The 2026-05-25 live trace
+    # showed the collision propagating across swaps through step 1 (cmdline)
+    # well after the initial step-3 contamination — every subsequent swap
+    # re-relaunched both panes with the same id; the operator saw "no
+    # conversation found" in one pane every cycle.
+    #
+    # Post-pass: any session_id resolved for >=2 panes is contaminated.
+    # Clear it for ALL such panes so they relaunch fresh. Strictly safer
+    # than one pane stealing another's chat — fresh is a recoverable state;
+    # cross-contaminated history is not. Catches every source uniformly,
+    # including future code paths we might add.
+    sid_to_panes: dict[str, list[LiveSession]] = {}
+    for ls in out:
+        if ls.session_id:
+            sid_to_panes.setdefault(ls.session_id, []).append(ls)
+    for sid, ls_list in sid_to_panes.items():
+        if len(ls_list) > 1:
+            panes_str = ", ".join(ls.pane for ls in ls_list)
+            if verbose:
+                click.echo(
+                    f"    COLLISION: session-id {sid[:8]} resolved for {len(ls_list)} panes ({panes_str}); "
+                    f"clearing all — they will relaunch FRESH (no --resume) to avoid stealing each other's chat"
+                )
+            for ls in ls_list:
+                ls.session_id = None
+                ls.transcript_path = None
+
     return out
 
 
