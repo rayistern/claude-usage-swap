@@ -1408,14 +1408,21 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     # forth with no usage on this machine." Root cause: 7d/5h numbers were
     # high due to OTHER machines' consumption, but locally we weren't
     # spending anything. Every cycle the threshold tripped on stale-high
-    # numbers and triggered a swap. The threshold is a signal that we need
-    # MORE headroom — but if we're not consuming anything on this machine,
-    # we have all the headroom we need; swapping is just wasted activity.
+    # numbers and triggered a swap.
+    #
+    # Saturation override (GH #19, fixed 2026-05-25): when cur_pct is at
+    # or above `saturation_pct` (default 95%), SKIP the growth gate. At
+    # full saturation the account literally can't go higher, so delta=0
+    # is unavoidable — gating on growth would trap us on the maxed account
+    # forever (the exact bug reported: "ran out of usage, didn't auto
+    # swap"). Above saturation, the account is effectively exhausted and
+    # we MUST swap regardless of whether this machine drove the growth.
     #
     # Reactive-429 and hard-7d-cap paths above intentionally bypass this
     # gate — they're emergencies. Only the ladder is gated.
     growth_cfg = config.get("usage_growth_gate", {})
-    if growth_cfg.get("enabled", True):
+    saturation_pct = growth_cfg.get("saturation_pct", 95)
+    if growth_cfg.get("enabled", True) and cur_pct < saturation_pct:
         min_delta_pct = growth_cfg.get("min_delta_pct", 0.5)
         prev_5h = active_acct.get("prev_current_5h_pct")
         prev_7d = active_acct.get("prev_current_7d_pct")
@@ -1436,6 +1443,11 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
                 f"(max delta {max(deltas):.2f}% < {min_delta_pct}%); skipping swap"
             )
             return None
+    elif growth_cfg.get("enabled", True) and cur_pct >= saturation_pct:
+        click.echo(
+            f"  ladder threshold tripped ({current} at {cur_pct:.1f}%) — at/above "
+            f"saturation_pct={saturation_pct}%, bypassing growth gate"
+        )
 
     target = pick_swap_target(state, config)
     if target is None:
@@ -2636,7 +2648,15 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
                 ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
                 if not ok:
-                    click.echo(f"      timed out waiting for Stop; proceeding anyway")
+                    # GH #19: escalate to tier 3 on pause-response timeout
+                    # rather than just proceeding anyway. The pause_message
+                    # apparently didn't land (session stuck in tool call);
+                    # force interrupt is the right next step.
+                    click.echo(f"      pause_message timed out; escalating to tier 3 (force double-Escape)")
+                    tmux_send_keys(s.pane, "Escape")
+                    time.sleep(0.3)
+                    tmux_send_keys(s.pane, "Escape")
+                    time.sleep(0.5)
         elif tier == 3:
             if is_idle:
                 # Idle — no running tool to interrupt; skip Escape.
@@ -2660,19 +2680,57 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
             if is_idle:
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — already at turn boundary, no wait")
             else:
+                # Escalation ladder (GH #19, 2026-05-25 user directive):
+                # tier 1 timeout → escalate to tier 2 (send pause_message)
+                # tier 2 timeout → escalate to tier 3 (force double-Escape)
+                # tier 3 timeout → skip pane (proceed with others)
+                #
+                # The 2026-05-24 incident: tier 1 wait_for_stop timed out
+                # after 300s on a stuck pane; the orchestrator aborted the
+                # ENTIRE swap. User feedback: "its supposed to step in and
+                # send a message to wrap up so we can swap (in the event
+                # that the session is just going and going)." That's exactly
+                # what tier 2 was designed for — but tier was determined
+                # from next_swap_at_pct (which was 70 → tier 1), not from
+                # actual stuck-state. The fix: on tier 1 timeout, ESCALATE
+                # rather than abort.
                 stop_timeout = hot.get("stop_wait_timeout_seconds", 300)
                 click.echo(f"    pane {s.pane}: mid-turn — waiting for Stop (up to {stop_timeout}s)")
                 ok = wait_for_stop(s.session_id, stop_timeout)
                 if not ok:
-                    click.echo(f"      timed out; aborting (will retry next cycle)")
-                    return
+                    # Escalate to tier 2: send pause_message and wait again.
+                    click.echo(f"      tier 1 timed out; escalating to tier 2 (sending pause_message)")
+                    tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+                    pause_timeout = hot.get("pause_response_timeout_seconds", 120)
+                    ok2 = wait_for_stop(s.session_id, pause_timeout)
+                    if not ok2:
+                        # Escalate to tier 3: double-Escape force interrupt.
+                        click.echo(f"      tier 2 timed out; escalating to tier 3 (force double-Escape)")
+                        tmux_send_keys(s.pane, "Escape")
+                        time.sleep(0.3)
+                        tmux_send_keys(s.pane, "Escape")
+                        time.sleep(0.5)
+                        shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
+                        if shell_note:
+                            append_inbox(
+                                "deviation",
+                                f"Force-interrupted pane {s.pane} (tier 3 escalation from tier 1)",
+                                f"Account `{current}` was force-swapped to `{decision.target}` after tier-1+tier-2 timeouts on pane {s.pane} (session {s.session_id[:8]}). Active tool calls at time of interrupt:\n\n```\n{shell_note}\n```\n\n**Walk-back**: re-issue the interrupted commands in a fresh session on the now-active account, or `cus switch {current}` to go back to the original.",
+                            )
+                        # We proceed regardless — escape is best-effort.
+                        # If THIS also somehow fails, skip the pane.
+                        # (Detected later via wait_for_shell failing.)
 
     # /exit each pane — see tmux_exit_claude docstring for the draft-handling
     # modes. Default "submit" preserves the user's in-progress draft as a sent
     # message; "clear" brute-force-wipes the input box before /exit (legacy,
     # destroys drafts). Configurable via hot_swap.draft_handling (GH #11).
+    # Per GH #19: skip panes that timed out during the Stop-wait above.
     draft_handling = hot.get("draft_handling", "submit")
     for s in swappable:
+        if getattr(s, "_stuck_skip", False):
+            click.echo(f"    pane {s.pane}: skipping /exit (Stop-wait timed out — leaving on old account)")
+            continue
         click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
         tmux_exit_claude(s.pane, draft_handling=draft_handling)
 
@@ -2683,12 +2741,20 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     shell_timeout = hot.get("shell_return_timeout_seconds", 10)
     panes_ready: list[LiveSession] = []
     for s in swappable:
+        if getattr(s, "_stuck_skip", False):
+            # Already skipped /exit; don't wait for shell either.
+            continue
         if wait_for_shell(s.pane, timeout_seconds=shell_timeout):
             panes_ready.append(s)
         else:
             click.echo(f"    WARN: pane {s.pane} didn't return to shell in {shell_timeout}s; skipping relaunch")
 
     if not panes_ready:
+        # No panes reached shell prompt — could be all stuck or all timed out
+        # on shell-return. Either way, do the cred swap anyway so future
+        # claude invocations use the new account. This also handles the
+        # GH #19 case where ALL panes were stuck mid-turn: we still want the
+        # underlying account swap to happen.
         click.echo(f"    no panes reached shell prompt; doing cred swap only (no relaunch)")
         execute_swap(decision.target, trigger=f"auto-tier{tier}-noreloaunch")
         return
@@ -3536,7 +3602,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 and current_max_pct(active_usage, config) >= threshold
             )
             if wanted:
-                click.echo(f"  threshold tripped on {active} ({current_max_pct(active_usage, config):.1f}% >= {threshold}%) but no valid swap target")
+                # Distinguish "no target available" from "gate suppressed."
+                # The gate-suppression paths (growth gate, hysteresis) already
+                # logged their own reason inside decide_swap. We only print
+                # "no valid swap target" if pick_swap_target would also fail
+                # — otherwise we'd be misleading the operator about WHY the
+                # swap didn't fire. Bug fixed 2026-05-25 (GH #19).
+                if pick_swap_target(state, config) is None:
+                    click.echo(f"  threshold tripped on {active} ({current_max_pct(active_usage, config):.1f}% >= {threshold}%) but no valid swap target")
             for name, acct in state["accounts"].items():
                 marker = " *" if name == state["active"] else "  "
                 te = " (TOKEN_EXPIRED)" if acct.get("token_expired") else ""
