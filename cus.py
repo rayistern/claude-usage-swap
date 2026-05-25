@@ -2325,6 +2325,16 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             continue
         by_pane[pane] = e
 
+    # GH #22: count how many panes share each cwd. The newest-mtime
+    # fallback (step 3 below) is CWD-wide and can't disambiguate between
+    # panes sharing a cwd — so we skip it entirely when 2+ panes share a
+    # cwd. Better to relaunch fresh than to copy someone else's chat.
+    cwd_pane_count: dict[str, int] = {}
+    for _p, _e in by_pane.items():
+        c = _e.get("cwd", "")
+        if c:
+            cwd_pane_count[c] = cwd_pane_count.get(c, 0) + 1
+
     out: list[LiveSession] = []
     for pane, e in by_pane.items():
         if account_filter and e["account"] != account_filter:
@@ -2336,27 +2346,26 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             # Pane is back to shell (or running something else). No live claude.
             continue
 
-        # Pick session-id with FALLBACK CHAIN (GH #21, 2026-05-25):
-        #   1. /proc cmdline --resume arg (GH #10) — strongest signal when
-        #      claude was launched with --resume <id> AND the JSONL exists
-        #   2. newest-mtime .jsonl in cwd's project dir, mtime within 1 hour
-        #      — strong signal because claude is actively writing to it RIGHT
-        #      NOW. Handles "user manually /exit + claude (fresh)" case where
-        #      cmdline has no --resume.
-        #   3. sessions.log latest for this pane (SessionStart hook log) —
-        #      weaker because the hook may not have fired or may be stale
-        #   4. sessions.log latest UNVALIDATED — last resort so we always
-        #      have SOMETHING to attempt --resume with
+        # Pick session-id with FALLBACK CHAIN (GH #21/#22, 2026-05-25):
+        #   1. /proc cmdline --resume arg (GH #10) — strongest signal: it's
+        #      pane-specific AND the canonical id the process was launched
+        #      with. Used only if the JSONL exists.
+        #   2. sessions.log latest for THIS PANE (SessionStart hook log) —
+        #      pane-specific, validated to have an existing JSONL.
+        #   3. newest-mtime .jsonl in cwd's project dir, mtime within 1h —
+        #      LAST resort because it's CWD-WIDE, not pane-specific. When
+        #      multiple panes share a cwd (very common: window splits in
+        #      the same project), this picks the same JSONL for ALL of
+        #      them — wrong for all but one. Only fall through to this if
+        #      sessions.log entry is missing/invalid AND cmdline gave None.
+        #   4. None → relaunch FRESH (no --resume) per user directive
         #
-        # Each candidate is validated to have an actual .jsonl file before
-        # we accept it (except the desperate fallback).
-        #
-        # 2026-05-25 incident: pane %11 cmdline said --resume 28eac355-...,
-        # but only `28eac355.../tool-results/` existed — the .jsonl had been
-        # cleaned up (claude internal compaction/rotation). Relaunching with
-        # --resume 28eac355 → "No conversation found." User also noted
-        # "we often have multiple sessions in the same tmux (like close and
-        # open a new one manually)" — covered by the newest-mtime fallback.
+        # GH #22 (2026-05-25): user reported "the window for CKids1a opened
+        # to the chat that was in the tmux window for gym3a." Both panes
+        # (%11 and %12) had cwd /home/rayi/repos/vibeCoding; both fell through
+        # to newest-mtime which returned the same id for both → both
+        # relaunched into the same chat. Fix: promote sessions.log above
+        # newest-mtime so pane-specific data wins.
         cwd = e.get("cwd", "")
         live_sid = pane_live_session_id(pane)
 
@@ -2368,15 +2377,26 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         transcript = None
         chosen_source = None
 
-        # Step 1: cmdline (validated)
+        # Step 1: cmdline (validated). Pane-specific.
         if live_sid:
             t = _validate(live_sid)
             if t:
                 sid, transcript, chosen_source = live_sid, t, "cmdline"
 
-        # Step 2: newest-mtime JSONL in cwd's project dir (validated by mtime
-        # < 1h to filter against stale files from previous days)
-        if sid is None and cwd:
+        # Step 2: sessions.log latest for THIS PANE (validated). Pane-specific.
+        if sid is None:
+            t = _validate(e["session_id"])
+            if t:
+                sid, transcript, chosen_source = e["session_id"], t, "sessions.log"
+
+        # Step 3: newest-mtime .jsonl in cwd's project dir (validated by
+        # mtime < 1h). CWD-WIDE, not pane-specific — only safe to use when
+        # we have NO better signal AND only ONE live pane is in this cwd.
+        # GH #22: if multiple panes share this cwd, the newest-mtime would
+        # return the same id for ALL of them, causing them to relaunch into
+        # the same chat. We skip the fallback in that case (sid stays None;
+        # relaunch will be plain `claude` no --resume).
+        if sid is None and cwd and cwd_pane_count.get(cwd, 0) <= 1:
             try:
                 projects_root = Path.home() / ".claude" / "projects"
                 encoded = cwd.replace("/", "-")
@@ -2394,12 +2414,6 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
                             break
             except OSError:
                 pass
-
-        # Step 3: sessions.log latest (validated)
-        if sid is None:
-            t = _validate(e["session_id"])
-            if t:
-                sid, transcript, chosen_source = e["session_id"], t, "sessions.log"
 
         # Step 4 (user directive 2026-05-25): no fallback to unvalidated.
         # If no candidate has a JSONL, sid stays None and the relaunch logic
