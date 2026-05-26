@@ -220,6 +220,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # before the next pane piles on. 0 disables staggering (relaunch all at
         # once, the pre-GH#25 behavior).
         "relaunch_stagger_seconds": 2.0,
+        # Lookback window (seconds) for the tool_use.log "session is in active
+        # multi-step work" check that feeds session_is_idle (GH #33). When the
+        # JSONL has been stale longer than mid_turn_idle_seconds but the
+        # session has had ANY tool entry within this window, treat it as
+        # mid-turn for pause-message / Escape routing. The 2026-05-26 incident:
+        # panes running tools every ~30s with one occasional ~3min gap were
+        # classified idle by the JSONL-mtime check alone, so the pause-message
+        # was skipped and /exit interrupted them mid-work. The default 300s
+        # (5 min) catches typical tool-call cadences with text-generation gaps;
+        # operators who want more aggressive routing (warn anything that
+        # touched a tool in the last 10 min) can bump higher, or lower it
+        # toward 30s if they prefer the GH #4 caution.
+        "activity_lookback_seconds": 300,
+        # Lookback for the post-/exit session-id walkback (GH #32). After
+        # /exit + wait_for_shell, if the chosen session_id still has no
+        # JSONL it's a ghost — walk backwards through sessions.log entries
+        # for the same pane, picking the most recent within this window
+        # whose JSONL exists. Default 1 hour balances "find the user's last
+        # real session" vs "don't reopen something from yesterday." If
+        # nothing in the window has a JSONL, the relaunch is plain `claude`
+        # (no --resume) per the GH #20 directive.
+        "relaunch_walkback_lookback_seconds": 3600,
     },
     "subagent_skip": {
         "enabled": True,
@@ -2263,6 +2285,12 @@ def subagent_active(session: LiveSession, config: dict, idle_seconds: int = 60) 
 
     Heuristic: count tool_use.log entries for this session_id where the
     last entry is "start" (no matching "stop") within the recent window.
+
+    Note: this function uses a deliberately SHORT 60s window because it
+    feeds the swap-defer guard at the orchestrator (GH #27) — a tool stuck
+    longer than 60s shouldn't be allowed to block swaps indefinitely. For
+    the longer-lookback "session is doing active work" question used by
+    pause-message routing (GH #33), see `session_has_recent_tool_activity`.
     """
     if not TOOL_USE_LOG.exists():
         return False
@@ -2290,6 +2318,65 @@ def subagent_active(session: LiveSession, config: dict, idle_seconds: int = 60) 
     return in_flight > 0
 
 
+def session_has_recent_tool_activity(session_id: str, lookback_seconds: int = 300) -> bool:
+    """Return True if the session had ANY tool_use.log entry in the last lookback window.
+
+    Used by `session_is_idle` (GH #33) to catch sessions in the middle of an
+    active multi-step task even when there's a multi-minute gap between the
+    last tool's PostToolUse and the swap check moment. The JSONL-mtime check
+    alone misses these because: (a) tool I/O between PreToolUse and PostToolUse
+    doesn't always flush to the JSONL on its own clock, and (b) Claude's
+    "thinking" text between tools may not update the file every second either.
+
+    The 2026-05-26 incident: panes %14 and %18 were tool-active 3–4 minutes
+    before the swap (one tool every ~30s before that gap) but happened to be
+    in a between-tools lull at the exact 20:21:53 check moment. The 30s
+    JSONL-mtime threshold marked them idle. cus skipped the pause-message,
+    then `/exit` interrupted them mid-work.
+
+    The user's mental model (queued-message-is-harmless): if the session is
+    currently doing tools, the pause-message slips in via tmux send-keys and
+    becomes the next thing claude sees after its current Stop. If the session
+    is truly between turns (input prompt focused), the message is submitted
+    as a billed user turn — that's the cost. GH #4 worried about this cost;
+    GH #33 says the cost is worth it for the active-task case.
+
+    Distinct from `subagent_active`:
+      - `subagent_active` uses a 60s window because it powers the swap-defer
+        guard (don't let a stuck tool block swaps indefinitely); it also
+        tracks in-flight (start without matching stop) only.
+      - This function takes a longer window (default 5min) and counts ANY
+        entry — start OR stop, matched or not — as evidence the session is
+        in active work. We don't care whether a specific tool is currently
+        running, only whether the session is in an "is working" state.
+
+    `lookback_seconds` defaults to 300 (5 min); operators tune via
+    `hot_swap.activity_lookback_seconds` to make pause-message routing more
+    or less aggressive.
+    """
+    if not TOOL_USE_LOG.exists() or not session_id:
+        return False
+    cutoff = time.time() - lookback_seconds
+    try:
+        with TOOL_USE_LOG.open() as f:
+            for line in f:
+                parts = line.strip().split(",", 3)
+                if len(parts) < 4:
+                    continue
+                ts_str, sid, _, _ = parts
+                if sid != session_id:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if ts >= cutoff:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def wait_for_stop(session_id: str, timeout_seconds: int) -> bool:
     """Block until a fresh Stop signal is seen for session_id, or timeout."""
     deadline = time.monotonic() + timeout_seconds
@@ -2302,24 +2389,134 @@ def wait_for_stop(session_id: str, timeout_seconds: int) -> bool:
     return False
 
 
-def session_is_idle(session: LiveSession, idle_seconds: int) -> bool:
-    """Return True if the session's transcript has had no new writes in `idle_seconds`.
+def session_is_idle(
+    session: LiveSession,
+    idle_seconds: int,
+    activity_lookback_seconds: int = 300,
+) -> bool:
+    """Return True if the session is genuinely between turns (NOT actively working).
 
-    This is the "already past its last Stop" check: if no JSONL activity for
-    `idle_seconds`, the session is between turns — Claude is at the input
-    prompt, not generating. We can swap *immediately* in this state, no
-    need to wait for a fresh Stop signal (which won't fire until the user
-    types something next).
+    Two-source check:
+      (1) JSONL mtime — recent (< idle_seconds) write means Claude was just
+          generating text or flushing tool I/O. Mid-turn.
+      (2) tool_use.log entry in last `activity_lookback_seconds` — even with
+          a stale JSONL mtime, a tool PreToolUse/PostToolUse in the recent
+          past means the session is in an active multi-step task. The 30s
+          JSONL window is too short to catch sessions doing tools at a slower
+          cadence (one tool per few minutes, or long tool gaps with text
+          generation in between).
 
-    Returns False if we can't determine (no transcript path, can't stat).
+    A session is idle ONLY if BOTH signals say so: stale JSONL mtime AND no
+    recent tool activity. Either signal of life flips it back to mid-turn.
+
+    GH #33 (2026-05-26): the user reported the pause-message landing in a
+    "basically paused" session while skipping two "running" sessions. The
+    "running" sessions had had tools every ~30s up until a multi-minute gap
+    just before the swap — long enough for the 30s JSONL-mtime window to
+    expire but still within the operator's intuitive "this session is
+    actively doing things" window. The fix: extend the detection horizon to
+    cover this gap by ORing in the tool_use.log lookback.
+
+    Affects TWO call sites:
+      - Pause-message routing (tier 2/3): the main reason for this change.
+        More sessions classified mid-turn → more pause-messages sent. Cost:
+        tier-2 pause-messages to "stale-but-not-truly-idle" sessions become
+        billed user turns instead of queued-and-forgotten. The user accepted
+        this cost: "a message queued will slip in and stop the AI."
+      - Tier 1 cache-bust check (line ~2911): tier-1 swaps now defer more
+        often on stale-but-active sessions. Probably also desired (don't
+        burn the cache on a session that's been doing work) but a behavior
+        change worth knowing.
+
+    Returns False (= not idle) if we can't determine — defensive default,
+    matches prior behavior for sessions without a transcript.
     """
+    # Source (1): JSONL mtime.
     if session.transcript_path is None or not session.transcript_path.exists():
         return False
     try:
         mtime = datetime.fromtimestamp(session.transcript_path.stat().st_mtime, tz=timezone.utc)
-        return (datetime.now(timezone.utc) - mtime).total_seconds() > idle_seconds
+        jsonl_stale = (datetime.now(timezone.utc) - mtime).total_seconds() > idle_seconds
     except OSError:
         return False
+    if not jsonl_stale:
+        return False  # JSONL was just written — definitely mid-turn
+
+    # Source (2): tool_use.log recent activity. JSONL was stale, but the
+    # session might still be in an active task (between tools with a gap).
+    if session.session_id and session_has_recent_tool_activity(
+        session.session_id, activity_lookback_seconds
+    ):
+        return False  # recent tool activity — treat as mid-turn
+
+    return True
+
+
+def _resolve_relaunch_session_id(
+    session: LiveSession,
+    max_lookback_seconds: int = 3600,
+) -> tuple[str | None, Path | None]:
+    """Re-validate session-id at relaunch time, walking back through sessions.log if needed.
+
+    Called from the hot-swap orchestrator AFTER `/exit` + `wait_for_shell` —
+    by that point the GH #22 race window (SessionStart fired but JSONL not yet
+    written) has had 5–10 seconds to resolve. If the JSONL STILL doesn't
+    exist, the session-id picked at decision time is a ghost: it had a
+    SessionStart event but the session died before writing its first
+    transcript line. `claude --resume <ghost-id>` will fail with "No
+    conversation found."
+
+    GH #32 (2026-05-26): pane %15 had two SessionStart events 5 seconds
+    apart (490479c7 then fa0d9122). The first never wrote a JSONL. cus's
+    `find_live_panes` step 2 (GH #23 fix) accepts sessions.log latest
+    unconditionally to survive the race window — correct policy at decision
+    time, wrong at relaunch time when the race has already resolved against
+    us.
+
+    Recovery strategy:
+      1. If the chosen session_id now has a JSONL → use it as-is.
+      2. Otherwise walk backwards through sessions.log entries for THIS
+         pane, oldest-of-recent first, picking the most recent entry whose
+         JSONL exists within `max_lookback_seconds`. Preserves the user's
+         prior real session — strictly better than fresh launch when one
+         is available, since they keep continuity.
+      3. If no entry within the lookback has a JSONL, return (None, None).
+         The caller (`build_relaunch_cmd`) renders a plain `claude` launch
+         (no `--resume`) per the GH #20 directive: "we can just never do
+         that I guess" (better fresh than failed-resume-leaves-dead-shell).
+
+    Returns (session_id, transcript_path); either may be None.
+    """
+    # Step 1: revalidate the originally-picked session.
+    if session.session_id:
+        t = _find_transcript(session.session_id, session.cwd)
+        if t and t.exists():
+            return session.session_id, t
+
+    # Step 2: walk back through sessions.log for this pane.
+    entries = _parse_sessions_log()
+    pane_entries = [e for e in entries if e.get("pane") == session.pane]
+    pane_entries.reverse()  # latest first
+    now = datetime.now(timezone.utc)
+    for e in pane_entries:
+        sid_candidate = e.get("session_id")
+        if not sid_candidate:
+            continue
+        if sid_candidate == session.session_id:
+            continue  # already failed above
+        try:
+            ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+        except (ValueError, KeyError):
+            continue
+        if (now - ts).total_seconds() > max_lookback_seconds:
+            break  # too far back; assume nothing useful past here
+        cwd = e.get("cwd") or session.cwd
+        t = _find_transcript(sid_candidate, cwd)
+        if t and t.exists():
+            return sid_candidate, t
+
+    # Step 3: nothing valid found.
+    return None, None
 
 
 def find_live_panes(account_filter: str | None = None, verbose: bool = False) -> list[LiveSession]:
@@ -2424,6 +2621,111 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             t = _validate(live_sid)
             if t:
                 sid, transcript, chosen_source = live_sid, t, "cmdline"
+
+        # Step 1.5: cmdline-staleness override (GH #33-followup, 2026-05-26).
+        #
+        # /proc/<pid>/cmdline reflects the LAUNCH-TIME arguments. When the user
+        # uses Claude Code's in-process `/resume` slash-command to switch
+        # sessions WITHIN a running claude, the process doesn't fork — it just
+        # switches which JSONL it writes to. cmdline keeps showing the
+        # original --resume id forever, even after the user has moved to a
+        # completely different session.
+        #
+        # The 2026-05-26 incident: pane %18 cmdline shows `--resume a7ad2f4d`
+        # (launched ~hours ago), but the user /resume'd to c3c2cd5a inside
+        # claude and has been writing 600+ tool entries to c3c2cd5a.jsonl
+        # since. Step 1 happily picked a7ad2f4d (validation passed: that
+        # JSONL exists, just hasn't been touched in 2+ hours). The swap then
+        # relaunched into the wrong session, and idle-checks/pause-routing
+        # consulted the wrong JSONL's mtime.
+        #
+        # Detection: among ALL sessions.log entries for THIS PANE (which
+        # SessionStart fires for, including in-process /resume), find the
+        # one whose JSONL has the MOST RECENT mtime. If that mtime is more
+        # recent than cmdline's chosen JSONL's mtime, prefer it — the
+        # actively-written-to JSONL is the canonical "what session is this
+        # pane on" signal. cmdline is treated as a hint that may be stale.
+        #
+        # Pane-specificity: we filter `entries` by pane field, so we never
+        # cross panes. No collision risk (the GH #29 post-pass remains as a
+        # belt-and-suspenders check). Sessions.log records the pane each
+        # SessionStart fired in, so cross-pane id-poisoning isn't possible
+        # from this source.
+        #
+        # Discrimination strategy: among ALL sessions.log entries for this
+        # pane within a generous SessionStart-age lookback (cap N for perf),
+        # pick the one whose JSONL has the most recent mtime, provided that
+        # mtime is itself within a tighter "actually-active" window. The two
+        # windows are independent:
+        #   - entry_age_lookback: caps how many sessions.log lines to scan
+        #     and stat (perf concern only; 24h is generous — sessions.log
+        #     grows to 3000+ lines on hot machines, and 24h × N panes keeps
+        #     the scan under a few hundred ms)
+        #   - active_mtime_window: the actual liveness filter — JSONL must
+        #     have been written within this window to be considered live.
+        #     Anything older is stale even if its SessionStart was recent.
+        #
+        # The 2026-05-26 incident proves entry_age can't be tight: c3c2cd5a's
+        # SessionStart for pane %18 was at 18:32:18, the swap was at 20:21:53
+        # — 1h49m later, OUTSIDE a 1h SessionStart-age filter. The session
+        # had been continuously /resume'd-into for those 2 hours; the JSONL
+        # mtime stayed current the whole time. Filtering on entry age would
+        # have missed it; filtering on JSONL mtime correctly catches it.
+        now_ts = now.timestamp()
+        entry_age_lookback = 86400         # 24h — perf cap on stats
+        active_mtime_window = 3600         # 1h — liveness filter on JSONL
+        had_cmdline_pick = sid is not None
+        best_mtime = transcript.stat().st_mtime if transcript and transcript.exists() else 0.0
+        # The active_mtime_window check should also apply to the cmdline pick
+        # — if cmdline's JSONL was last written >1h ago, treat it as
+        # uncompetitive (best_mtime stays 0 and any newer-than-1h pe wins).
+        if best_mtime > 0 and (now_ts - best_mtime) > active_mtime_window:
+            best_mtime = 0.0
+        for pe in entries:
+            if pe.get("pane") != pane:
+                continue
+            pe_ts_str = pe.get("ts")
+            if not pe_ts_str:
+                continue
+            try:
+                pe_ts = datetime.fromisoformat(pe_ts_str.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if now_ts - pe_ts > entry_age_lookback:
+                continue
+            pe_sid = pe.get("session_id")
+            if not pe_sid or pe_sid == sid:
+                continue
+            # Direct path lookup only (skip _find_transcript's fallback
+            # glob across all project dirs — that scan is O(projects) per
+            # call and would push the whole function back over 5s on
+            # 3000-entry logs). Sessions.log entries written by our own
+            # SessionStart hook always record an absolute cwd, so the
+            # canonical encoded-path lookup is sufficient.
+            pe_cwd = pe.get("cwd", cwd)
+            if not pe_cwd:
+                continue
+            pe_t = CLAUDE_DIR / "projects" / pe_cwd.replace("/", "-") / f"{pe_sid}.jsonl"
+            try:
+                pe_mtime = pe_t.stat().st_mtime
+            except (OSError, FileNotFoundError):
+                continue
+            # Liveness: only consider entries whose JSONL is in the active
+            # window. Stale-mtime entries can't be the "what is this pane
+            # currently doing" session.
+            if (now_ts - pe_mtime) > active_mtime_window:
+                continue
+            if pe_mtime > best_mtime:
+                best_mtime = pe_mtime
+                sid, transcript = pe_sid, pe_t
+                # Distinguish "we overrode a stale cmdline" from "filled in
+                # for missing cmdline" — the first is a regression-prone
+                # case worth surfacing in logs; the second is routine.
+                chosen_source = (
+                    "active-jsonl-mtime (cmdline-stale)"
+                    if had_cmdline_pick
+                    else "active-jsonl-mtime"
+                )
 
         # Step 2: sessions.log latest for THIS PANE. Pane-specific. NOT
         # validated against JSONL existence anymore (GH #23 fix): there's
@@ -2904,11 +3206,16 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 swappable = kept
 
     # Cache-bust window (Tier 1 only, non-idle panes only)
+    # GH #33: session_is_idle now ORs in a tool_use.log lookback so sessions
+    # in active multi-step tasks (tool every few min with gaps) stay
+    # classified mid-turn. Net effect here: tier-1 swaps defer more often
+    # on stale-JSONL-but-tool-active sessions. Desired — don't burn cache.
+    activity_lookback = hot.get("activity_lookback_seconds", 300)
     if tier == 1:
         window = hot.get("cache_bust_window_seconds", 300)
         idle_seconds = hot.get("mid_turn_idle_seconds", 30)
         for s in swappable:
-            if session_is_idle(s, idle_seconds):
+            if session_is_idle(s, idle_seconds, activity_lookback):
                 continue
             if s.transcript_path and cache_warm(s.transcript_path, window):
                 click.echo(f"    DEFER: cache warm for active pane {s.pane} (Tier 1 swap would burn cache)")
@@ -2920,7 +3227,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     # signals unconditionally, billing tokens on idle sessions.
     idle_seconds = hot.get("mid_turn_idle_seconds", 30)
     for s in swappable:
-        is_idle = session_is_idle(s, idle_seconds)
+        is_idle = session_is_idle(s, idle_seconds, activity_lookback)
         if tier == 2:
             if is_idle:
                 # Idle — no pause-message needed; session already at turn boundary.
@@ -3040,6 +3347,48 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         click.echo(f"    no panes reached shell prompt; doing cred swap only (no relaunch)")
         execute_swap(decision.target, trigger=f"auto-tier{tier}-noreloaunch")
         return
+
+    # GH #32: re-validate each pane's session-id at relaunch time. By now
+    # /exit has run and wait_for_shell returned — typically 5-10 seconds
+    # past the find_live_panes() decision point. The GH #22 race-window
+    # acceptance ("JSONL will exist by relaunch time") is invalidated if
+    # the JSONL STILL doesn't exist after that wait: the original session
+    # is a ghost (SessionStart fired but session died before first write).
+    # Walk back through sessions.log for that pane to find a real prior
+    # session, or fall back to fresh launch.
+    walkback_lookback = hot.get("relaunch_walkback_lookback_seconds", 3600)
+    for s in panes_ready:
+        new_sid, new_t = _resolve_relaunch_session_id(s, walkback_lookback)
+        if new_sid != s.session_id:
+            old_short = s.session_id[:8] if s.session_id else "None"
+            new_short = new_sid[:8] if new_sid else "None"
+            click.echo(
+                f"    pane {s.pane}: relaunch session-id changed from {old_short} → {new_short} "
+                f"(post-/exit JSONL re-validation; original was a ghost)"
+            )
+            s.session_id = new_sid
+            s.transcript_path = new_t
+
+    # GH #32 + GH #29: collision detector. The walkback above can produce a
+    # session_id that's now shared with another pane (e.g. two panes both
+    # had ghost session_ids that walked back to the same prior session in a
+    # shared cwd). The collision check inside find_live_panes ran BEFORE
+    # walkback so it wouldn't see this — re-run it now over panes_ready and
+    # fall back to fresh launch for any collisions, same policy as GH #29.
+    sid_to_panes_post: dict[str, list[LiveSession]] = {}
+    for s in panes_ready:
+        if s.session_id:
+            sid_to_panes_post.setdefault(s.session_id, []).append(s)
+    for sid_dup, ls_list in sid_to_panes_post.items():
+        if len(ls_list) > 1:
+            panes_str = ", ".join(ls.pane for ls in ls_list)
+            click.echo(
+                f"    POST-WALKBACK COLLISION: session-id {sid_dup[:8]} resolved for {len(ls_list)} panes "
+                f"({panes_str}); clearing all — they will relaunch FRESH (no --resume)"
+            )
+            for ls in ls_list:
+                ls.session_id = None
+                ls.transcript_path = None
 
     # Atomic credential swap
     execute_swap(decision.target, trigger=f"auto-tier{tier}")
