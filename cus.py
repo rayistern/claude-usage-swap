@@ -73,6 +73,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import click
 import yaml
@@ -3412,6 +3413,8 @@ def status() -> None:
             flags.append("RATE_LIMITED")
         if a.get("poll_error"):
             flags.append("POLL_ERROR")
+        if a.get("token_stale"):
+            flags.append("TOKEN_STALE")
         status_col = ",".join(flags) if flags else "ok"
         click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}")
     click.echo()
@@ -4099,11 +4102,23 @@ def _pct_is_unknown(acct: dict) -> bool:
     blocker flags is set, because we don't actually have current data — what's
     stored is last-known-good which may be hours old.
 
+    `token_stale` is included because when the stored access token has aged out
+    we skip the poll entirely and preserve the prior `current_*_pct` values.
+    Across a 5h reset boundary that preserved value silently lies — e.g. a
+    pre-stale 100% gets surfaced as `5h:100%` even after the window has reset
+    to zero. Treating token_stale as unknown surfaces `?` until the account is
+    actually used and the refresh-token-driven mint refreshes our data.
+
     Shows "?" rather than the buggy "0.0" sentinel (or stale numbers) per the
     2026-05-20 user feedback: 0% implied "no usage" which was equally
     misleading as 100% from the prior sentinel bug.
     """
-    return bool(acct.get("rate_limited") or acct.get("token_expired") or acct.get("poll_error"))
+    return bool(
+        acct.get("rate_limited")
+        or acct.get("token_expired")
+        or acct.get("poll_error")
+        or acct.get("token_stale")
+    )
 
 
 def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1) -> str:
@@ -4151,6 +4166,24 @@ def _time_since(iso_str: str | None) -> float | None:
     return -delta if delta is not None else None
 
 
+def _fmt_render_stamp_eastern() -> str:
+    """Wall-clock stamp of WHEN THIS STATUSLINE WAS RENDERED, in US Eastern time.
+
+    The statusline isn't re-rendered on a fixed cadence — Claude Code refreshes
+    it on its own triggers (tmux events, new message, etc.), so a pane that's
+    been idle can be displaying minutes-or-hours-old output. The `poll Nago`
+    countdown only tells you when DATA was last polled relative to the render
+    moment; it doesn't tell you how old the RENDER itself is.
+
+    A wall-clock stamp lets the operator glance at their terminal clock and
+    immediately tell the staleness of the line on screen: "shows 14:23ET but
+    it's 14:45 now → this pane hasn't refreshed in 22min." Eastern because
+    that's the operator's local timezone; format is short (HH:MMet) to fit
+    inside the statusline budget without crowding the percentages.
+    """
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%H:%Met")
+
+
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
@@ -4177,15 +4210,20 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
 
     is_verbose = not compact and (verbose or sl_cfg.get("verbose", False))
 
+    # Wall-clock stamp marking when THIS render fired (Eastern). Appended to
+    # every output path (SOS / warning / compact / verbose) so the operator
+    # can always tell render-time staleness regardless of which branch hit.
+    render_stamp = _fmt_render_stamp_eastern()
+
     # SOS takes priority — if human action is needed, surface it loudly
     conditions = diagnose(state, config)
     urgent = [c for c in conditions if c.severity == "urgent"]
     if urgent:
-        click.echo(f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md")
+        click.echo(f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md · {render_stamp}")
         return
     warning = [c for c in conditions if c.severity == "warning"]
     if warning:
-        click.echo(f"⚠ cus: {warning[0].summary}")
+        click.echo(f"⚠ cus: {warning[0].summary} · {render_stamp}")
         return
 
     # Determine THIS session's account (the one this pane's claude actually
@@ -4213,7 +4251,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     if not is_verbose:
         # Compact mode. Render "?" if we don't have reliable data.
         if _pct_is_unknown(acct):
-            click.echo(f"cus:{active} 5h:? 7d:? nxt:{nx}%")
+            click.echo(f"cus:{active} 5h:? 7d:? nxt:{nx}% · {render_stamp}")
             return
         flag_marker = ""
         if max(fh, sd) >= nx:
@@ -4238,7 +4276,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 poll_part = f" ({_fmt_duration(remaining)} to poll)"
             else:
                 poll_part = " (poll due)"
-        click.echo(f"{prefix} 5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%{poll_part}")
+        click.echo(f"{prefix} 5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%{poll_part} · {render_stamp}")
         return
 
     # Verbose mode.
@@ -4307,7 +4345,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             else:
                 pieces.append(f"poll {_fmt_duration(age)}ago·due now")
 
-    click.echo(pieces_prefix + " | ".join(pieces))
+    click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}")
 
 
 @cli.command(name="sos")
