@@ -1528,6 +1528,44 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     target = pick_swap_target(state, config)
     if target is None:
         return None
+
+    # Anti-pingpong / "must improve" gate (GH #40, 2026-05-27): a LADDER swap
+    # should strictly reduce the active account's effective utilization.
+    # Otherwise we just churn — and live sessions take a tier-1 hit each cycle.
+    #
+    # Observed failure mode: both accounts' 5h windows roll over (correctly
+    # resetting both ladders to the first step), but absolute usage stays in
+    # the same band (e.g. default 77% / merkos 80%, both > step 70). Every
+    # cycle the active account trips the ladder; `pick_swap_target`'s
+    # `headroom_fallback` returns the only candidate even though it would
+    # immediately re-trip its own step; the smart-strategy `burn-soon` bonus
+    # can flip the pick onto the higher-usage account when its 5h resets
+    # sooner. `min_seconds_between_swaps` blocks the immediate swap-back but
+    # then expires — net result is a ~10-minute pingpong, not termination.
+    #
+    # This gate makes the ladder sequence strictly monotone in active-account
+    # effective %, so it provably terminates. Saturated-active rotation still
+    # works (e.g. 95% active, 71% candidate over its own step → swaps).
+    # The hard-7d-cap (line ~1430) and reactive-429 paths intentionally
+    # bypass this gate, same convention as `min_seconds_between_swaps`.
+    #
+    # `_account_effective_pct` is used on BOTH sides for metric symmetry —
+    # `cur_pct` above came from `current_max_pct(cur_usage, …)` (live
+    # AccountUsage) while target reads the state dict; mixing them would
+    # leak 1-2pp drift through small `min_improvement_pct` margins.
+    if hyst_cfg.get("enabled", True):
+        min_improvement = hyst_cfg.get("min_improvement_pct", 3)
+        active_eff = _account_effective_pct(active_acct, config)
+        target_eff = _account_effective_pct(state["accounts"][target.name], config)
+        if target_eff > active_eff - min_improvement:
+            click.echo(
+                f"  ladder swap suppressed: target {target.name} at "
+                f"{target_eff:.1f}% would not improve on active {current} at "
+                f"{active_eff:.1f}% by min_improvement_pct={min_improvement}pp "
+                f"(picker reason: {target.reason})"
+            )
+            return None
+
     return SwapDecision(
         target=target.name,
         reason=f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%",
@@ -4346,6 +4384,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
+    "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
