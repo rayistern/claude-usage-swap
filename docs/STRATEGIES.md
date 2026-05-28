@@ -98,6 +98,27 @@ burn_before_reset:
   min_candidate_headroom_pct: 15 # target's unused 5h headroom must exceed this
 ```
 
+### `defer_swap_near_5h_reset` (GH #51)
+
+The complement of `burn_before_reset`: where that one swaps you **onto** a soon-to-reset account, this one declines to swap **away** from the active account when *its own* 5h window is about to reset anyway. At ~70% climbing toward the ladder step with the 5h reset minutes away, swapping is pointless churn — the reset drops 5h back to ~0 on its own and `maybe_reset_thresholds` resets the ladder. "We could have just easily waited" (user, 2026-05-28).
+
+Applies to the **ladder path only**. Defers (waits, swaps nothing) when all hold:
+
+- the 5h window is the **sole** window at/over the threshold — a reset zeroes 5h but leaves 7d untouched, so if 7d is also over we'd just re-trip next cycle (don't defer);
+- the 5h window resets within `wait_window_minutes`;
+- 5h is **below** `max_defer_pct` — if it's already near the cap, don't gamble on waiting (usage could spike to a real 429 before the reset).
+
+Hard-7d-cap and reactive-429 bypass this (emergencies; 7d doesn't reset soon). The reactive-429 hook is the backstop if usage spikes past the cap before the reset lands.
+
+Config (`defer_swap_near_5h_reset:`):
+
+```yaml
+defer_swap_near_5h_reset:
+  enabled: true                 # walk-back: set false
+  wait_window_minutes: 15       # defer the ladder swap only if 5h resets within this
+  max_defer_pct: 90             # ...unless 5h is already this high (too close to cap to risk waiting)
+```
+
 ---
 
 ## Future strategy directions

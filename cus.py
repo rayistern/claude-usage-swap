@@ -192,6 +192,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "min_reset_gap_minutes": 60,       # active's 5h must reset >= this much later
         "min_candidate_headroom_pct": 15,  # target's unused 5h (100-5h%) must exceed this
     },
+    # Complement of burn_before_reset (GH #51): decline a LADDER swap when the
+    # active account's OWN 5h window is about to reset anyway. At ~70% climbing
+    # toward the step with the 5h reset minutes away, swapping is pointless
+    # churn — the reset drops 5h to ~0 on its own and resets the ladder. "We
+    # could have just easily waited" (user 2026-05-28). The reactive-429 path
+    # is the backstop if usage spikes to the cap before the reset lands.
+    "defer_swap_near_5h_reset": {
+        "enabled": True,
+        "wait_window_minutes": 15,   # defer the ladder swap only if 5h resets within this
+        "max_defer_pct": 90,         # ...unless 5h is already this high (too close to cap to risk waiting)
+    },
     "hot_swap": {
         "enabled": False,        # Phase 3+ — opt-in. Smoke-test before enabling (see 2026-05-19 incident notes).
         "tier_2_at_pct": 75,
@@ -1711,6 +1722,41 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     cur_pct = current_max_pct(cur_usage, config)
     if cur_pct < threshold:
         return None
+
+    # Defer-if-5h-resetting-soon (GH #51, 2026-05-28): the ladder threshold
+    # tripped, but if the pressure is the 5-hour window AND that window is about
+    # to reset, swapping is pointless churn — the reset drops 5h back to ~0 on
+    # its own and maybe_reset_thresholds resets the ladder. "We could have just
+    # easily waited" (user). So WAIT instead of swapping.
+    #
+    # Guards:
+    #   - only when the 5h window is the SOLE window at/over threshold: a reset
+    #     zeroes 5h but leaves 7d untouched, so if 7d is also over we'd just
+    #     re-trip next cycle — waiting wouldn't help, don't defer;
+    #   - only when 5h resets within wait_window_minutes;
+    #   - NOT when 5h is already at/above max_defer_pct (too close to the cap to
+    #     gamble on waiting — usage could spike to a real 429 first; if we are
+    #     wrong, the reactive-429 path is still the backstop).
+    # Hard-7d-cap and reactive-429 bypass this (emergencies / 7d doesn't reset
+    # soon), same convention as the growth + improvement gates below.
+    defer_cfg = config.get("defer_swap_near_5h_reset", {})
+    if defer_cfg.get("enabled", True):
+        th_cfg = config.get("thresholds", {})
+        wait_window_s = defer_cfg.get("wait_window_minutes", 15) * 60
+        max_defer_pct = defer_cfg.get("max_defer_pct", 90)
+        cur_5h = cur_usage.five_hour.utilization if cur_usage.five_hour else 0.0
+        cur_7d_val = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
+        five_h_over = th_cfg.get("five_hour", True) and cur_5h >= threshold
+        seven_d_over = th_cfg.get("seven_day", True) and cur_7d_val >= threshold
+        if five_h_over and not seven_d_over and cur_5h < max_defer_pct:
+            time_to_reset_s = _five_hour_remaining_seconds(cur_usage, active_acct)
+            if time_to_reset_s is not None and 0 < time_to_reset_s <= wait_window_s:
+                click.echo(
+                    f"  ladder threshold tripped ({current} 5h={cur_5h:.0f}% >= {threshold}%) "
+                    f"BUT 5h resets in {time_to_reset_s / 60:.0f}min (<= {wait_window_s // 60}min window) "
+                    f"and 5h < max_defer_pct({max_defer_pct}%); WAITING for the reset instead of swapping"
+                )
+                return None
 
     # Usage-growth gate (GH #15): only swap via the ladder if the active
     # account's local usage is ACTUALLY GROWING since the previous poll.
