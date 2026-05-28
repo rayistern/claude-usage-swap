@@ -5080,7 +5080,16 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             r7 = _time_until(a.get("seven_day_resets_at"))
             r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
             r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown else ""
-            r5_str = click.style(r5_raw, dim=True) if color_on and r5_raw else r5_raw
+            # Time left on the ACTIVE account's 5h clock is the key operational
+            # number — it's the runway on the account you're actually using AND
+            # what the burn-before-reset trigger (GH #42) keys on — so make it
+            # POP (bold bright-magenta + a ↻ glyph) instead of dimming it like
+            # everything else. Other accounts' 5h and everyone's 7d stay dim.
+            if is_active and r5_raw:
+                r5_disp = f" ↻{_fmt_duration(r5)}"
+                r5_str = click.style(r5_disp, fg="bright_magenta", bold=True) if color_on else r5_disp
+            else:
+                r5_str = click.style(r5_raw, dim=True) if color_on and r5_raw else r5_raw
             r7_str = click.style(r7_raw, dim=True) if color_on and r7_raw else r7_raw
             parts.append(f"5h:{pct5}{r5_str}")
             parts.append(f"7d:{pct7}{r7_str}")
