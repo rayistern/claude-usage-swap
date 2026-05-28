@@ -297,6 +297,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_other_accounts": True,      # in verbose mode, include other account states
         "show_poll_age": True,            # include "polled Nago"
         "show_reset_times": True,         # show time until 5h / 7d resets
+        # ANSI color (GH #38). Claude Code's statusLine renders ANSI, so we
+        # force color through even though stdout is a pipe. Honors NO_COLOR.
+        "color": True,                    # colorize percentages / active account / flags
     },
     "accounts": [],              # filled in at init time from discovery
 }
@@ -4899,6 +4902,35 @@ def _fmt_render_stamp_eastern() -> str:
     return datetime.now(ZoneInfo("America/New_York")).strftime("%H:%Met")
 
 
+def _sl_color_on(sl_cfg: dict) -> bool:
+    """Whether to emit ANSI color in the statusline (GH #38).
+
+    Claude Code's statusLine renders ANSI color codes, and `cus statusline` is
+    normally piped to it (not a TTY) — so we force color through `click.echo`
+    with `color=True` rather than letting click strip it on a non-TTY stream.
+    Honors the NO_COLOR convention and the `statusline.color` config toggle.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(sl_cfg.get("color", True))
+
+
+def _sl_pct(value: float, nxt: float, on: bool) -> str:
+    """Format a usage percentage, colored by proximity to its swap point (GH #38).
+
+    green below 80% of `nxt` · yellow approaching `nxt` · bold red at/over `nxt`,
+    so the eye lands on whichever window is closest to triggering a swap.
+    """
+    txt = f"{value:.0f}%"
+    if not on:
+        return txt
+    if value >= nxt:
+        return click.style(txt, fg="red", bold=True)
+    if value >= nxt * 0.8:
+        return click.style(txt, fg="yellow")
+    return click.style(txt, fg="green")
+
+
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
@@ -4906,7 +4938,11 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     """One-line summary for Claude Code statusline integration.
 
     Compact (default): `cus:<account> 5h:NN% 7d:NN% nxt:NN%` or `🚨 SOS: ...`.
-    Verbose: `cus:<active> 5h NN%·1h23m 7d NN%·3d | <other> 5h NN% 7d NN% | poll Nago`.
+    Verbose: `cus <active>* 5h:NN%·1h23m 7d:NN%·3d nxt:NN% | <other> 5h:NN% 7d:NN% nxt:NN% | poll Nago`.
+
+    Percentages are colored by proximity to the swap point (green/yellow/red)
+    and the active account is bold-cyan when `statusline.color` is on (GH #38);
+    NO_COLOR disables it. Claude Code's statusLine renders the ANSI.
 
     Verbosity priority: --compact flag > --verbose flag > config.statusline.verbose.
 
@@ -4922,6 +4958,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     state = read_json(STATE_JSON)
     config = load_config()
     sl_cfg = config.get("statusline", {})
+    color_on = _sl_color_on(sl_cfg)  # GH #38
 
     is_verbose = not compact and (verbose or sl_cfg.get("verbose", False))
 
@@ -4934,11 +4971,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     conditions = diagnose(state, config)
     urgent = [c for c in conditions if c.severity == "urgent"]
     if urgent:
-        click.echo(f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md · {render_stamp}")
+        msg = f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md · {render_stamp}"
+        click.echo(click.style(msg, fg="red", bold=True) if color_on else msg, color=color_on)
         return
     warning = [c for c in conditions if c.severity == "warning"]
     if warning:
-        click.echo(f"⚠ cus: {warning[0].summary} · {render_stamp}")
+        msg = f"⚠ cus: {warning[0].summary} · {render_stamp}"
+        click.echo(click.style(msg, fg="yellow", bold=True) if color_on else msg, color=color_on)
         return
 
     # Determine THIS session's account (the one this pane's claude actually
@@ -4963,17 +5002,22 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     sd = acct.get("current_7d_pct", 0)
     nx = acct.get("next_swap_at_pct", 50)
 
+    # GH #38: a colored, bold active-account label reused by both compact and
+    # verbose so the eye lands on which account is in play.
+    active_lbl = click.style(active, fg="cyan", bold=True) if color_on else active
+    nxt_lbl = (lambda n: click.style(f"nxt:{n}%", dim=True) if color_on else f"nxt:{n}%")
+
     if not is_verbose:
         # Compact mode. Render "?" if we don't have reliable data.
         if _pct_is_unknown(acct):
-            click.echo(f"cus:{active} 5h:? 7d:? nxt:{nx}% · {render_stamp}")
+            click.echo(f"cus:{active_lbl} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
             return
         flag_marker = ""
         if max(fh, sd) >= nx:
             flag_marker = "⚠"
         elif max(fh, sd) >= nx * 0.8:
             flag_marker = "·"
-        prefix_bits = [f"cus:{active}"]
+        prefix_bits = [f"cus:{active_lbl}"]
         if pending_swap:
             prefix_bits.append(f"→{machine_active}")
         if flag_marker:
@@ -4991,7 +5035,11 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 poll_part = f" ({_fmt_duration(remaining)} to poll)"
             else:
                 poll_part = " (poll due)"
-        click.echo(f"{prefix} 5h:{fh:.0f}% 7d:{sd:.0f}% nxt:{nx}%{poll_part} · {render_stamp}")
+        click.echo(
+            f"{prefix} 5h:{_sl_pct(fh, nx, color_on)} 7d:{_sl_pct(sd, nx, color_on)} "
+            f"{nxt_lbl(nx)}{poll_part} · {render_stamp}",
+            color=color_on,
+        )
         return
 
     # Verbose mode.
@@ -5010,6 +5058,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     def fmt_account(name: str, a: dict, is_active: bool) -> str:
         h5 = a.get("current_5h_pct", 0)
         h7 = a.get("current_7d_pct", 0)
+        nxt = a.get("next_swap_at_pct", 50)
         unknown = _pct_is_unknown(a)
         flags = []
         if a.get("token_expired"):
@@ -5018,21 +5067,32 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             flags.append("429")
         flag_str = "(" + ",".join(flags) + ")" if flags else ""
         marker = "*" if is_active else ""
-        parts = [f"{name}{marker}"]
-        pct5 = "?" if unknown else f"{h5:.0f}%"
-        pct7 = "?" if unknown else f"{h7:.0f}%"
+        # GH #38: bold-cyan the active account; dim the others so the eye lands
+        # on the one in play.
+        name_lbl = f"{name}{marker}"
+        if color_on:
+            name_lbl = click.style(name_lbl, fg="cyan", bold=True) if is_active else click.style(name_lbl, dim=True)
+        parts = [name_lbl]
+        pct5 = "?" if unknown else _sl_pct(h5, nxt, color_on)
+        pct7 = "?" if unknown else _sl_pct(h7, nxt, color_on)
         if show_resets:
             r5 = _time_until(a.get("five_hour_resets_at"))
             r7 = _time_until(a.get("seven_day_resets_at"))
-            r5_str = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
-            r7_str = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown else ""
+            r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
+            r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown else ""
+            r5_str = click.style(r5_raw, dim=True) if color_on and r5_raw else r5_raw
+            r7_str = click.style(r7_raw, dim=True) if color_on and r7_raw else r7_raw
             parts.append(f"5h:{pct5}{r5_str}")
             parts.append(f"7d:{pct7}{r7_str}")
         else:
             parts.append(f"5h:{pct5}")
             parts.append(f"7d:{pct7}")
+        # GH #38: surface the next-swap-point (ladder threshold). It was only in
+        # compact mode before — in verbose you couldn't tell how close each
+        # account was to tripping a swap.
+        parts.append(nxt_lbl(nxt))
         if flag_str:
-            parts.append(flag_str)
+            parts.append(click.style(flag_str, fg="red", bold=True) if color_on else flag_str)
         return " ".join(parts)
 
     pieces = [fmt_account(active, acct, True)]
@@ -5056,11 +5116,12 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             poll_interval = config.get("poll_interval_seconds", 600)
             remaining = poll_interval - age
             if remaining > 0:
-                pieces.append(f"poll {_fmt_duration(age)}ago·next in {_fmt_duration(remaining)}")
+                poll_piece = f"poll {_fmt_duration(age)}ago·next in {_fmt_duration(remaining)}"
             else:
-                pieces.append(f"poll {_fmt_duration(age)}ago·due now")
+                poll_piece = f"poll {_fmt_duration(age)}ago·due now"
+            pieces.append(click.style(poll_piece, dim=True) if color_on else poll_piece)
 
-    click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}")
+    click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}", color=color_on)
 
 
 @cli.command(name="sos")
