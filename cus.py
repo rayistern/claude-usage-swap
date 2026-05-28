@@ -3954,6 +3954,51 @@ def list_cmd() -> None:
         click.echo()
 
 
+@cli.command(name="whoami")
+def whoami_cmd() -> None:
+    """Print the currently active account — i.e. which account you're on.
+
+    The active account is authoritative from state.json's "active" key, which
+    is rewritten on every swap; new `claude` invocations use it. NOTE: a tmux
+    pane launched BEFORE a swap keeps using whatever account it loaded at start
+    until it's relaunched, so this reports the MACHINE-WIDE active account, not
+    per-pane attribution — see `cus status` for live sessions and the
+    statusline for the per-pane account.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    state = read_json(STATE_JSON)
+    active = state.get("active")
+    if not active:
+        click.echo("No active account recorded in state.json.")
+        sys.exit(1)
+
+    meta = account_meta(active)
+    acct = state.get("accounts", {}).get(active, {})
+    click.echo(f"Active account: {active}")
+    click.echo(f"  oauth_email:  {meta.get('oauth_email', 'unknown')}")
+    click.echo(f"  account_uuid: {meta.get('oauth_account_uuid', 'unknown')}")
+
+    # Usage snapshot from the last successful poll (best-effort context).
+    h5 = acct.get("current_5h_pct")
+    h7 = acct.get("current_7d_pct")
+    if h5 is not None or h7 is not None:
+        h5s = f"{h5:.0f}" if isinstance(h5, (int, float)) else "?"
+        h7s = f"{h7:.0f}" if isinstance(h7, (int, float)) else "?"
+        click.echo(f"  usage:        5h={h5s}%  7d={h7s}%")
+    # _five_hour_remaining_seconds returns None when the 5h clock isn't ticking
+    # (5h at 0%), so we never print a misleading countdown for an idle window.
+    remaining = _five_hour_remaining_seconds(None, acct)
+    if remaining is not None and remaining > 0:
+        click.echo(f"  5h resets in: {int(remaining // 60)} min")
+
+    # Surface staleness/blocked flags so whoami never quietly reports old data.
+    flags = [f for f in ("token_expired", "token_stale", "rate_limited", "poll_error") if acct.get(f)]
+    if flags:
+        click.echo(f"  flags:        {', '.join(flags)}")
+
+
 @cli.command()
 def status() -> None:
     """Show active account, per-account usage state, locks, and recent activity."""

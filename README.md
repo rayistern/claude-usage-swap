@@ -85,6 +85,7 @@ cus install                   # one-command bootstrap (all-in-one)
 cus uninstall                 # reverse install
 
 # Daily inspection
+cus whoami                    # which account am I on right now (+ its usage)
 cus status                    # active + per-account state + live sessions
 cus sos                       # exit 1 + actions if anything needs you
 cus list                      # configured accounts with OAuth identities
