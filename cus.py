@@ -1266,12 +1266,52 @@ def _settings_json_path() -> Path:
     return CLAUDE_DIR / "settings.json"
 
 
+def _entry_is_cus(entry: object) -> bool:
+    """Identify a settings.json hook entry as one installed by cus (GH #31).
+
+    The modern signal is the `_cus_marker` field. But hooks installed by an
+    OLDER cus (or a bootstrap predating the marker code) have NO marker — so
+    dedupe-by-marker missed them and `cus hooks install` appended a duplicate
+    MARKED copy of every hook. A duplicated PreToolUse hook fires twice per
+    tool call, writing two `start` lines to tool_use.log and re-corrupting the
+    start/stop ledger that #27/#29 fixed; uninstall had the symmetric bug
+    (it orphaned the unmarked legacy entries, leaving them behind).
+
+    Fix: also treat an entry as ours if any of its hook commands points at the
+    cus hooks/ directory, or is a bare `cus_*.sh` script name (robust even if
+    the repo was moved). This makes install + uninstall idempotent on legacy
+    systems instead of duplicating / orphaning their entries.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("_cus_marker") == HOOK_SETTINGS_KEY:
+        return True
+    hooks_dir = str(HOOKS_SRC_DIR.resolve())
+    for h in entry.get("hooks", []):
+        if not isinstance(h, dict):
+            continue
+        cmd = h.get("command") or ""
+        # Command is normally the bare script path, but tolerate env prefixes /
+        # args by scanning whitespace-separated tokens.
+        for token in cmd.split():
+            name = os.path.basename(token)
+            if name.startswith("cus_") and name.endswith(".sh"):
+                return True
+            if token.startswith(hooks_dir):
+                return True
+    return False
+
+
 def install_hooks(config: dict) -> dict[str, str]:
     """Install enabled hooks into ~/.claude/settings.json.
 
     Each hook entry is tagged with a signature in its `_cus_marker` field
     so we can identify our entries and avoid clobbering others'. Returns
     {event_name: "installed" | "already_installed" | "skipped (disabled)"}.
+
+    Idempotent on legacy systems (GH #31): existing cus entries are matched by
+    `_entry_is_cus` (marker OR command path), collapsed to a single normalized
+    marked entry, so re-running never appends duplicates.
     """
     settings_path = _settings_json_path()
     settings = read_json(settings_path) if settings_path.exists() else {}
@@ -1291,21 +1331,30 @@ def install_hooks(config: dict) -> dict[str, str]:
         # Hooks for an event are stored as a list-of-matchers. We use
         # an empty matcher (matches everything) for our entries.
         event_entries = hooks.setdefault(event, [])
-        entry = next(
-            (e for e in event_entries if isinstance(e, dict) and e.get("_cus_marker") == HOOK_SETTINGS_KEY),
-            None,
-        )
         new_entry = {
             "_cus_marker": HOOK_SETTINGS_KEY,
             "matcher": "",
             "hooks": [{"type": "command", "command": str(script_path)}],
         }
-        if entry:
-            if entry == new_entry:
-                result[event] = "already_installed"
-                continue
-            event_entries[event_entries.index(entry)] = new_entry
-            result[event] = "updated"
+        # Find ALL existing cus entries (marker OR command path; GH #31).
+        # Collapse them into a single normalized, marked entry in the first
+        # cus slot and drop any extras — this upgrades unmarked legacy entries
+        # AND de-duplicates any duplicates a prior buggy install left behind.
+        cus_idxs = {i for i, e in enumerate(event_entries) if _entry_is_cus(e)}
+        if cus_idxs:
+            already = len(cus_idxs) == 1 and event_entries[next(iter(cus_idxs))] == new_entry
+            rebuilt = []
+            placed = False
+            for i, e in enumerate(event_entries):
+                if i in cus_idxs:
+                    if not placed:
+                        rebuilt.append(new_entry)
+                        placed = True
+                    # else: drop the duplicate / superseded cus entry
+                else:
+                    rebuilt.append(e)
+            hooks[event] = rebuilt
+            result[event] = "already_installed" if already else "updated (normalized; deduped legacy/dupes)"
         else:
             event_entries.append(new_entry)
             result[event] = "installed"
@@ -1315,7 +1364,11 @@ def install_hooks(config: dict) -> dict[str, str]:
 
 
 def uninstall_hooks() -> dict[str, str]:
-    """Remove all cus-marked entries from ~/.claude/settings.json."""
+    """Remove all cus entries from ~/.claude/settings.json.
+
+    Matches by `_entry_is_cus` (marker OR command path) so legacy unmarked
+    entries are removed too, not orphaned (GH #31).
+    """
     settings_path = _settings_json_path()
     if not settings_path.exists():
         return {event: "no settings.json" for event in HOOK_EVENTS}
@@ -1325,7 +1378,7 @@ def uninstall_hooks() -> dict[str, str]:
     result: dict[str, str] = {}
     for event in HOOK_EVENTS:
         entries = hooks.get(event, [])
-        new_entries = [e for e in entries if not (isinstance(e, dict) and e.get("_cus_marker") == HOOK_SETTINGS_KEY)]
+        new_entries = [e for e in entries if not _entry_is_cus(e)]
         if len(new_entries) != len(entries):
             hooks[event] = new_entries
             result[event] = "uninstalled"
@@ -1345,10 +1398,11 @@ def list_hooks() -> dict[str, str]:
     result: dict[str, str] = {}
     for event, (script_name, _) in HOOK_EVENTS.items():
         entries = hooks.get(event, [])
-        marked = [e for e in entries if isinstance(e, dict) and e.get("_cus_marker") == HOOK_SETTINGS_KEY]
+        marked = [e for e in entries if _entry_is_cus(e)]
         if marked:
             cmds = ",".join(h.get("command", "?") for e in marked for h in e.get("hooks", []))
-            result[event] = f"installed -> {cmds}"
+            dup = f" [{len(marked)} entries — DUPLICATED]" if len(marked) > 1 else ""
+            result[event] = f"installed -> {cmds}{dup}"
         else:
             result[event] = "not installed"
     return result
