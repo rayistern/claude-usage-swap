@@ -1809,6 +1809,27 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     if target is None:
         return None
 
+    # Anti-pingpong / cap-degraded-target gate (GH #53, 2026-05-28): refuse a
+    # LADDER swap whose ONLY target is over the hard 7d cap. The hard-cap path
+    # already refuses such targets (it's the user's invariant); the ladder path
+    # didn't — and that completed a two-leg pingpong. Concretely: active is
+    # 7d-capped (e.g. default 7d=80%), we swap to merkos (5h-saturated), merkos's
+    # 5h ladder trips, and the only target is the 7d-capped default. The #40
+    # improvement gate below compares the configured ladder window(s) only —
+    # here 5h — so a 7d-capped account with fresh 5h (default 14%) looks like a
+    # huge improvement and the swap-back fires, re-capping 7d → repeat forever.
+    # This check runs BEFORE the improvement gate precisely because that gate's
+    # ladder-window math is blind to the 7d cap on the target. SOS surfaces the
+    # "no usable target" state. (User 2026-05-28: "we shouldn't switch to an
+    # account that's going to trigger a switch back.")
+    if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
+        click.echo(
+            f"  ladder swap suppressed: only target {target.name} is over the 7d cap "
+            f"({int(hard_7d_cap)}%) — swapping there would pingpong (it'd immediately "
+            f"re-trip the hard cap); staying on {current}, SOS will surface"
+        )
+        return None
+
     # Anti-pingpong / "must improve" gate (GH #40, 2026-05-27): a LADDER swap
     # should strictly reduce the active account's effective utilization.
     # Otherwise we just churn — and live sessions take a tier-1 hit each cycle.
