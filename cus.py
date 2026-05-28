@@ -155,6 +155,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "burn_soon_weight": 1.0,         # multiplier on burn-soon bonus
         "five_hour_headroom_weight": 0.6,
         "seven_day_headroom_weight": 0.4,
+        # Continuous reset-proximity preference (GH #42). Beyond the within-
+        # burn_window bonus above, gently prefer the account whose 5h window
+        # resets sooner, across the FULL 5h horizon, so target selection always
+        # leans toward the earlier-resetting account ("consider how much time
+        # is left on the 5h clock"). Scaled small so it only tips genuine ties;
+        # the 0-100 headroom score + burn-soon bonus still dominate. 0 = off.
+        "reset_proximity_weight": 8.0,
         "cold_account_penalty": 0,       # 0 = none; >0 deprioritizes accounts with 5h=0% (clock not ticking)
         # When True, the picker may select a rate_limited account if no
         # better option exists. Useful because the `rate_limited` flag
@@ -170,6 +177,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hard_7d_cap_pct": 80,
         "five_hour_weight": 0.7,
         "seven_day_weight": 0.3,
+    },
+    # Proactive burn-before-reset trigger (GH #42). Strategy-independent: the
+    # ladder/cap/reactive triggers only fire when the ACTIVE account climbs
+    # toward its own cap — they never move us ONTO an account whose 5h window
+    # is about to reset. But a 5h window is "use it or lose it": when it rolls
+    # over, accrued usage resets to zero, so the right place to be just before
+    # a reset is ON the about-to-reset account (draining its remaining
+    # capacity) while leaving the far-from-reset account's window pristine.
+    # Fires at TIER 1 only (wait-for-Stop) so it never interrupts a live turn.
+    "burn_before_reset": {
+        "enabled": True,
+        "reset_window_minutes": 30,        # target's 5h must reset within this
+        "min_reset_gap_minutes": 60,       # active's 5h must reset >= this much later
+        "min_candidate_headroom_pct": 15,  # target's unused 5h (100-5h%) must exceed this
     },
     "hot_swap": {
         "enabled": False,        # Phase 3+ — opt-in. Smoke-test before enabling (see 2026-05-19 incident notes).
@@ -1070,6 +1091,7 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         w5 = cfg.get("five_hour_headroom_weight", 0.6)
         w7 = cfg.get("seven_day_headroom_weight", 0.4)
         cold_penalty = cfg.get("cold_account_penalty", 0)  # 0 = no penalty (default)
+        reset_pref_weight = cfg.get("reset_proximity_weight", 8.0)  # GH #42; 0 = off
 
         def smart_score(acct: dict) -> tuple[float, str]:
             h5 = acct.get("current_5h_pct", 0.0)
@@ -1093,6 +1115,29 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
                         bonus *= burn_soon_weight
                         s += bonus
                         reasons.append(f"burn-soon(+{bonus:.0f}, resets in {time_to_reset_s/60:.0f}min)")
+                except (ValueError, AttributeError, TypeError):
+                    pass
+
+            # Continuous reset-proximity preference (GH #42, 2026-05-28):
+            # beyond the within-burn_window bonus above, still gently prefer
+            # the account whose 5h window resets sooner — spanning the FULL
+            # 5h horizon so selection always leans toward the earlier-resetting
+            # account, breaking near-ties the burn_window cutoff would miss.
+            # Scaled small (default weight 8) so it only tips ties; headroom
+            # (0-100) and burn-soon still dominate. This is the "consider how
+            # much time is left on the 5h clock" half of the request; the
+            # burn-before-reset TRIGGER (decide_swap, GH #42) is the other.
+            if reset_pref_weight and h5 > 0 and reset_at:
+                try:
+                    reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                    ttr_s = (reset_dt - datetime.now(timezone.utc)).total_seconds()
+                    horizon_s = 5 * 3600
+                    if 0 < ttr_s <= horizon_s:
+                        # prox ~1 when about to reset, ~0 when just reset (full 5h ahead)
+                        prox = (horizon_s - ttr_s) / horizon_s
+                        add = reset_pref_weight * prox
+                        s += add
+                        reasons.append(f"reset-prox(+{add:.1f})")
                 except (ValueError, AttributeError, TypeError):
                     pass
 
@@ -1360,6 +1405,122 @@ def determine_tier(active_acct: dict, config: dict) -> int:
     return 1
 
 
+def _five_hour_remaining_seconds(usage: "AccountUsage | None", acct: dict | None) -> float | None:
+    """Seconds until an account's 5-hour window resets, or None if undeterminable.
+
+    Prefers the freshly-polled AccountUsage; falls back to the state dict's
+    persisted `five_hour_resets_at`. Returns None when the 5h clock isn't
+    ticking (utilization <= 0 → no reset deadline, and the stored resets_at is
+    stale/meaningless) or no parseable reset timestamp exists. Shared by the
+    burn-before-reset trigger (GH #42).
+    """
+    util = None
+    reset_at = None
+    if usage is not None and usage.five_hour is not None:
+        util = usage.five_hour.utilization
+        reset_at = usage.five_hour.resets_at
+    if reset_at is None and acct is not None:
+        reset_at = acct.get("five_hour_resets_at")
+        if util is None:
+            util = acct.get("current_5h_pct")
+    if not reset_at:
+        return None
+    # 5h at 0% means the clock hasn't started — resets_at is stale/meaningless.
+    if util is not None and util <= 0:
+        return None
+    try:
+        reset_dt = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+        return (reset_dt - datetime.now(timezone.utc)).total_seconds()
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _maybe_burn_before_reset(
+    state: dict,
+    config: dict,
+    current: str,
+    active_acct: dict,
+    cur_usage: "AccountUsage",
+    usage_by_account: dict[str, AccountUsage],
+) -> SwapDecision | None:
+    """Proactive 'burn-before-reset' swap trigger (GH #42, requested 2026-05-28).
+
+    The standard ladder/cap/reactive triggers only fire when the ACTIVE
+    account climbs toward its own cap. They never move us ONTO an account
+    whose 5-hour window is about to reset. But a 5h window is "use it or lose
+    it": when account B's window rolls over, whatever B accrued resets to zero
+    — so the right place to be just before a reset is ON the account that's
+    about to reset, draining its remaining capacity, while leaving the
+    far-from-reset account's window pristine for later.
+
+    User intent (2026-05-28): "consider how much more time is left on the 5h
+    clock per session when swapping ... we should have always been on the
+    closer-to-[reset] session." Earlier verbatim framing: "if one resets in 1
+    hour, that one should be burned before the one that resets in 4 hours."
+
+    Guardrails (ALL must hold) so this never churns or interrupts live work:
+      - feature enabled (config.burn_before_reset.enabled)
+      - a usable swap target exists — reuses pick_swap_target's full filter set
+        (not blocked, below hard 7d cap, below its own ladder step), so we
+        never land on an exhausted or about-to-re-trip account
+      - that target's 5h window resets within reset_window_minutes
+      - the target still has unused 5h capacity worth draining
+        (>= min_candidate_headroom_pct) — no point landing on a near-capped
+        account that would immediately need swapping off again
+      - the ACTIVE account's 5h window resets at least min_reset_gap_minutes
+        LATER than the target's (or its clock isn't ticking at all) — i.e. we
+        genuinely give up nothing usable by leaving it now
+
+    Fires at TIER 1 only (wait-for-Stop, defer if cache warm) so it never
+    interrupts an in-flight turn — important given the 2026-05-19 incident
+    where a botched mid-turn relaunch burned ~4% of a 5h window.
+
+    Walk-back: set burn_before_reset.enabled: false in config.yaml.
+    """
+    cfg = config.get("burn_before_reset", {})
+    if not cfg.get("enabled", True):
+        return None
+    reset_window_s = cfg.get("reset_window_minutes", 30) * 60
+    min_gap_s = cfg.get("min_reset_gap_minutes", 60) * 60
+    min_headroom = cfg.get("min_candidate_headroom_pct", 15)
+
+    target = pick_swap_target(state, config)
+    if target is None or target.name == current:
+        return None
+    tgt_acct = state["accounts"].get(target.name, {})
+    tgt_usage = usage_by_account.get(target.name)
+
+    # Target must be about to reset AND still hold capacity worth burning.
+    tgt_remaining = _five_hour_remaining_seconds(tgt_usage, tgt_acct)
+    if tgt_remaining is None or not (0 < tgt_remaining <= reset_window_s):
+        return None
+    tgt_5h = (
+        tgt_usage.five_hour.utilization
+        if tgt_usage and tgt_usage.five_hour
+        else tgt_acct.get("current_5h_pct", 0.0)
+    )
+    if (100 - tgt_5h) < min_headroom:
+        return None
+
+    # Active must reset meaningfully LATER (or have no ticking clock at all →
+    # treat as infinitely far, since we lose nothing usable by leaving it).
+    act_remaining = _five_hour_remaining_seconds(cur_usage, active_acct)
+    act_remaining_eff = float("inf") if act_remaining is None else act_remaining
+    if act_remaining_eff - tgt_remaining < min_gap_s:
+        return None
+
+    act_desc = "never(idle)" if act_remaining is None else f"{act_remaining / 60:.0f}min"
+    return SwapDecision(
+        target=target.name,
+        reason=(
+            f"burn-before-reset: {target.name} 5h resets in "
+            f"{tgt_remaining / 60:.0f}min (5h={tgt_5h:.0f}%, {100 - tgt_5h:.0f}% headroom) "
+            f"vs active {current} resets in {act_desc}; {target.reason}"
+        ),
+        tier=1,
+    )
+
+
 def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUsage]) -> SwapDecision | None:
     """Given current state + fresh usage, decide whether to swap.
 
@@ -1460,6 +1621,22 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
                     return None
             except ValueError:
                 pass
+
+    # Trigger 2.5: proactive burn-before-reset (GH #42). Placed AFTER the
+    # universal hysteresis gate (so it can't churn — the gate above already
+    # returned None if we swapped too recently) and only fires when the ladder
+    # WON'T (active still below its step), so the two triggers never compete.
+    # See _maybe_burn_before_reset for the full rationale + guardrails.
+    cfg_steps_bbr = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    ladder_threshold_bbr = active_acct.get("next_swap_at_pct", cfg_steps_bbr[0])
+    if ladder_threshold_bbr >= 100:
+        ladder_threshold_bbr = cfg_steps_bbr[-1]
+    if current_max_pct(cur_usage, config) < ladder_threshold_bbr:
+        bbr_decision = _maybe_burn_before_reset(
+            state, config, current, active_acct, cur_usage, usage_by_account
+        )
+        if bbr_decision is not None:
+            return bbr_decision
 
     # Trigger 2: progressive ladder.
     cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]

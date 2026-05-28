@@ -15,6 +15,7 @@ Pipeline:
 3. **Score** each remaining candidate:
    - **Headroom score**: `(100 - 5h%) × five_hour_headroom_weight + (100 - 7d%) × seven_day_headroom_weight`
    - **Burn-soon bonus**: if the candidate's 5h clock is ticking (`current_5h_pct > 0`) AND its 5h window will reset within `burn_window_hours` (default 2), add a bonus proportional to how soon the reset is. Sooner reset = bigger bonus. **Reasoning**: a 5h window that's about to reset has "free" remaining capacity — if we don't use it, it goes to waste. The user articulated this exactly: "if one resets in 1 hour, that one should be burned before the one that resets in 4 hours."
+   - **Reset-proximity preference** (`reset_proximity_weight`, default 8.0; GH #42): beyond the `burn_window` cutoff above, a small continuous term spanning the full 5-hour horizon that still leans selection toward the earlier-resetting account. Scaled small so it only breaks genuine ties — the headroom score (0–100) and burn-soon bonus dominate. Set to 0 to disable.
    - **Cold-account penalty** (off by default): if `current_5h_pct == 0`, deprioritize. The 5h clock starts on the first message — an account at 0% has its clock NOT ticking. Future "straddle" strategies (see below) may want to favor keeping at least one cold account in reserve.
 4. **Trigger 2 (hard 7d cap on *active* account)** — separately from the picker, `decide_swap()` checks the active account's 7d. If it crosses `hard_7d_cap_pct`, swap immediately regardless of the progressive ladder. This is what enforces "never go over 80%."
 
@@ -27,6 +28,7 @@ smart_strategy:
   burn_soon_weight: 1.0
   five_hour_headroom_weight: 0.6       # weight for 5h in base headroom score
   seven_day_headroom_weight: 0.4
+  reset_proximity_weight: 8.0          # full-horizon lean toward earlier-resetting account (GH #42); 0 = off
   cold_account_penalty: 0              # off by default; >0 to enable
 ```
 
@@ -69,9 +71,46 @@ Trade-off: blindest possible strategy. Useful for testing.
 
 ---
 
+## Proactive triggers (strategy-independent)
+
+These fire in `decide_swap()` regardless of which `strategy:` you pick, because they're about *when* to swap, not *which account* to pick.
+
+### `burn_before_reset` (GH #42)
+
+The ladder / hard-cap / reactive triggers only fire when the **active** account climbs toward its own cap — they never move you **onto** an account whose 5-hour window is about to reset. But a 5h window is "use it or lose it": when it rolls over, accrued usage resets to zero. So the best place to be just before a reset is **on the about-to-reset account**, draining its remaining capacity, while leaving the far-from-reset account's window pristine for later. This is the trigger half of the user request "we should have always been on the closer-to-[reset] session"; the `smart` strategy's burn-soon bonus + `reset_proximity_weight` are the *selection* half.
+
+Fires only when the ladder *wouldn't* (active still below its step), so the two never compete. Guardrails (all must hold):
+
+- a usable target exists (reuses the active `strategy`'s picker + all its filters — never lands on a blocked / over-7d-cap / about-to-re-trip account);
+- the target's 5h window resets within `reset_window_minutes`;
+- the target still has unused 5h capacity worth draining (`100 - 5h% >= min_candidate_headroom_pct`);
+- the active account's 5h window resets at least `min_reset_gap_minutes` **later** than the target's (or its clock isn't ticking at all).
+
+Always fires at **tier 1** (wait-for-Stop, defer if cache warm) so it never interrupts an in-flight turn — see the 2026-05-19 incident where a botched mid-turn relaunch burned ~4% of a 5h window.
+
+Config (`burn_before_reset:`):
+
+```yaml
+burn_before_reset:
+  enabled: true                 # walk-back: set false
+  reset_window_minutes: 30      # target's 5h must reset within this
+  min_reset_gap_minutes: 60     # active's 5h must reset >= this much later than target's
+  min_candidate_headroom_pct: 15 # target's unused 5h headroom must exceed this
+```
+
+---
+
 ## Future strategy directions
 
 These are designed but not implemented. Document, file as GitHub issues, or contribute via PR.
+
+### `llm` (tracked: GH #43)
+
+Hand the swap decision to an LLM instead of a hand-coded scoring function. The operator expresses policy in **natural language** (`llm_strategy.policy`) and the model weighs richer/fuzzier context — per-account usage + reset timestamps, ladder step, recent swap history, live tmux sessions and their activity, poll staleness — into a schema-constrained `{target, tier, reason}`.
+
+**Must degrade gracefully**: API down/slow/over-budget → fall back to `fallback_strategy` (deterministic); the daemon never blocks or crashes on the call. **Guardrails win**: the LLM output is advisory — the same hard filters that protect the deterministic pickers (hard 7d cap, blocked-account exclusion, hysteresis, would-immediately-re-trip) still gate the final swap. Cheap on Haiku + prompt-cached; consider `max_decision_age_seconds` to avoid calling when nothing changed. Full design in GH #43.
+
+**Why deferred**: adds a network dependency + API cost to a currently fully-offline-deterministic daemon, and needs the graceful-degradation + guardrail-validation scaffolding before it's safe to ship.
 
 ### `staggered_straddle`
 
