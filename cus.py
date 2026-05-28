@@ -2508,6 +2508,25 @@ def tmux_pane_name(pane: str) -> str:
         return ""
 
 
+def pane_is_claude(pane: str) -> bool:
+    """True if a tmux pane is currently running a claude session (GH #37).
+
+    Claude Code runs as `claude` or (more commonly) as a `node` process hosting
+    the CLI, so its tmux `pane_current_command` is one of those. This is the
+    canonical "is claude up in this pane" predicate — used at session discovery
+    AND, critically, re-checked right before the hot-swap path injects
+    keystrokes. Discovery and keystroke-injection are separated by the pre-swap
+    verify-poll and minute-long per-pane Stop/pause waits, during which the user
+    may have exited claude. Typing a pause-message or `/exit` into a pane that's
+    back at a bare shell would run as SHELL input (e.g. `/exit` closes the
+    shell). Guarding on this keeps cus from "doing anything" to a pane that is
+    no longer a live claude session.
+    """
+    if not pane or pane == "no-tmux":
+        return False
+    return tmux_pane_name(pane) in ("claude", "node")
+
+
 # --------------------------------------------------------------------------
 # Hot-swap orchestrator (Phase 3)
 # --------------------------------------------------------------------------
@@ -2847,8 +2866,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             continue
         if not tmux_pane_exists(pane):
             continue
-        pane_cmd = tmux_pane_name(pane)
-        if pane_cmd not in ("claude", "node"):
+        if not pane_is_claude(pane):
             # Pane is back to shell (or running something else). No live claude.
             continue
 
@@ -3490,6 +3508,24 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    DEFER: cache warm for active pane {s.pane} (Tier 1 swap would burn cache)")
                 return
 
+    # GH #37: re-verify each pane is STILL running claude right before we begin
+    # injecting keystrokes. find_live_sessions confirmed claude at discovery,
+    # but the pre-swap verify-poll above (and the per-pane Stop/pause waits
+    # below) can elapse minutes — the user may have /exit'd in the meantime.
+    # A pause-message or /exit typed into a bare shell would execute as shell
+    # input. Drop any pane that's no longer claude; the account-level credential
+    # swap downstream still proceeds (it benefits new sessions regardless).
+    still_claude = []
+    for s in swappable:
+        if pane_is_claude(s.pane):
+            still_claude.append(s)
+        else:
+            click.echo(
+                f"    pane {s.pane}: no longer running claude "
+                f"(pane_current_command changed) — skipping keystrokes (GH #37)"
+            )
+    swappable = still_claude
+
     # Per-tier prep. All tiers now check session_is_idle FIRST and skip
     # the disruptive action (pause-message, Escape) when the session is
     # already at a turn boundary. Issue #4: previously tier 2/3 sent their
@@ -3588,6 +3624,13 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     for s in swappable:
         if getattr(s, "_stuck_skip", False):
             click.echo(f"    pane {s.pane}: skipping /exit (Stop-wait timed out — leaving on old account)")
+            continue
+        # GH #37: a minute-long Stop/pause wait may have just elapsed for this
+        # pane — re-check it's still claude. If the user already exited during
+        # the wait, typing "/exit" here would land in their shell and could
+        # close the pane. Skip; the pane is already off the old account.
+        if not pane_is_claude(s.pane):
+            click.echo(f"    pane {s.pane}: no longer running claude — skipping /exit (GH #37; would type into shell)")
             continue
         click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
         tmux_exit_claude(s.pane, draft_handling=draft_handling)
