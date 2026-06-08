@@ -276,6 +276,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # (no --resume) per the GH #20 directive.
         "relaunch_walkback_lookback_seconds": 3600,
     },
+    # GH #56: cache-aware lazy background swap. Consulted ONLY in background-
+    # swap mode (hot_swap.enabled == False — the credential file is swapped
+    # globally and live Claude Code sessions re-read it on their next request,
+    # so a swap never interrupts anyone). Its ONLY cost is a one-time prompt-
+    # cache rebuild on the live sessions that make their next call on the new
+    # account. So DEFER a non-urgent (deferrable) swap while any live session is
+    # still cache-warm — wait until the cache is cold (last activity older than
+    # cache_window_seconds, Anthropic's ~5min prompt-cache TTL), when the swap
+    # is free. Urgent swaps (hard 7d cap / 5h saturation / reactive 429 →
+    # SwapDecision.deferrable == False) are NEVER deferred here, so we never
+    # strand a session riding into a rate-limit. Implements the user directive
+    # (2026-06-08): "swapping frequently just busts cache; we can wait until
+    # cache is busted anyway, or until a high percent."
+    "lazy_swap": {
+        "enabled": True,
+        "cache_window_seconds": 300,
+    },
     "subagent_skip": {
         "enabled": True,
         # If a subagent (or any in-flight tool) is detected, skip that pane's
@@ -1530,6 +1547,42 @@ def _migrating_panes() -> dict:
     except Exception:
         panes = []
     return {"live_pane_count": len(panes), "panes": panes}
+
+
+def _lazy_warm_sessions(decision: "SwapDecision", config: dict) -> list:
+    """GH #56: live sessions whose prompt cache a background swap would bust now.
+
+    Empty list = the swap is free (or must not be lazy-deferred), so the caller
+    should proceed immediately. A non-empty list = defer: those sessions are
+    still cache-warm and would each eat a prompt-cache rebuild on the new
+    account.
+
+    Returns [] (→ swap now) when:
+      - hot-swap mode is on (it has its own per-pane cache-bust deferral),
+      - lazy_swap is disabled,
+      - the decision is NOT deferrable — urgent swaps (hard 7d cap / 5h
+        saturation / reactive 429) must proceed regardless of cache warmth,
+        else we'd strand a session riding into a rate-limit.
+
+    Otherwise returns the cache-warm live sessions (last transcript activity
+    younger than cache_window_seconds). A background swap migrates ALL live
+    sessions onto the new account (single global credential file), so every
+    warm session is a payer — pins are advisory swap-policy only and do not
+    route creds per-session, so they are NOT excluded.
+    """
+    if config.get("hot_swap", {}).get("enabled", False):
+        return []
+    lazy = config.get("lazy_swap", {})
+    if not lazy.get("enabled", True):
+        return []
+    if not getattr(decision, "deferrable", True):
+        return []
+    window = lazy.get("cache_window_seconds", 300)
+    try:
+        sessions = find_live_sessions()
+    except Exception:
+        return []
+    return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
 
 
 def determine_tier(active_acct: dict, config: dict) -> int:
@@ -4876,6 +4929,28 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         click.echo(f"  swap decision: {state['active']} -> {decision.target} (tier {decision.tier})")
         click.echo(f"    reason: {decision.reason}")
+
+        # GH #56: cache-aware lazy background swap. A background swap never
+        # interrupts a session; its only cost is a prompt-cache rebuild on the
+        # warm sessions that migrate. So defer a NON-URGENT swap while any live
+        # session is still cache-warm — it'll fire on a later cycle once the
+        # cache goes cold (free) or the swap turns urgent (deferrable=False).
+        # Computed BEFORE the --no-execute return so the dry-run shows it too.
+        lazy_warm = _lazy_warm_sessions(decision, config)
+        if lazy_warm:
+            warm_panes = sorted({s.pane for s in lazy_warm if s.pane and s.pane != "no-tmux"})
+            msg = (
+                f"lazy-swap DEFER: {len(lazy_warm)} cache-warm session(s) across "
+                f"{len(warm_panes)} pane(s) — non-urgent {decision.gate} swap to "
+                f"{decision.target} would burn cache; waiting for cold cache (GH #56)"
+            )
+            click.echo(f"  {msg}")
+            _log_decision(_build_decision_record(
+                state, config, action="defer", gate="lazy_swap",
+                reason=msg, target=decision.target, tier=decision.tier,
+                where={"warm_pane_count": len(warm_panes), "panes": warm_panes},
+            ))
+            return
 
         if no_execute:
             click.echo("    (--no-execute) skipping actual swap")
