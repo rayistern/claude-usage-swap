@@ -161,8 +161,23 @@ Edit `~/claude-accounts/config.yaml`. Common changes:
 | Disable hot-swap (level 3 only — auto-rotate new sessions, leave live ones alone) | `hot_swap.enabled: false` |
 | Inject pause-message at 50% instead of 75% | `hot_swap.tier_2_at_pct: 50` |
 | Never swap mid-subagent | `subagent_skip.defer_below_tier: 100` (effectively always defer) |
+| Swap on every ladder trip (disable cache-aware deferral) | `lazy_swap.enabled: false` |
+| Wait longer for a cold cache before swapping | `lazy_swap.cache_window_seconds: 600` |
 
 Restart the daemon after editing: `systemctl --user restart cus.service`. (`cus daemon` re-reads config on every cycle, so no restart needed if running foreground — but systemd-managed processes don't pick up config changes until restart.)
+
+## Auditing swap decisions — who / what / where / when / why
+
+The daemon writes one structured record per cycle to `~/claude-accounts/decisions.jsonl` (size-rotated at ~5MB). Each record captures the active account + usage (who), the action — `swap` / `hold` / `defer` / `would_swap` (what), the affected panes (where), the timestamp (when), and the gate + reason that decided it (why).
+
+```bash
+cus decisions                 # last 20 decisions, formatted
+cus decisions -n 50           # last 50
+cus decisions --swaps-only    # hide routine 'hold' cycles — just swaps/defers
+cus decisions --json          # raw JSONL (pipe to jq for analysis)
+```
+
+Use this when a swap surprised you ("why did it swap / why didn't it?"). The `[gate]` in brackets names the exact rule: `ladder`, `hard_7d_cap`, `min_improvement_gate`, `usage_growth_gate`, `defer_near_5h_reset`, `burn_before_reset`, `reactive_429`, `lazy_swap` (a cache-aware deferral), or `below_threshold` (nothing to do). The `where` line lists the panes whose prompt cache a background swap would rebuild.
 
 ## Checking what's currently configured
 
@@ -205,6 +220,7 @@ Inside `~/claude-accounts/`:
 | `SOS.md` | Latest SOS conditions (daemon updates each cycle; absent when clear) |
 | `inbox.md` | Autonomous decisions the daemon made (e.g. force-interrupts at Tier 3) |
 | `daemon.log` | Daemon stdout/stderr |
+| `decisions.jsonl` | One structured who/what/where/when/why record per cycle — view with `cus decisions` (size-rotated at ~5MB to `.jsonl.1`) |
 | `daemon.pid` | Running daemon's PID (used by SOS to detect stale process) |
 | `sessions.log` | One line per session start (SessionStart hook) |
 | `stops.log` | One line per turn end (Stop hook) |
