@@ -5048,10 +5048,24 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         return
 
     # Determine THIS session's account (the one this pane's claude actually
-    # loaded tokens for) vs machine-wide active. Tokens get loaded once at
-    # claude start; if a swap happens after, the pane's claude still uses
-    # its loaded creds until /exit + restart. Showing only machine-wide
-    # active is misleading for that pane.
+    # loaded tokens for) vs machine-wide active.
+    #
+    # Original assumption (pre-2026-06-08): tokens get loaded once at claude
+    # start; if a swap happens after, the pane's claude still uses its loaded
+    # creds until /exit + restart — so we show the SessionStart account and a
+    # "pending swap / exit to apply" hint.
+    #
+    # Correction 2026-06-08 (GH #56, user-observed): that assumption only holds
+    # for HOT-SWAP orchestration (which relaunches the pane). In BACKGROUND-swap
+    # mode (hot_swap.enabled == False — the default here), the credential file
+    # is swapped globally and Claude Code re-reads it on its next request, so a
+    # running pane ALREADY follows the machine-active account with NO /exit.
+    # The user confirmed empirically: background swap "takes usage to the right
+    # account without restarting any session." So in background mode the
+    # SessionStart account recorded in sessions.log is stale — the session is
+    # really on machine_active — and the "→X (swap pending)" indicator is a
+    # phantom (it pointed at the account the pane was ALREADY using). Treat the
+    # session as being on machine_active and suppress the phantom pending hint.
     machine_active = state.get("active", "?")
     this_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
     this_session_account = None
@@ -5060,6 +5074,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             if e.get("session_id") == this_session_id:
                 this_session_account = e.get("account")
                 break
+    # In background-swap mode the live session follows the global active
+    # account on its next request, so the recorded SessionStart account is not
+    # where it actually is. Only hot-swap mode has a genuine "loaded creds vs
+    # machine-active" mismatch worth surfacing.
+    hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
+    if not hot_swap_on:
+        this_session_account = machine_active
     # Display PRIMARY = this session's account if known, else machine-active.
     active = this_session_account or machine_active
     pending_swap = this_session_account and this_session_account != machine_active
