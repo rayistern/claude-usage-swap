@@ -85,7 +85,7 @@ These were deliberately deferred so the test isn't confounded:
 1. **Saturated-both freeze (#56):** when *both* accounts are ≥ saturation, a swap can't help — still need explicit "freeze, don't bounce" logic, or did lazy-swap + min_improvement_pct=5 already cover it? Check the log for any saturated bounces.
 2. **Threshold re-tuning (#56):** are `[90, 96]` right under the new model? Could go higher. Is `min_improvement_pct: 5` enough, or raise it?
 3. **`burn_before_reset` (#56):** kept on. Did it fire usefully, or did lazy-swap defer it into irrelevance? Decide keep / tune / drop.
-4. **Adaptive repoll on rollover (#59):** the rollover flag is display-only — the daemon's stored % (used by `decide_swap`) is still stale until the next poll, so for up to 10 min the decision logic thinks a just-reset account is still at 95%. Worth having the daemon repoll right after a detected reset? Could improve target selection.
+4. **Reset inference (#59) — NOW IMPLEMENTED, evaluate it:** the daemon now (a) infers a 5h reset from the countdown when a poll didn't refresh past it (`reset_inference.enabled`, writes 5h→0 for decisions/SOS) and (b) adaptively repolls just after a known reset (`reset_inference.adaptive_repoll`). Evaluate over the week: did the countdown fallback ever fire (grep daemon.log for "countdown fallback"), and did it ever infer-reset an account that was actually still busy (over-optimistic)? Did adaptive repoll shorten the gap as intended? Watch for any thrash from the shortened sleep.
 5. **7d in ladder scope (#56):** `seven_day: false` today. Re-add as a "no real danger, don't churn" signal?
 6. **Competitor research (#57):** are we redundant vs cux / ccusage / claude-code-router?
 
