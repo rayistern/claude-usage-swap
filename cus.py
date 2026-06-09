@@ -94,6 +94,7 @@ STOPS_LOG = ACCOUNTS_DIR / "stops.log"
 RATE_LIMIT_LOG = ACCOUNTS_DIR / "429.log"
 TOOL_USE_LOG = ACCOUNTS_DIR / "tool_use.log"
 DAEMON_LOG = ACCOUNTS_DIR / "daemon.log"
+DECISIONS_LOG = ACCOUNTS_DIR / "decisions.jsonl"   # GH #56: one structured record per daemon decision
 DAEMON_PID = ACCOUNTS_DIR / "daemon.pid"
 ORCHESTRATE_LOCK = ACCOUNTS_DIR / "orchestrate.lock"
 INBOX_MD = ACCOUNTS_DIR / "inbox.md"
@@ -274,6 +275,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # nothing in the window has a JSONL, the relaunch is plain `claude`
         # (no --resume) per the GH #20 directive.
         "relaunch_walkback_lookback_seconds": 3600,
+    },
+    # GH #56: cache-aware lazy background swap. Consulted ONLY in background-
+    # swap mode (hot_swap.enabled == False — the credential file is swapped
+    # globally and live Claude Code sessions re-read it on their next request,
+    # so a swap never interrupts anyone). Its ONLY cost is a one-time prompt-
+    # cache rebuild on the live sessions that make their next call on the new
+    # account. So DEFER a non-urgent (deferrable) swap while any live session is
+    # still cache-warm — wait until the cache is cold (last activity older than
+    # cache_window_seconds, Anthropic's ~5min prompt-cache TTL), when the swap
+    # is free. Urgent swaps (hard 7d cap / 5h saturation / reactive 429 →
+    # SwapDecision.deferrable == False) are NEVER deferred here, so we never
+    # strand a session riding into a rate-limit. Implements the user directive
+    # (2026-06-08): "swapping frequently just busts cache; we can wait until
+    # cache is busted anyway, or until a high percent."
+    "lazy_swap": {
+        "enabled": True,
+        "cache_window_seconds": 300,
     },
     "subagent_skip": {
         "enabled": True,
@@ -1432,6 +1450,139 @@ class SwapDecision:
     target: str
     reason: str
     tier: int   # 1 = wait-for-Stop, 2 = pause-message, 3 = force
+    # GH #56: which trigger/rule produced this decision — surfaced in the
+    # structured decision log so the operator can see WHY every swap happened.
+    gate: str = "ladder"
+    # GH #56: may the cache-aware lazy background-swap gate defer this swap?
+    # True for non-urgent balancing swaps (ladder below saturation, burn-before-
+    # reset). False for urgent ones — hard 7d cap, 5h saturation, reactive 429 —
+    # which must proceed regardless of prompt-cache warmth, else we'd strand a
+    # session riding into a rate-limit. Keyed explicitly (NOT off `tier`) because
+    # a hard-cap swap can land at tier 2 yet must never be deferred.
+    deferrable: bool = True
+
+
+def _build_decision_record(
+    state: dict,
+    config: dict,
+    *,
+    action: str,
+    gate: str,
+    reason: str,
+    target: str | None = None,
+    tier: int | None = None,
+    where: dict | None = None,
+) -> dict:
+    """Assemble one structured who/what/where/when/why decision record (GH #56).
+
+    Written once per daemon cycle to decisions.jsonl so the operator can audit
+    exactly why each swap did or didn't happen over a long testing window.
+      who   = the active account + its live usage
+      what  = action: swap | hold | defer | would_swap
+      where = panes/sessions affected (who pays the prompt-cache rebuild)
+      when  = timestamp
+      why   = gate (which rule decided) + a human reason sentence
+    """
+    active = state.get("active")
+    accts = {}
+    for n, a in (state.get("accounts") or {}).items():
+        accts[n] = {
+            "5h": a.get("current_5h_pct"),
+            "7d": a.get("current_7d_pct"),
+            "next_swap_at_pct": a.get("next_swap_at_pct"),
+            "five_hour_resets_at": a.get("five_hour_resets_at"),
+        }
+    who = accts.get(active, {})
+    th = config.get("thresholds", {})
+    return {
+        "when": now_iso(),
+        "action": action,
+        "gate": gate,
+        "reason": reason,
+        "who": {
+            "active": active,
+            "5h": who.get("5h"),
+            "7d": who.get("7d"),
+            "next_swap_at_pct": who.get("next_swap_at_pct"),
+        },
+        "target": target,
+        "tier": tier,
+        "where": where or {},
+        "accounts": accts,
+        "mode": "hot_swap" if config.get("hot_swap", {}).get("enabled", False) else "background",
+        "config": {
+            "steps": th.get("steps"),
+            "min_improvement_pct": config.get("swap_hysteresis", {}).get("min_improvement_pct"),
+            "lazy_swap": config.get("lazy_swap", {}).get("enabled"),
+            "burn_before_reset": config.get("burn_before_reset", {}).get("enabled"),
+        },
+    }
+
+
+def _log_decision(record: dict) -> None:
+    """Append a decision record to decisions.jsonl (size-rotated at ~5MB).
+
+    Best-effort: a logging failure must NEVER break the daemon cycle, so all
+    OSErrors are swallowed. GH #56.
+    """
+    try:
+        if DECISIONS_LOG.exists() and DECISIONS_LOG.stat().st_size > 5_000_000:
+            DECISIONS_LOG.replace(DECISIONS_LOG.with_name(DECISIONS_LOG.name + ".1"))
+        with DECISIONS_LOG.open("a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+def _migrating_panes() -> dict:
+    """The 'where' of a background swap: every live session follows the global
+    creds, so all live panes migrate to the new account (and the warm ones pay
+    a one-time prompt-cache rebuild). Returns {count, panes} for the decision
+    record. Best-effort — only call this on actual swap/defer cycles, not on
+    every hold, to avoid scanning sessions.log needlessly. GH #56.
+    """
+    try:
+        panes = sorted({s.pane for s in find_live_sessions()
+                        if s.pane and s.pane != "no-tmux"})
+    except Exception:
+        panes = []
+    return {"live_pane_count": len(panes), "panes": panes}
+
+
+def _lazy_warm_sessions(decision: "SwapDecision", config: dict) -> list:
+    """GH #56: live sessions whose prompt cache a background swap would bust now.
+
+    Empty list = the swap is free (or must not be lazy-deferred), so the caller
+    should proceed immediately. A non-empty list = defer: those sessions are
+    still cache-warm and would each eat a prompt-cache rebuild on the new
+    account.
+
+    Returns [] (→ swap now) when:
+      - hot-swap mode is on (it has its own per-pane cache-bust deferral),
+      - lazy_swap is disabled,
+      - the decision is NOT deferrable — urgent swaps (hard 7d cap / 5h
+        saturation / reactive 429) must proceed regardless of cache warmth,
+        else we'd strand a session riding into a rate-limit.
+
+    Otherwise returns the cache-warm live sessions (last transcript activity
+    younger than cache_window_seconds). A background swap migrates ALL live
+    sessions onto the new account (single global credential file), so every
+    warm session is a payer — pins are advisory swap-policy only and do not
+    route creds per-session, so they are NOT excluded.
+    """
+    if config.get("hot_swap", {}).get("enabled", False):
+        return []
+    lazy = config.get("lazy_swap", {})
+    if not lazy.get("enabled", True):
+        return []
+    if not getattr(decision, "deferrable", True):
+        return []
+    window = lazy.get("cache_window_seconds", 300)
+    try:
+        sessions = find_live_sessions()
+    except Exception:
+        return []
+    return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
 
 
 def determine_tier(active_acct: dict, config: dict) -> int:
@@ -1586,10 +1737,21 @@ def _maybe_burn_before_reset(
             f"vs active {current} resets in {act_desc}; {target.reason}"
         ),
         tier=1,
+        gate="burn_before_reset",
+        # GH #56: burn-before-reset is a non-urgent throughput optimization, so
+        # it IS lazy-deferrable — only worth a cache rebuild when the cache is
+        # already cold. If sessions are warm we skip the burn (the missed 5h
+        # headroom is free to give up given large weekly headroom).
+        deferrable=True,
     )
 
 
-def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUsage]) -> SwapDecision | None:
+def decide_swap(
+    state: dict,
+    config: dict,
+    usage_by_account: dict[str, AccountUsage],
+    trace: dict | None = None,
+) -> SwapDecision | None:
     """Given current state + fresh usage, decide whether to swap.
 
     Returns None if no action needed. Otherwise a SwapDecision with target
@@ -1602,14 +1764,25 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
          is the user-stated invariant: "never go over 80% of 7 day usage."
       2. **Progressive threshold ladder**: the standard path. Trigger when
          current max(5h, 7d) crosses the active account's next_swap_at_pct.
+
+    `trace` (GH #56): optional dict the caller passes in to capture WHICH rule
+    decided this cycle (gate), the outcome (action: "swap"/"hold"), and a
+    human reason — for the structured decision log. Every return path records
+    it via `_note`; pass None to skip (the logic is unaffected either way).
     """
+    def _note(gate: str, action: str, reason: str) -> None:
+        if trace is not None:
+            trace["gate"], trace["action"], trace["reason"] = gate, action, reason
+
     current = state.get("active")
     if not current:
+        _note("no_active", "hold", "no active account set")
         return None
 
     active_acct = state["accounts"][current]
     cur_usage = usage_by_account.get(current)
     if cur_usage is None:
+        _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
     # NOTE: the previous "Trigger 0: active is rate-limited (poll 429)" has
@@ -1642,30 +1815,42 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
                     last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
                     elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
                     if elapsed < min_seconds:
-                        click.echo(
-                            f"  hard 7d cap tripped ({current} at {cur_7d:.1f}%) "
+                        msg = (
+                            f"hard 7d cap tripped ({current} at {cur_7d:.1f}%) "
                             f"but last swap was {int(elapsed)}s ago (< {min_seconds}s); deferring"
                         )
+                        click.echo(f"  {msg}")
+                        _note("hard_7d_cap_hysteresis", "hold", msg)
                         return None
                 except ValueError:
                     pass
 
         target = pick_swap_target(state, config)
         if target is None:
+            _note("hard_7d_cap_no_target", "hold",
+                  f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but no valid swap target")
             return None
         # If the picker had to fall back to a DEGRADED candidate (also above
         # hard_7d_cap), swapping doesn't actually help — both accounts are
         # exhausted. Don't churn; the SOS layer will surface it.
         if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
-            click.echo(
-                f"  hard 7d cap tripped on {current} ({cur_7d:.1f}%) but all "
+            msg = (
+                f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but all "
                 f"other accounts are ALSO above cap — not swapping (would just churn); SOS will fire"
             )
+            click.echo(f"  {msg}")
+            _note("hard_7d_cap_degraded", "hold", msg)
             return None
+        reason = f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}"
+        _note("hard_7d_cap", "swap", reason)
+        # Hard cap is the user's invariant — NEVER lazy-deferrable (deferring it
+        # would let 7d climb past the cap while sessions are warm). GH #56.
         return SwapDecision(
             target=target.name,
-            reason=f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}",
+            reason=reason,
             tier=determine_tier(active_acct, config),
+            gate="hard_7d_cap",
+            deferrable=False,
         )
 
     # Universal hysteresis: enforce a minimum interval between swaps.
@@ -1682,10 +1867,12 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
                 last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
                 elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
                 if elapsed < min_seconds:
-                    click.echo(
-                        f"  ladder check deferred: last swap was {int(elapsed)}s ago "
+                    msg = (
+                        f"ladder check deferred: last swap was {int(elapsed)}s ago "
                         f"(< min_seconds_between_swaps={min_seconds}s)"
                     )
+                    click.echo(f"  {msg}")
+                    _note("swap_hysteresis", "hold", msg)
                     return None
             except ValueError:
                 pass
@@ -1704,6 +1891,7 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
             state, config, current, active_acct, cur_usage, usage_by_account
         )
         if bbr_decision is not None:
+            _note("burn_before_reset", "swap", bbr_decision.reason)
             return bbr_decision
 
     # Trigger 2: progressive ladder.
@@ -1721,6 +1909,8 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 
     cur_pct = current_max_pct(cur_usage, config)
     if cur_pct < threshold:
+        _note("below_threshold", "hold",
+              f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
         return None
 
     # Defer-if-5h-resetting-soon (GH #51, 2026-05-28): the ladder threshold
@@ -1751,11 +1941,13 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
         if five_h_over and not seven_d_over and cur_5h < max_defer_pct:
             time_to_reset_s = _five_hour_remaining_seconds(cur_usage, active_acct)
             if time_to_reset_s is not None and 0 < time_to_reset_s <= wait_window_s:
-                click.echo(
-                    f"  ladder threshold tripped ({current} 5h={cur_5h:.0f}% >= {threshold}%) "
+                msg = (
+                    f"ladder threshold tripped ({current} 5h={cur_5h:.0f}% >= {threshold}%) "
                     f"BUT 5h resets in {time_to_reset_s / 60:.0f}min (<= {wait_window_s // 60}min window) "
                     f"and 5h < max_defer_pct({max_defer_pct}%); WAITING for the reset instead of swapping"
                 )
+                click.echo(f"  {msg}")
+                _note("defer_near_5h_reset", "hold", msg)
                 return None
 
     # Usage-growth gate (GH #15): only swap via the ladder if the active
@@ -1793,11 +1985,13 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
         if deltas and max(deltas) < min_delta_pct:
             # No meaningful growth. Suppress the ladder swap. We still log
             # so the operator can see the gate firing in daemon.log.
-            click.echo(
-                f"  ladder threshold tripped ({current} at {cur_pct:.1f}% >= "
+            msg = (
+                f"ladder threshold tripped ({current} at {cur_pct:.1f}% >= "
                 f"{threshold}%) BUT usage isn't growing on this machine "
                 f"(max delta {max(deltas):.2f}% < {min_delta_pct}%); skipping swap"
             )
+            click.echo(f"  {msg}")
+            _note("usage_growth_gate", "hold", msg)
             return None
     elif growth_cfg.get("enabled", True) and cur_pct >= saturation_pct:
         click.echo(
@@ -1807,6 +2001,8 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
 
     target = pick_swap_target(state, config)
     if target is None:
+        _note("no_target", "hold",
+              f"ladder tripped on {current} ({cur_pct:.1f}% >= {threshold}%) but no valid swap target")
         return None
 
     # Anti-pingpong / cap-degraded-target gate (GH #53, 2026-05-28): refuse a
@@ -1823,11 +2019,13 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
     # "no usable target" state. (User 2026-05-28: "we shouldn't switch to an
     # account that's going to trigger a switch back.")
     if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
-        click.echo(
-            f"  ladder swap suppressed: only target {target.name} is over the 7d cap "
+        msg = (
+            f"ladder swap suppressed: only target {target.name} is over the 7d cap "
             f"({int(hard_7d_cap)}%) — swapping there would pingpong (it'd immediately "
             f"re-trip the hard cap); staying on {current}, SOS will surface"
         )
+        click.echo(f"  {msg}")
+        _note("cap_degraded_target", "hold", msg)
         return None
 
     # Anti-pingpong / "must improve" gate (GH #40, 2026-05-27): a LADDER swap
@@ -1859,18 +2057,28 @@ def decide_swap(state: dict, config: dict, usage_by_account: dict[str, AccountUs
         active_eff = _account_effective_pct(active_acct, config)
         target_eff = _account_effective_pct(state["accounts"][target.name], config)
         if target_eff > active_eff - min_improvement:
-            click.echo(
-                f"  ladder swap suppressed: target {target.name} at "
+            msg = (
+                f"ladder swap suppressed: target {target.name} at "
                 f"{target_eff:.1f}% would not improve on active {current} at "
                 f"{active_eff:.1f}% by min_improvement_pct={min_improvement}pp "
                 f"(picker reason: {target.reason})"
             )
+            click.echo(f"  {msg}")
+            _note("min_improvement_gate", "hold", msg)
             return None
 
+    reason = f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%"
+    _note("ladder", "swap", reason)
+    # GH #56: a ladder swap below saturation is a non-urgent balancing move →
+    # lazy-deferrable (only worth a cache rebuild once the cache is cold). At or
+    # above saturation_pct the active account is effectively capped, so the swap
+    # is urgent (escape the cap before sessions hit a 429) → NOT deferrable.
     return SwapDecision(
         target=target.name,
-        reason=f"{target.reason}; current {current} at {cur_pct:.1f}% >= {threshold}%",
+        reason=reason,
         tier=determine_tier(active_acct, config),
+        gate="ladder",
+        deferrable=cur_pct < saturation_pct,
     )
 
 
@@ -3900,6 +4108,8 @@ def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
         target=target.name,
         reason=f"429 reactive: {matched_session['match']} in session {matched_session['session_id'][:8]}",
         tier=3,
+        gate="reactive_429",
+        deferrable=False,  # GH #56: a real user-facing 429 is an emergency — never lazy-defer
     )
 
 
@@ -4207,11 +4417,26 @@ def status() -> None:
         click.echo()
 
     # Live sessions (from sessions.log + stops.log)
+    # GH #56: the `account` field records where a session was registered at
+    # SessionStart, NOT where it actually is now. In background-swap mode every
+    # unpinned session follows the single global credential file on its next
+    # request, so its true account is the machine-active one. Show that truth
+    # (and note the SessionStart drift) rather than the stale recorded value,
+    # which read as misleading "this session is on a different account" rows.
     live = find_live_sessions()
     if live:
+        machine_active = state.get("active", "?")
+        hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
         click.echo(f"Live sessions ({len(live)}):")
         for s in live:
-            click.echo(f"  {s.session_id[:8]}  account={s.account:<10} pane={s.pane:<8} cwd={s.cwd}")
+            # Background mode: every session follows the global creds → its true
+            # account is machine_active (pins are advisory swap-policy only, they
+            # do NOT route creds per-session — see session_is_pinned). Hot-swap
+            # mode: a pane keeps its loaded creds until relaunch, so the recorded
+            # SessionStart account is the better estimate.
+            eff = s.account if hot_swap_on else machine_active
+            drift = "" if eff == s.account else f" (start:{s.account})"
+            click.echo(f"  {s.session_id[:8]}  account={eff:<10} pane={s.pane:<8}{drift} cwd={s.cwd}")
         click.echo()
 
     history = state.get("swap_history", [])
@@ -4373,7 +4598,8 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
         # Build a synthetic SwapDecision and run the orchestrator. This is
         # the level-4 path the daemon would normally take when hot_swap.enabled
         # is true and a threshold trips — but here, manually invoked.
-        decision = SwapDecision(target=chosen_name, reason=reason, tier=tier)
+        decision = SwapDecision(target=chosen_name, reason=reason, tier=tier,
+                                gate="manual", deferrable=False)
         try:
             hot_swap_orchestrate(decision, state, config)
         except Exception as e:
@@ -4625,6 +4851,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         if reactive_decision is not None:
             click.echo(f"  reactive (429): {reactive_decision.reason}")
             save_state(state)
+            _log_decision(_build_decision_record(
+                state, config,
+                action=("would_swap" if no_execute else "swap"),
+                gate="reactive_429", reason=reactive_decision.reason,
+                target=reactive_decision.target, tier=reactive_decision.tier,
+                where=_migrating_panes(),
+            ))
             if no_execute:
                 click.echo("    (--no-execute) skipping reactive swap")
             elif config.get("hot_swap", {}).get("enabled", False):
@@ -4651,13 +4884,22 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         maybe_reset_thresholds(state, config)
 
         # 3. Decide
-        decision = decide_swap(state, config, usage_by_account)
+        trace: dict = {}
+        decision = decide_swap(state, config, usage_by_account, trace)
 
         # Persist usage updates BEFORE acting on swap (so a crash during
         # swap leaves valid usage state)
         save_state(state)
 
         if decision is None:
+            # GH #56: log the no-swap decision with the exact gate that held it
+            # (below_threshold, growth gate, min-improvement, hysteresis, ...).
+            _log_decision(_build_decision_record(
+                state, config,
+                action="hold",
+                gate=trace.get("gate", "no_swap"),
+                reason=trace.get("reason", "no swap needed"),
+            ))
             # Diagnose: was a swap WANTED but no target available?
             active = state["active"]
             active_acct = state["accounts"][active]
@@ -4688,8 +4930,41 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         click.echo(f"  swap decision: {state['active']} -> {decision.target} (tier {decision.tier})")
         click.echo(f"    reason: {decision.reason}")
 
+        # GH #56: cache-aware lazy background swap. A background swap never
+        # interrupts a session; its only cost is a prompt-cache rebuild on the
+        # warm sessions that migrate. So defer a NON-URGENT swap while any live
+        # session is still cache-warm — it'll fire on a later cycle once the
+        # cache goes cold (free) or the swap turns urgent (deferrable=False).
+        # Computed BEFORE the --no-execute return so the dry-run shows it too.
+        lazy_warm = _lazy_warm_sessions(decision, config)
+        if lazy_warm:
+            warm_panes = sorted({s.pane for s in lazy_warm if s.pane and s.pane != "no-tmux"})
+            msg = (
+                f"lazy-swap DEFER: {len(lazy_warm)} cache-warm session(s) across "
+                f"{len(warm_panes)} pane(s) — non-urgent {decision.gate} swap to "
+                f"{decision.target} would burn cache; waiting for cold cache (GH #56)"
+            )
+            click.echo(f"  {msg}")
+            _log_decision(_build_decision_record(
+                state, config, action="defer", gate="lazy_swap",
+                reason=msg, target=decision.target, tier=decision.tier,
+                where={"warm_pane_count": len(warm_panes), "panes": warm_panes},
+            ))
+            # A defer is a real live-cycle outcome (unlike --no-execute), so it
+            # must still refresh SOS — on a busy fleet the cache stays warm and
+            # the active account can sit in a long 90–95% defer streak; without
+            # this, SOS.md would freeze and hide a token-expiry / stale-poll /
+            # no-target condition until a hold or swap cycle finally fired.
+            _emit_sos_after(state, config)
+            return
+
         if no_execute:
             click.echo("    (--no-execute) skipping actual swap")
+            _log_decision(_build_decision_record(
+                state, config, action="would_swap", gate=decision.gate,
+                reason=decision.reason, target=decision.target, tier=decision.tier,
+                where=_migrating_panes(),
+            ))
             return
 
         # 4. Execute. Phase 2: simple swap. Phase 3+ will dispatch to hot-swap
@@ -4705,6 +4980,11 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
             click.echo(f"    swapped (new sessions only — live sessions unaffected)")
 
+        _log_decision(_build_decision_record(
+            state, config, action="swap", gate=decision.gate,
+            reason=decision.reason, target=decision.target, tier=decision.tier,
+            where=_migrating_panes(),
+        ))
         _emit_sos_after(load_state(), config)
 
     if once:
@@ -4771,6 +5051,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
     "thresholds": "Progressive per-account thresholds. `steps: [70, 85, 95]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
+    "lazy_swap": "Cache-aware lazy background swap (GH #56). Consulted ONLY when `hot_swap.enabled` is false. A background swap never interrupts a session; its only cost is a one-time prompt-cache rebuild on the live sessions that migrate. So `enabled: true` (default) DEFERS a non-urgent swap (ladder below saturation, burn-before-reset) while any live session's last activity is younger than `cache_window_seconds: 300` (≈ Anthropic's prompt-cache TTL) — it re-fires once the cache is cold (free) or the swap turns urgent. Urgent swaps (hard 7d cap, 5h saturation, reactive 429) are never deferred. Set `enabled: false` to swap immediately on every ladder trip (old behavior). Inspect deferrals with `cus decisions`.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
@@ -5048,10 +5329,24 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         return
 
     # Determine THIS session's account (the one this pane's claude actually
-    # loaded tokens for) vs machine-wide active. Tokens get loaded once at
-    # claude start; if a swap happens after, the pane's claude still uses
-    # its loaded creds until /exit + restart. Showing only machine-wide
-    # active is misleading for that pane.
+    # loaded tokens for) vs machine-wide active.
+    #
+    # Original assumption (pre-2026-06-08): tokens get loaded once at claude
+    # start; if a swap happens after, the pane's claude still uses its loaded
+    # creds until /exit + restart — so we show the SessionStart account and a
+    # "pending swap / exit to apply" hint.
+    #
+    # Correction 2026-06-08 (GH #56, user-observed): that assumption only holds
+    # for HOT-SWAP orchestration (which relaunches the pane). In BACKGROUND-swap
+    # mode (hot_swap.enabled == False — the default here), the credential file
+    # is swapped globally and Claude Code re-reads it on its next request, so a
+    # running pane ALREADY follows the machine-active account with NO /exit.
+    # The user confirmed empirically: background swap "takes usage to the right
+    # account without restarting any session." So in background mode the
+    # SessionStart account recorded in sessions.log is stale — the session is
+    # really on machine_active — and the "→X (swap pending)" indicator is a
+    # phantom (it pointed at the account the pane was ALREADY using). Treat the
+    # session as being on machine_active and suppress the phantom pending hint.
     machine_active = state.get("active", "?")
     this_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
     this_session_account = None
@@ -5060,6 +5355,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             if e.get("session_id") == this_session_id:
                 this_session_account = e.get("account")
                 break
+    # In background-swap mode the live session follows the global active
+    # account on its next request, so the recorded SessionStart account is not
+    # where it actually is. Only hot-swap mode has a genuine "loaded creds vs
+    # machine-active" mismatch worth surfacing.
+    hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
+    if not hot_swap_on:
+        this_session_account = machine_active
     # Display PRIMARY = this session's account if known, else machine-active.
     active = this_session_account or machine_active
     pending_swap = this_session_account and this_session_account != machine_active
@@ -5198,6 +5500,77 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
             pieces.append(click.style(poll_piece, dim=True) if color_on else poll_piece)
 
     click.echo(pieces_prefix + " | ".join(pieces) + f" · {render_stamp}", color=color_on)
+
+
+@cli.command(name="decisions")
+@click.option("-n", "--tail", default=20, help="Show the last N decision records.")
+@click.option("--swaps-only", is_flag=True, help="Hide routine 'hold' cycles; show only swap/defer/would-swap.")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSONL records instead of the formatted view.")
+def decisions_cmd(tail: int, swaps_only: bool, as_json: bool) -> None:
+    """Show recent swap decisions — who / what / where / when / why (GH #56).
+
+    Reads ~/claude-accounts/decisions.jsonl, one structured record per daemon
+    cycle: the active account + usage (who), the action (what: swap / hold /
+    defer / would_swap), the affected panes (where), the timestamp (when), and
+    the gate + reason that decided it (why).
+    """
+    if not DECISIONS_LOG.exists():
+        click.echo("No decisions logged yet (decisions.jsonl absent — the daemon writes one per cycle).")
+        return
+    try:
+        lines = DECISIONS_LOG.read_text().splitlines()
+    except OSError as e:
+        click.echo(f"Could not read {DECISIONS_LOG}: {e}")
+        return
+    records = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            records.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    if swaps_only:
+        records = [r for r in records if r.get("action") != "hold"]
+    records = records[-tail:]
+    if not records:
+        click.echo("No matching decision records.")
+        return
+    if as_json:
+        for r in records:
+            click.echo(json.dumps(r))
+        return
+
+    action_style = {
+        "swap": ("SWAP", "green"),
+        "would_swap": ("WOULD-SWAP", "cyan"),
+        "defer": ("DEFER", "yellow"),
+        "hold": ("hold", "bright_black"),
+    }
+    color_on = sys.stdout.isatty()
+    for r in records:
+        action = r.get("action", "?")
+        label, color = action_style.get(action, (action.upper(), "white"))
+        when = r.get("when", "?")
+        who = r.get("who", {})
+        active = who.get("active", "?")
+        a5, a7 = who.get("5h"), who.get("7d")
+        gate = r.get("gate", "?")
+        target = r.get("target")
+        tier = r.get("tier")
+        arrow = (f" → {target}" + (f" (tier {tier})" if tier else "")) if target else ""
+        head = click.style(f"{label:<11}", fg=color, bold=True) if color_on else f"{label:<11}"
+        usage = f"{active} 5h={a5}% 7d={a7}%" if a5 is not None else str(active)
+        click.echo(f"{when}  {head} {usage}{arrow}  [{gate}]")
+        reason = r.get("reason")
+        if reason:
+            click.echo(f"             why:   {reason}")
+        where = r.get("where") or {}
+        panes = where.get("panes")
+        if panes:
+            shown = ", ".join(panes[:8]) + (f" +{len(panes) - 8} more" if len(panes) > 8 else "")
+            click.echo(f"             where: {where.get('live_pane_count', len(panes))} panes — {shown}")
 
 
 @cli.command(name="sos")

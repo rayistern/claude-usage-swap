@@ -119,6 +119,31 @@ defer_swap_near_5h_reset:
   max_defer_pct: 90             # ...unless 5h is already this high (too close to cap to risk waiting)
 ```
 
+### `lazy_swap` — cache-aware lazy background swap (GH #56)
+
+The cost model behind the swapper inverted once **background-swap mode** (`hot_swap.enabled: false`) proved out in production. The credential file is swapped globally and live Claude Code sessions re-read it on their next request, so a swap **never interrupts anyone** — usage just moves to the new account. The *only* cost of a swap is a one-time **prompt-cache rebuild** (Anthropic's prompt cache has a ~5-minute TTL) on the live sessions that make their next call on the new account.
+
+That changes the optimal policy. The old rules swapped early/often (low ladder steps, burn-before-reset) to avoid an account hitting its cap and **rate-limiting** a live session. In background mode hitting a cap is cheap — new sessions just go to the other account. So swapping early no longer saves anything; it just burns cache. The right time to swap is when it's **free** (cache already cold) or **necessary** (near a cap).
+
+`lazy_swap` implements exactly that. When a swap decision is **deferrable** (a ladder swap below saturation, or burn-before-reset), the daemon checks whether any live session is still cache-warm (last transcript activity younger than `cache_window_seconds`). If so it **defers** — does nothing, re-evaluates next cycle. The swap fires later, once either:
+
+- the cache goes cold (no warm session) → the swap is now free, or
+- the active account climbs into urgent territory (5h saturation / hard 7d cap / a reactive 429) → the decision becomes **non-deferrable** and bypasses the gate.
+
+Urgent swaps are **never** deferred — `deferrable` is set per-trigger in `decide_swap` (NOT inferred from tier, because a hard-cap swap can land at tier 2), so the daemon will always escape a maxed account rather than strand a session into a rate-limit.
+
+Applies in **background mode only** — hot-swap mode has its own per-pane cache-bust deferral (`hot_swap.cache_bust_window_seconds`). Every deferral is written to the decision log; inspect with `cus decisions`.
+
+Config (`lazy_swap:`):
+
+```yaml
+lazy_swap:
+  enabled: true                 # walk-back: set false to swap on every ladder trip (old behavior)
+  cache_window_seconds: 300     # "warm" = last activity younger than this (≈ prompt-cache TTL)
+```
+
+This is the keystone of GH #56. Remaining items there (saturated-both freeze, ladder-step re-tuning for the new cost model) build on it.
+
 ---
 
 ## Future strategy directions
