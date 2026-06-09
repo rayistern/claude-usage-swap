@@ -293,6 +293,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "cache_window_seconds": 300,
     },
+    # GH #59: 5h-window reset inference. The statusline reset countdown already
+    # ticks live per-render; these make the DAEMON act on it too rather than
+    # waiting for the next poll to learn a window reset.
+    #   - countdown fallback (`enabled`): when a poll did NOT refresh an account
+    #     past its 5h reset (poll failed / in backoff / token stale), trust the
+    #     countdown — the window has rolled to ~0 — and write that into state so
+    #     decide_swap + SOS use reality instead of the stale pre-reset %. The
+    #     next successful poll supersedes it.
+    #   - adaptive_repoll: wake just after the soonest known 5h reset (+buffer)
+    #     to repoll promptly, instead of flying on the inferred value for a full
+    #     poll_interval. Only ever SHORTENS the sleep; floored by min_repoll.
+    "reset_inference": {
+        "enabled": True,
+        "adaptive_repoll": True,
+        "repoll_buffer_seconds": 20,
+        "min_repoll_seconds": 30,
+    },
     "subagent_skip": {
         "enabled": True,
         # If a subagent (or any in-flight tool) is detected, skip that pane's
@@ -4881,6 +4898,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
+        # GH #59: countdown fallback — for any account whose 5h reset elapsed
+        # without a fresh poll this cycle, trust the countdown and infer the
+        # window reset (5h→0) BEFORE the ladder-reset + decision below, so both
+        # act on reality rather than a stale-high %.
+        for nm in _apply_countdown_reset_inference(state, config):
+            click.echo(f"  countdown fallback: {nm} 5h reset elapsed without a fresh poll "
+                       f"— inferring 5h→0% for this cycle (GH #59)")
         maybe_reset_thresholds(state, config)
 
         # 3. Decide
@@ -5000,7 +5024,10 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 one_cycle()
             except Exception as e:
                 click.echo(f"ERROR in cycle: {type(e).__name__}: {e}", err=True)
-            time.sleep(interval)
+            # GH #59: adaptive repoll — wake just after the soonest known 5h
+            # reset (if sooner than the normal interval) to refresh real data
+            # promptly instead of running on the countdown-inferred value.
+            time.sleep(_adaptive_sleep_seconds(load_state(), config, interval))
     except KeyboardInterrupt:
         click.echo("\ndaemon stopped.")
 
@@ -5052,6 +5079,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "thresholds": "Progressive per-account thresholds. `steps: [70, 85, 95]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
     "lazy_swap": "Cache-aware lazy background swap (GH #56). Consulted ONLY when `hot_swap.enabled` is false. A background swap never interrupts a session; its only cost is a one-time prompt-cache rebuild on the live sessions that migrate. So `enabled: true` (default) DEFERS a non-urgent swap (ladder below saturation, burn-before-reset) while any live session's last activity is younger than `cache_window_seconds: 300` (≈ Anthropic's prompt-cache TTL) — it re-fires once the cache is cold (free) or the swap turns urgent. Urgent swaps (hard 7d cap, 5h saturation, reactive 429) are never deferred. Set `enabled: false` to swap immediately on every ladder trip (old behavior). Inspect deferrals with `cus decisions`.",
+    "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
@@ -5261,6 +5289,62 @@ def _five_hour_rolled_since_poll(acct: dict) -> bool:
     poll_age = _time_since(last_poll)          # seconds since the last poll
     # Stale iff the last poll predates the reset (poll older than the reset).
     return poll_age is not None and poll_age > reset_age
+
+
+def _apply_countdown_reset_inference(state: dict, config: dict) -> list[str]:
+    """GH #59 countdown fallback: act on the reset countdown when polling can't.
+
+    When a cycle did NOT refresh an account past its 5h reset (the poll failed,
+    the account is in 429 backoff, or its token is stale), the stored
+    `current_5h_pct` is the PRE-reset value (e.g. 96%) even though the window
+    has actually rolled to ~0. Trust the live countdown: write 5h→0 into state
+    (stashing the prior value in `five_hour_pct_pre_reset` for display) so the
+    decision logic and SOS see reality instead of a stale-high number. The next
+    successful poll supersedes the inference and clears the flags.
+
+    Returns the names of accounts inferred-reset this cycle (for logging).
+    Idempotent: a re-run on an already-inferred account is a no-op.
+    """
+    if not config.get("reset_inference", {}).get("enabled", True):
+        return []
+    inferred = []
+    for name, acct in state.get("accounts", {}).items():
+        rolled = _five_hour_rolled_since_poll(acct)
+        if rolled and (acct.get("current_5h_pct") or 0) > 0:
+            acct["five_hour_pct_pre_reset"] = acct.get("current_5h_pct")
+            acct["current_5h_pct"] = 0.0
+            acct["five_hour_reset_inferred"] = True
+            inferred.append(name)
+        elif acct.get("five_hour_reset_inferred") and not rolled:
+            # A fresh poll has superseded the inference — clear the markers.
+            acct.pop("five_hour_reset_inferred", None)
+            acct.pop("five_hour_pct_pre_reset", None)
+    return inferred
+
+
+def _adaptive_sleep_seconds(state: dict, config: dict, base_interval: float) -> float:
+    """GH #59 adaptive repoll: shorten the inter-cycle sleep so the daemon wakes
+    just after the soonest known 5h reset and repolls promptly, instead of
+    flying on the countdown-inferred value for a whole poll_interval.
+
+    Only ever SHORTENS `base_interval` (returns it unchanged when no window
+    resets sooner), and is floored by `min_repoll_seconds` so we never
+    busy-loop. Accounts with no ticking 5h clock (util ≤ 0 → resets_at
+    stale/meaningless) are ignored.
+    """
+    cfg = config.get("reset_inference", {})
+    if not cfg.get("adaptive_repoll", True):
+        return base_interval
+    soonest = None
+    for acct in state.get("accounts", {}).values():
+        secs = _five_hour_remaining_seconds(None, acct)
+        if secs is not None and secs > 0:
+            soonest = secs if soonest is None else min(soonest, secs)
+    if soonest is None:
+        return base_interval
+    buffer = cfg.get("repoll_buffer_seconds", 20)
+    floor = cfg.get("min_repoll_seconds", 30)
+    return max(floor, min(base_interval, soonest + buffer))
 
 
 def _fmt_render_stamp_eastern() -> str:
@@ -5487,7 +5571,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 # stale. Flag it (↻reset, was X%) rather than showing the stale
                 # number bare, so the operator knows a reset happened without
                 # waiting to repoll. Next poll confirms the new (~0%) value.
-                rolled_lbl = f"5h:↻reset(was {h5:.0f}%)"
+                # Prefer the stashed pre-reset value (set when the daemon's
+                # countdown fallback already zeroed current_5h_pct); fall back to
+                # the still-stale h5 when the statusline renders before the
+                # daemon has inferred. GH #59.
+                was_pct = a.get("five_hour_pct_pre_reset")
+                was_pct = was_pct if was_pct is not None else h5
+                rolled_lbl = f"5h:↻reset(was {was_pct:.0f}%)"
                 parts.append(click.style(rolled_lbl, fg="bright_magenta", bold=True) if color_on else rolled_lbl)
             else:
                 r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""

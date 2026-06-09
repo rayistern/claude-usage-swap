@@ -72,6 +72,100 @@ def test_rolled_when_never_polled():
     assert cus._five_hour_rolled_since_poll(acct) is True
 
 
+def test_inference_zeroes_stale_high_rolled_account():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now - timedelta(minutes=5)),
+        "last_poll_ts": _iso(now - timedelta(minutes=12)),
+        "current_5h_pct": 96,
+    }}}
+    out = cus._apply_countdown_reset_inference(state, {"reset_inference": {"enabled": True}})
+    a = state["accounts"]["a"]
+    assert out == ["a"]
+    assert a["current_5h_pct"] == 0.0
+    assert a["five_hour_reset_inferred"] is True
+    assert a["five_hour_pct_pre_reset"] == 96   # prior value stashed for display
+
+
+def test_inference_leaves_freshly_polled_account_alone():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now - timedelta(minutes=70)),
+        "last_poll_ts": _iso(now - timedelta(minutes=3)),   # polled after the reset
+        "current_5h_pct": 0,
+    }}}
+    out = cus._apply_countdown_reset_inference(state, {"reset_inference": {"enabled": True}})
+    assert out == []
+    assert "five_hour_reset_inferred" not in state["accounts"]["a"]
+
+
+def test_inference_cleared_when_fresh_poll_supersedes():
+    now = _now()
+    # previously inferred, but now we've polled after the reset → clear markers
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now - timedelta(minutes=70)),
+        "last_poll_ts": _iso(now - timedelta(minutes=1)),
+        "current_5h_pct": 12,
+        "five_hour_reset_inferred": True,
+        "five_hour_pct_pre_reset": 96,
+    }}}
+    cus._apply_countdown_reset_inference(state, {"reset_inference": {"enabled": True}})
+    a = state["accounts"]["a"]
+    assert "five_hour_reset_inferred" not in a
+    assert "five_hour_pct_pre_reset" not in a
+
+
+def test_inference_disabled_is_noop():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now - timedelta(minutes=5)),
+        "last_poll_ts": _iso(now - timedelta(minutes=12)),
+        "current_5h_pct": 96,
+    }}}
+    out = cus._apply_countdown_reset_inference(state, {"reset_inference": {"enabled": False}})
+    assert out == []
+    assert state["accounts"]["a"]["current_5h_pct"] == 96
+
+
+def test_adaptive_sleep_shortens_to_just_after_reset():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now + timedelta(seconds=240)), "current_5h_pct": 50,
+    }}}
+    s = cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600)
+    assert 255 <= s <= 265   # 240 + 20 buffer
+
+
+def test_adaptive_sleep_unchanged_when_reset_is_far():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now + timedelta(hours=2)), "current_5h_pct": 50,
+    }}}
+    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600) == 600
+
+
+def test_adaptive_sleep_unchanged_when_no_ticking_clock():
+    state = {"accounts": {"a": {"current_5h_pct": 0}}}
+    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600) == 600
+
+
+def test_adaptive_sleep_floored():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now + timedelta(seconds=5)), "current_5h_pct": 50,
+    }}}
+    # 5 + 20 = 25, but floored at min_repoll_seconds (default 30)
+    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600) == 30
+
+
+def test_adaptive_sleep_disabled_returns_base():
+    now = _now()
+    state = {"accounts": {"a": {
+        "five_hour_resets_at": _iso(now + timedelta(seconds=60)), "current_5h_pct": 50,
+    }}}
+    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": False}}, 600) == 600
+
+
 def _run_all() -> int:
     import types
     tests = [v for k, v in globals().items()
