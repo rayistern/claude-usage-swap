@@ -22,7 +22,9 @@ Storage:
     state.json                   Runtime state (active + per-account thresholds + history).
     sessions.log                 SessionStart hook output (one line per new session).
     stops.log                    Stop hook output (one line per turn end).
-    429.log                      PostToolUseFailure detections.
+    429.log                      Rate-limit detections: StopFailure (primary, real
+                                 model-level 429s) + PostToolUseFailure (secondary,
+                                 best-effort subagent-internal API errors).
     tool_use.log                 PreToolUse + SubagentStop signals.
     daemon.log                   Daemon stdout/stderr when running.
     inbox.md                     Decisions made autonomously by the daemon.
@@ -49,6 +51,10 @@ Methodology lifted (not code) from cux (github.com/inulute/cux):
   - Strategy picker patterns (drain/balanced) (internal/strategy/strategy.go)
   - Hook-based turn-boundary signaling
   - PostToolUseFailure 429 substring-match (internal/hooks/hooks.go:765-800)
+    [A2 2026-06-23: superseded as the PRIMARY 429 source by a StopFailure hook —
+    PostToolUseFailure structurally never sees model-level 429s (those fire
+    StopFailure with a categorized `error` enum); the old loose substring match
+    manufactured false positives from downstream tool output.]
   - --resume <id> "Go continue." wake-up pattern (wrapper.go:180-185)
 NOT lifted: cux's keystore-swap, because on Linux .credentials.json IS the
 keystore — no libsecret/keychain dance is needed (Claude Code auth docs are
@@ -353,6 +359,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hooks": {
         "install_session_start": True,
         "install_stop": True,
+        "install_stop_failure": True,     # A2: reliable model-level 429 detector (StopFailure)
         "install_post_tool_use_failure": True,
         "install_pre_tool_use": False,    # only needed if subagent_skip.enabled
         "install_post_tool_use": False,   # only needed if subagent_skip.enabled — pairs with install_pre_tool_use (GH #27)
@@ -1349,6 +1356,13 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
 HOOK_EVENTS = {
     "SessionStart": ("cus_session_start.sh", "install_session_start"),
     "Stop": ("cus_stop.sh", "install_stop"),
+    # StopFailure (A2, 2026-06-23): the DOCUMENTED, reliable Anthropic-429 signal.
+    # A model-level rate limit fires StopFailure (instead of Stop) with a clean
+    # categorized `error` enum ("rate_limit"/"overloaded"), NOT PostToolUseFailure
+    # — which only sees tool-execution failures. This is the primary 429 detector;
+    # the PostToolUseFailure hook below is now a best-effort secondary for
+    # subagent-internal API errors only.
+    "StopFailure": ("cus_stop_failure.sh", "install_stop_failure"),
     "PostToolUseFailure": ("cus_post_tool_use_failure.sh", "install_post_tool_use_failure"),
     "PreToolUse": ("cus_pre_tool_use.sh", "install_pre_tool_use"),
     # PostToolUse(success) closes the start/stop ledger so subagent_active
