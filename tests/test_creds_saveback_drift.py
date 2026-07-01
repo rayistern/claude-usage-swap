@@ -260,6 +260,82 @@ def test_unparseable_live_creds_do_not_destroy_snapshot():
         env.restore()
 
 
+# ---------------------------------------------------------------------------
+# Review amendment 2026-07-01 — valid-JSON garbage in the live file
+# (the original PR only guarded UNPARSEABLE JSON; these pin the parseable-
+# but-tokenless / non-object cases, which used to destroy the snapshot or
+# crash the swap with AttributeError)
+# ---------------------------------------------------------------------------
+
+def test_classify_invalid_when_no_refresh_token():
+    """A live file with no claudeAiOauth.refreshToken has nothing durable to
+    save; it must classify 'invalid' (skip), never 'unknown' (save-back)."""
+    env = _Env({"a": _creds("rt-a", "at-a")}, active="a",
+               live_creds={"claudeAiOauth": {"accessToken": "at-only"}})
+    try:
+        state = json.loads(env.state_json.read_text())
+        for live in ({}, {"claudeAiOauth": {"accessToken": "at-only"}},
+                     {"claudeAiOauth": "bogus-not-a-dict"}, ["not", "a", "dict"], "just a string", 42):
+            verdict, owner, _ = cus.classify_live_creds_owner(live, "a", state)
+            assert (verdict, owner) == ("invalid", None), f"live={live!r} -> {(verdict, owner)}"
+    finally:
+        env.restore()
+
+
+def test_tokenless_live_creds_do_not_destroy_snapshot():
+    """`claude logout` in a pane rewrites the live file without oauth tokens.
+    Saving that back would erase the outgoing account's refresh token — the
+    save-back must be skipped, exactly like the unparseable-JSON case."""
+    env = _Env({"a": _creds("rt-a", "at-a-good"), "b": _creds("rt-b", "at-b")},
+               active="a", live_creds={"claudeAiOauth": {"accessToken": "at-x", "expiresAt": 1}})
+    try:
+        cus.execute_swap("b")
+        assert env.snapshot("a")["claudeAiOauth"]["refreshToken"] == "rt-a"
+        assert env.snapshot("a")["claudeAiOauth"]["accessToken"] == "at-a-good"
+        assert env.live()["claudeAiOauth"]["refreshToken"] == "rt-b"   # target installed
+    finally:
+        env.restore()
+
+
+def test_empty_object_live_creds_do_not_destroy_snapshot():
+    """Valid JSON `{}` is still garbage from a save-back perspective."""
+    env = _Env({"a": _creds("rt-a", "at-a-good"), "b": _creds("rt-b", "at-b")},
+               active="a", live_creds=b"{}")
+    try:
+        cus.execute_swap("b")
+        assert env.snapshot("a")["claudeAiOauth"]["refreshToken"] == "rt-a"
+    finally:
+        env.restore()
+
+
+def test_nondict_live_json_does_not_crash_swap():
+    """json.loads can return a list/string/number; the swap must classify it
+    'invalid' and proceed, not die with AttributeError (which no caller
+    catches — the daemon loop would crash)."""
+    env = _Env({"a": _creds("rt-a", "at-a"), "b": _creds("rt-b", "at-b")},
+               active="a", live_creds=b'["not", "a", "dict"]')
+    try:
+        cus.execute_swap("b")
+        assert env.snapshot("a")["claudeAiOauth"]["refreshToken"] == "rt-a"
+        assert json.loads(env.state_json.read_text())["active"] == "b"
+    finally:
+        env.restore()
+
+
+def test_nondict_snapshot_cannot_crash_or_misvote_classification():
+    """A snapshot holding a JSON list must be treated like a corrupt snapshot
+    (no vote), not AttributeError the classification."""
+    env = _Env({"a": _creds("rt-a", "at-a"), "b": _creds("rt-b", "at-b")},
+               active="a", live_creds=_creds("rt-a", "at-a-refreshed"))
+    try:
+        (env.accounts_dir / "account-b" / ".credentials.json").write_bytes(b"[1, 2]")
+        verdict, owner, _ = cus.classify_live_creds_owner(
+            env.live(), "a", json.loads(env.state_json.read_text()))
+        assert (verdict, owner) == ("expected", "a")
+    finally:
+        env.restore()
+
+
 def test_missing_live_creds_raises_filenotfound():
     """Callers (switch, daemon) catch FileNotFoundError specifically — the
     guard must keep raising the same exception type the old atomic_copy did."""

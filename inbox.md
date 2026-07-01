@@ -39,6 +39,14 @@ Identity matching is by refresh-token lineage because the credentials file carri
 2. To restore pre-fix unparseable-file behavior (not recommended): replace the `json.JSONDecodeError` skip branch with `atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)` and delete `test_unparseable_live_creds_do_not_destroy_snapshot`.
 3. Full revert: `git revert` the commit titled "fix(swap): detect token-refresh drift before the creds save-back (GH #3)" on branch fix/3-refresh-drift-saveback-guard.
 
+### Amendment 2026-07-01 (adversarial code review, same day)
+Review found two real gaps in the original implementation; both fixed on this branch before merge:
+
+1. **Parseable-but-tokenless live file destroyed the snapshot.** The "no refreshToken" case fell into the "unknown" verdict, which saves back — so a live file of `{}` or a `claude logout`-shaped file (valid JSON, no oauth tokens) was written over the outgoing account's snapshot, erasing its refresh token. That is the same snapshot-destruction class GH #3 exists to prevent, reachable via valid-JSON garbage instead of invalid. New verdict `"invalid"` now skips the save-back (mirrors the unparseable-JSON branch).
+2. **Non-dict JSON crashed the whole swap.** `json.loads` returning a list/string/number (live file or a snapshot) hit `.get` on a non-dict → `AttributeError`, which no caller catches (daemon callers catch only FileNotFoundError/ValueError/RuntimeError) — a corrupt-but-valid-JSON file would have crashed the daemon's swap loop. Extraction is now `isinstance`-guarded in `classify_live_creds_owner`; non-dict snapshots are treated like corrupt snapshots (no vote), a non-dict live file classifies `"invalid"`.
+
+Walk-back for the amendment alone: revert the commit titled "fix(swap): skip save-back of tokenless/non-dict live creds; harden classification against non-dict JSON (review of GH #3 fix)".
+
 ---
 
 

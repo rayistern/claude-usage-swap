@@ -1388,12 +1388,27 @@ def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> t
         whose refresh also rotated; callers should preserve the historical
         save-back behavior here (skipping would strand legitimately-rotated
         tokens, which is the worse failure).
+      - ("invalid", None, ...)       live creds parse as JSON but carry NO
+        claudeAiOauth.refreshToken (a `claude logout`-shaped file, an empty
+        `{}`, or JSON that isn't even an object). There is nothing durable to
+        save back — an access token alone expires within the hour and can't
+        be renewed — so writing these bytes over a snapshot can only destroy
+        its refresh token. Callers must SKIP the save-back, same as for
+        unparseable JSON. (Review amendment 2026-07-01: this case originally
+        fell through to "unknown" and clobbered the outgoing snapshot with
+        tokenless garbage — the same snapshot-destruction class GH #3 exists
+        to prevent, just via valid-JSON garbage instead of invalid.)
     """
-    live_rt = (live_creds.get("claudeAiOauth") or {}).get("refreshToken")
+    # Defensive extraction: any process can scribble on the live creds file,
+    # and json.loads happily returns lists/strings/numbers — so never assume
+    # dict shapes. An uncaught AttributeError here would crash the entire
+    # swap (callers catch only FileNotFoundError/ValueError/RuntimeError).
+    live_oauth = live_creds.get("claudeAiOauth") if isinstance(live_creds, dict) else None
+    live_rt = live_oauth.get("refreshToken") if isinstance(live_oauth, dict) else None
     if not live_rt:
-        # No refresh token at all — can't establish lineage. Treat like
-        # "unknown" so behavior falls back to the pre-GH#3 status quo.
-        return ("unknown", None, "live credentials have no claudeAiOauth.refreshToken")
+        return ("invalid", None,
+                "live credentials carry no claudeAiOauth.refreshToken — nothing durable "
+                "to save back (logout-shaped or malformed file)")
 
     matches: list[str] = []
     for name in state.get("accounts", {}):
@@ -1401,11 +1416,15 @@ def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> t
         if not snap_path.exists():
             continue
         try:
-            snap_rt = (read_json(snap_path).get("claudeAiOauth") or {}).get("refreshToken")
+            snap = read_json(snap_path)
         except (json.JSONDecodeError, OSError):
             # A corrupt/unreadable snapshot can't vote on ownership; skip it
             # rather than failing the whole swap.
             continue
+        # Same non-dict paranoia as for the live file: a snapshot holding a
+        # JSON list/string must not AttributeError the swap out from under us.
+        snap_oauth = snap.get("claudeAiOauth") if isinstance(snap, dict) else None
+        snap_rt = snap_oauth.get("refreshToken") if isinstance(snap_oauth, dict) else None
         if snap_rt and snap_rt == live_rt:
             matches.append(name)
 
@@ -1534,6 +1553,15 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
                 append_inbox("drift", f"token-refresh drift detected ({owner} overwrote live creds)", msg)
             except OSError:
                 pass  # inbox is best-effort observability; never fail a swap over it
+        elif verdict == "invalid":
+            # Parseable JSON but no refresh token inside (logout-shaped file,
+            # `{}`, or a non-object). Same treatment as unparseable JSON: a
+            # save-back could only replace the snapshot's refresh token with
+            # nothing, so keep the last-known-good snapshot and move on — the
+            # target install below rewrites the live file with good creds.
+            # (Review amendment 2026-07-01; previously this fell into the
+            # "unknown" save-back and destroyed the outgoing snapshot.)
+            click.echo(f"creds-save-back: SKIPPED — {detail}; keeping '{current}' snapshot as-is")
         else:  # "conflict"
             # Multiple snapshots share the live refresh token — duplicate-
             # identity accounts (GH #70). Any write would be a guess; keep
