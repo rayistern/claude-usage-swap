@@ -4994,6 +4994,20 @@ def poll(account: str | None, no_write: bool) -> None:
         click.echo(f"polling {name}...")
         u = poll_account_usage(name)
         usage_by_account[name] = u
+        # GH #68: token_stale must be checked BEFORE the generic raw["error"]
+        # branch. poll_account_usage sets raw["error"] alongside token_stale
+        # (the raw text is what an operator sees in --json dumps), so without
+        # this branch a benign aged-out access token on an inactive account
+        # fell through to the scary "ERROR: ..." line. That mislabel caused a
+        # real operator to re-login a perfectly healthy account. force-poll
+        # already had the friendly branch; this mirrors it. The account stays
+        # swap-eligible (pick_swap_target only excludes token_expired /
+        # poll_error), so say so explicitly to preempt the "will it ever swap
+        # to it?" worry that GH #68 documents.
+        if u.token_stale:
+            minutes = u.raw.get("expired_minutes_ago", "?")
+            click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable and swap-eligible).")
+            continue
         if u.token_expired:
             click.echo(f"  TOKEN EXPIRED — re-auth this account (claude login under its config dir)")
             continue
