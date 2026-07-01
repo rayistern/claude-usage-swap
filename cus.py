@@ -1354,6 +1354,96 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 # Swap primitive (callable from daemon, not just CLI)
 # --------------------------------------------------------------------------
 
+def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> tuple[str, str | None, str]:
+    """Identify which account the live credentials file actually belongs to (GH #3).
+
+    Why this exists: a DRIFTED pane (its in-memory tokens are account X's while
+    state.json says account Y is active) will eventually refresh its access
+    token and write X's tokens over `~/.claude/.credentials.json`. If a swap
+    then blindly saves the live file back into Y's storage snapshot, Y's
+    snapshot — including its long-lived refresh token — is clobbered with X's
+    tokens, and the corruption compounds on every subsequent swap.
+
+    Identification strategy: the credentials file carries no explicit identity
+    (no email / account uuid — just tokens), so we match on REFRESH TOKEN
+    lineage. Refresh tokens are long-lived (~30 days) and stable across the
+    hourly access-token refreshes, so `live.refreshToken == snapshot.refreshToken`
+    is a reliable "same account" signal, and matching a *different* account's
+    snapshot is definitive proof of drift. Access-token equality alone is NOT
+    used as a signal: the live access token legitimately diverges from every
+    snapshot within an hour of normal use.
+
+    Returns (verdict, owner, detail):
+      - ("expected", expected, ...)  live file provably belongs to `expected` —
+        safe to save back into its snapshot.
+      - ("foreign", X, ...)          live file provably belongs to account X !=
+        expected — the GH #3 drift case. Do NOT save into expected's snapshot.
+      - ("conflict", None, ...)      live refresh token matches MULTIPLE
+        snapshots (duplicate-identity setup, see GH #70) — ownership is
+        ambiguous, don't guess.
+      - ("unknown", None, ...)       live refresh token matches no snapshot.
+        Usually means the refresh endpoint ROTATED the active account's refresh
+        token since the last swap (benign — the save-back is exactly how the
+        rotated token gets persisted). Indistinguishable from a drifted pane
+        whose refresh also rotated; callers should preserve the historical
+        save-back behavior here (skipping would strand legitimately-rotated
+        tokens, which is the worse failure).
+      - ("invalid", None, ...)       live creds parse as JSON but carry NO
+        claudeAiOauth.refreshToken (a `claude logout`-shaped file, an empty
+        `{}`, or JSON that isn't even an object). There is nothing durable to
+        save back — an access token alone expires within the hour and can't
+        be renewed — so writing these bytes over a snapshot can only destroy
+        its refresh token. Callers must SKIP the save-back, same as for
+        unparseable JSON. (Review amendment 2026-07-01: this case originally
+        fell through to "unknown" and clobbered the outgoing snapshot with
+        tokenless garbage — the same snapshot-destruction class GH #3 exists
+        to prevent, just via valid-JSON garbage instead of invalid.)
+    """
+    # Defensive extraction: any process can scribble on the live creds file,
+    # and json.loads happily returns lists/strings/numbers — so never assume
+    # dict shapes. An uncaught AttributeError here would crash the entire
+    # swap (callers catch only FileNotFoundError/ValueError/RuntimeError).
+    live_oauth = live_creds.get("claudeAiOauth") if isinstance(live_creds, dict) else None
+    live_rt = live_oauth.get("refreshToken") if isinstance(live_oauth, dict) else None
+    if not live_rt:
+        return ("invalid", None,
+                "live credentials carry no claudeAiOauth.refreshToken — nothing durable "
+                "to save back (logout-shaped or malformed file)")
+
+    matches: list[str] = []
+    for name in state.get("accounts", {}):
+        snap_path = account_creds_path(name)
+        if not snap_path.exists():
+            continue
+        try:
+            snap = read_json(snap_path)
+        except (json.JSONDecodeError, OSError):
+            # A corrupt/unreadable snapshot can't vote on ownership; skip it
+            # rather than failing the whole swap.
+            continue
+        # Same non-dict paranoia as for the live file: a snapshot holding a
+        # JSON list/string must not AttributeError the swap out from under us.
+        snap_oauth = snap.get("claudeAiOauth") if isinstance(snap, dict) else None
+        snap_rt = snap_oauth.get("refreshToken") if isinstance(snap_oauth, dict) else None
+        if snap_rt and snap_rt == live_rt:
+            matches.append(name)
+
+    if len(matches) > 1:
+        return ("conflict", None,
+                f"live refresh token matches multiple account snapshots: {sorted(matches)} "
+                f"(duplicate-identity accounts? see GH #70)")
+    if len(matches) == 1:
+        owner = matches[0]
+        if owner == expected:
+            return ("expected", owner, f"live refresh token matches '{owner}' snapshot")
+        return ("foreign", owner,
+                f"live refresh token matches '{owner}' snapshot, not active account "
+                f"'{expected}' — a drifted pane's token refresh overwrote the live file (GH #3)")
+    return ("unknown", None,
+            "live refresh token matches no account snapshot (most likely the active "
+            "account's refresh token was rotated since the last swap)")
+
+
 def execute_swap(target_name: str, trigger: str = "manual") -> dict:
     """Atomically swap to `target_name`. Returns updated state dict.
 
@@ -1401,7 +1491,89 @@ def execute_swap(target_name: str, trigger: str = "manual") -> dict:
         existing = {}
     existing.update(current_identity)
     write_json(current_dir / ".claude.json", existing)
-    atomic_copy(CREDS_JSON, current_dir / ".credentials.json", mode=0o600)
+
+    # ---- GH #3: refresh-time drift detection on the credentials save-back ----
+    # The live file is read into memory EXACTLY ONCE and those same bytes are
+    # what gets written to storage. This closes the read-check-write race: a
+    # pane's token refresh can rewrite the live file at any moment, and a
+    # naive "check the file, then atomic_copy the file" would validate one
+    # version and copy another. (atomic_write_bytes still makes the *write*
+    # atomic; the residual race — a refresh landing between this read and the
+    # target-creds install below — existed before this change and only loses
+    # at most one access-token refresh, never a snapshot's lineage.)
+    if not CREDS_JSON.exists():
+        # Preserve pre-GH#3 behavior: atomic_copy(CREDS_JSON, ...) raised
+        # FileNotFoundError here, and `switch`/daemon callers handle exactly
+        # that exception type.
+        raise FileNotFoundError(f"{CREDS_JSON} missing — cannot save active account's tokens back to storage")
+    live_creds_bytes = CREDS_JSON.read_bytes()
+    try:
+        live_creds = json.loads(live_creds_bytes)
+    except json.JSONDecodeError as e:
+        # Pre-GH#3 this copied the unparseable bytes into current's snapshot
+        # verbatim, destroying a known-good snapshot with garbage (Claude
+        # mid-write, disk corruption, ...). Skipping the save-back is strictly
+        # safer: the snapshot keeps its last-known-good tokens, and the swap
+        # itself still proceeds (the target install below overwrites the
+        # corrupt live file with a good one — which also happens to repair it).
+        live_creds = None
+        click.echo(f"creds-save-back: SKIPPED — live {CREDS_JSON} unparseable ({e}); "
+                   f"keeping '{current}' snapshot as-is")
+    if live_creds is not None:
+        verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
+        if verdict in ("expected", "unknown"):
+            # "expected": provably current's tokens — the normal save-back.
+            # "unknown": no snapshot matched, which is what a legitimate
+            # refresh-token rotation on the active account looks like; the
+            # save-back is the only way that rotated token gets persisted, so
+            # keep the historical behavior (see classify_live_creds_owner).
+            if verdict == "unknown":
+                click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
+            atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+        elif verdict == "foreign":
+            # THE GH #3 case: a drifted pane's refresh overwrote the live file
+            # with a different account's tokens. Two actions:
+            #   1. Do NOT write them into current's snapshot (that was the bug —
+            #      current's refresh token would be lost).
+            #   2. DO write them into the true owner's snapshot: the live file
+            #      provably carries the owner's lineage (same refresh token)
+            #      with a fresher access token from the drifted pane's refresh.
+            #      Discarding it would strand the owner's snapshot on an older
+            #      access token for no benefit; same-lineage writes are safe.
+            atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
+                               live_creds_bytes, mode=0o600)
+            msg = (f"DRIFT DETECTED at swap ({current} -> {target_name}): {detail}. "
+                   f"Skipped save-back into '{current}' snapshot (kept its last-known-good tokens); "
+                   f"routed live tokens to their true owner '{owner}' instead.")
+            click.echo(f"creds-save-back: {msg}")
+            # Surface it for the operator too — drift means some pane is loaded
+            # with the wrong account and will keep rewriting the live file
+            # until it's restarted (see GH #3 for the mechanism).
+            try:
+                append_inbox("drift", f"token-refresh drift detected ({owner} overwrote live creds)", msg)
+            except OSError:
+                pass  # inbox is best-effort observability; never fail a swap over it
+        elif verdict == "invalid":
+            # Parseable JSON but no refresh token inside (logout-shaped file,
+            # `{}`, or a non-object). Same treatment as unparseable JSON: a
+            # save-back could only replace the snapshot's refresh token with
+            # nothing, so keep the last-known-good snapshot and move on — the
+            # target install below rewrites the live file with good creds.
+            # (Review amendment 2026-07-01; previously this fell into the
+            # "unknown" save-back and destroyed the outgoing snapshot.)
+            click.echo(f"creds-save-back: SKIPPED — {detail}; keeping '{current}' snapshot as-is")
+        else:  # "conflict"
+            # Multiple snapshots share the live refresh token — duplicate-
+            # identity accounts (GH #70). Any write would be a guess; keep
+            # every snapshot untouched and let the operator untangle it.
+            msg = (f"AMBIGUOUS creds ownership at swap ({current} -> {target_name}): {detail}. "
+                   f"Skipped save-back entirely to avoid corrupting a snapshot.")
+            click.echo(f"creds-save-back: {msg}")
+            try:
+                append_inbox("drift", "ambiguous creds ownership — save-back skipped", msg)
+            except OSError:
+                pass
+    # ---- end GH #3 drift detection ----
 
     # Merge target's account-bound keys into live ~/.claude.json
     target_account_cj = read_json(target_cj)

@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds](#2026-07-01-decision-gh-3-drift-guard-route-drifted-live-tokens-to-their-true-owner-beyond-skip-log-skip-save-back-of-unparseable-live-creds)
 - [2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found](#2026-05-19-flag-second-hot-swap-test-2026-05-19-21-00-orchestrator-correctness-ok-3-new-bugs-found)
 - [2026-05-19 — deviation — Hot-swap orchestration disabled 2026-05-19 after burning ~4% of user's 5h on bungled live-session relaunch](#2026-05-19-deviation-hot-swap-orchestration-disabled-2026-05-19-after-burning-4-of-user-s-5h-on-bungled-live-session-relaunch)
 - [2026-05-19 — decision — **ARCH DECISION** — Unified-tree storage: each account-* dir is a valid CLAUDE_CONFIG_DIR](#2026-05-19-decision-arch-decision-unified-tree-storage-each-account-dir-is-a-valid-claude-config-dir)
@@ -16,6 +17,38 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #drift #credentials #gh-3 #swap-safety
+
+### What I decided
+The task spec for the GH #3 fix said "verify account identity in the credentials file before writing; **skip + log** on mismatch." I implemented two things beyond that literal scope, both in `execute_swap`'s save-back path:
+
+1. **On a definite foreign match** (live `~/.claude/.credentials.json` refresh token exactly matches a *different* account's storage snapshot), the live bytes are not merely discarded — they are written into the **true owner's** snapshot. Rationale: the drifted pane's refresh gave the owner a *fresher* access token than its snapshot has; the refresh-token lineage is identical, so the write is provably same-account and strictly an improvement. Discarding would strand the owner on an older access token for no benefit.
+2. **Unparseable live creds file** (JSON decode failure): previously the raw bytes were byte-copied over the outgoing account's known-good snapshot. Now the save-back is skipped with a log line, and the swap proceeds (installing the target's creds also repairs the corrupt live file). This changes behavior for a corner case, but the old behavior destroyed a good snapshot with garbage — clearly a bug, not a contract.
+
+Also note the deliberate **"unknown" verdict fallback**: when the live refresh token matches *no* snapshot (what a legitimate refresh-token rotation looks like), the historical save-back to the active account is preserved. Skipping there would strand every legitimately-rotated refresh token, which is worse than the drift it would prevent. This is documented in `classify_live_creds_owner`'s docstring and in PR text as a residual gap (a drifted pane whose refresh also rotates its token remains undetectable without a network identity check).
+
+Identity matching is by refresh-token lineage because the credentials file carries no explicit identity (no email/uuid) — cross-referenced with GH #70 (duplicate-identity accounts), which produces the "conflict" verdict where the save-back is skipped entirely.
+
+### Walk-back path
+1. To restore literal skip+log-only behavior: in `cus.py` `execute_swap`, in the `verdict == "foreign"` branch, delete the `atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json", ...)` call (keep the click.echo + append_inbox lines). Update `tests/test_creds_saveback_drift.py::test_drift_does_not_clobber_current_snapshot` and `test_drift_to_third_account` to drop the "owner healed" assertions.
+2. To restore pre-fix unparseable-file behavior (not recommended): replace the `json.JSONDecodeError` skip branch with `atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)` and delete `test_unparseable_live_creds_do_not_destroy_snapshot`.
+3. Full revert: `git revert` the commit titled "fix(swap): detect token-refresh drift before the creds save-back (GH #3)" on branch fix/3-refresh-drift-saveback-guard.
+
+### Amendment 2026-07-01 (adversarial code review, same day)
+Review found two real gaps in the original implementation; both fixed on this branch before merge:
+
+1. **Parseable-but-tokenless live file destroyed the snapshot.** The "no refreshToken" case fell into the "unknown" verdict, which saves back — so a live file of `{}` or a `claude logout`-shaped file (valid JSON, no oauth tokens) was written over the outgoing account's snapshot, erasing its refresh token. That is the same snapshot-destruction class GH #3 exists to prevent, reachable via valid-JSON garbage instead of invalid. New verdict `"invalid"` now skips the save-back (mirrors the unparseable-JSON branch).
+2. **Non-dict JSON crashed the whole swap.** `json.loads` returning a list/string/number (live file or a snapshot) hit `.get` on a non-dict → `AttributeError`, which no caller catches (daemon callers catch only FileNotFoundError/ValueError/RuntimeError) — a corrupt-but-valid-JSON file would have crashed the daemon's swap loop. Extraction is now `isinstance`-guarded in `classify_live_creds_owner`; non-dict snapshots are treated like corrupt snapshots (no vote), a non-dict live file classifies `"invalid"`.
+
+Walk-back for the amendment alone: revert the commit titled "fix(swap): skip save-back of tokenless/non-dict live creds; harden classification against non-dict JSON (review of GH #3 fix)".
+
+---
+
 
 ## 2026-05-19 — flag — Second hot-swap test 2026-05-19 21:00 — orchestrator correctness OK; 3 new bugs found
 
