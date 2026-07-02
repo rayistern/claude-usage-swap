@@ -239,24 +239,36 @@ def test_gate_off_is_a_noop_on_current_max_pct():
     assert cus.current_max_pct(u, DIFF_CFG) == 40.0  # key absent entirely
 
 
-def test_gate_on_folds_max_model_week_into_current_max_pct():
+def test_ladder_signal_excludes_per_model_week():
+    # Behavior change 2026-07-02 (supersedes the prior fold): current_max_pct
+    # is the progressive-LADDER signal and no longer counts per-model weekly,
+    # even with the gate on. A Fable week at 95% must NOT drag the ladder
+    # signal up to 95% — that would trip a ladder swap at steps[0] long before
+    # Fable's own cap. Per-model is enforced on the hard-cap path instead.
     u = _usage(per_model={"Fable": cus.UsageWindow(utilization=95.0, resets_at=None),
                           "Sonnet": cus.UsageWindow(utilization=20.0, resets_at=None)})
-    assert cus.current_max_pct(u, GATE_ON) == 95.0
+    assert cus.current_max_pct(u, GATE_ON) == 40.0   # aggregate 7d only
+    assert cus.current_max_pct(u, GATE_OFF) == 40.0
 
 
-def test_gate_allowlist_filters_models_case_insensitively():
+def test_allowlist_filters_models_in_hard_cap_signal():
+    # The models allowlist still governs WHICH model feeds the hard-cap signal
+    # (_max_model_weekly_from_usage), which is where per-model now acts. Sonnet
+    # is not allowlisted, so only fable's 50% counts.
     u = _usage(per_model={"Sonnet": cus.UsageWindow(utilization=95.0, resets_at=None),
                           "fable": cus.UsageWindow(utilization=50.0, resets_at=None)})
-    # Sonnet is NOT in the allowlist → only fable's 50% counts, and the
-    # aggregate 7d 40% loses to it.
-    assert cus.current_max_pct(u, GATE_ALLOW) == 50.0
+    assert cus._max_model_weekly_from_usage(u, GATE_ALLOW) == 50.0
+    # ...and it does NOT leak into the ladder signal.
+    assert cus.current_max_pct(u, GATE_ALLOW) == 40.0
 
 
-def test_gate_folds_into_account_effective_pct_from_state():
+def test_effective_pct_excludes_per_model_week():
+    # Dict-level twin of the ladder signal: also no longer folds per-model
+    # weekly (2026-07-02). The hard-cap target filter in pick_swap_target
+    # excludes model-exhausted candidates on its own.
     acct = {"current_5h_pct": 10.0, "current_7d_pct": 20.0,
             "per_model_weekly_pct": {"Fable": 88.0}}
-    assert cus._account_effective_pct(acct, GATE_ON) == 88.0
+    assert cus._account_effective_pct(acct, GATE_ON) == 20.0
     assert cus._account_effective_pct(acct, GATE_OFF) == 20.0
 
 
@@ -424,3 +436,27 @@ def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
     picked_tight = cus.pick_swap_target(st, tight)
     assert picked_loose.name == "b" and "[DEGRADED:" not in picked_loose.reason
     assert picked_tight.name == "b" and "no targets below 7d cap" in picked_tight.reason
+
+
+def test_per_model_does_not_ladder_below_its_cap():
+    # The user's exact ask: with steps [80, 90] and Fable capped at 97, Fable
+    # climbing to 85% or 92% must NOT trigger a ladder swap — the account
+    # switches (and leaves rotation) ONLY at 97%. Aggregate 7d is low the whole
+    # time, so nothing but per-model could trip. Ladder step sits at 80.
+    accounts = {
+        "a": {"current_5h_pct": 10.0, "current_7d_pct": 15.0, "next_swap_at_pct": 80},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 50},
+    }
+    cfg = _cap_cfg(97, hard_cap=80, steps=[80, 90])
+    st = _state(active="a", accounts=accounts)
+    # Fable at 85% and 92%: over steps[0]=80 but under the 97 cap → HOLD
+    # (pre-2026-07-02 this laddered at 80%).
+    for fable in (85.0, 92.0):
+        u = {"a": _usage(five_hour=10.0, seven_day=15.0,
+                         per_model={"Fable": cus.UsageWindow(utilization=fable, resets_at=None)})}
+        assert cus.decide_swap(st, cfg, u) is None, f"Fable {fable}% must not ladder below cap"
+    # Fable at 97%: hard-cap force-swap fires.
+    u = {"a": _usage(five_hour=10.0, seven_day=15.0,
+                     per_model={"Fable": cus.UsageWindow(utilization=97.0, resets_at=None)})}
+    d = cus.decide_swap(st, cfg, u)
+    assert d is not None and d.gate == "hard_7d_cap" and d.target == "b"
