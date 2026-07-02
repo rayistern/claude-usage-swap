@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps](#2026-07-02-decision-gh-77-freshness-guard-active-account-relogin-bare-claude-login-not-storage-dir-sync-guard-covers-the-expected-verdict-too-finish-allows-incomparable-timestamps)
 - [2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast](#2026-07-02-decision-gh-76-swap-lock-crash-journal-journal-is-a-standalone-file-not-a-state-json-key-recovery-auto-reconciles-determinate-crashes-lock-waits-instead-of-failing-fast)
 - [2026-07-02 — decision — GH #79 backup rotation: also back up the LIVE creds file before target install; backup failures are NOT swallowed; keep-bound is a constant](#2026-07-02-decision-gh-79-backup-rotation-also-back-up-the-live-creds-file-before-target-install-backup-failures-are-not-swallowed-keep-bound-is-a-constant)
 - [2026-07-01 — decision — GH #3 drift guard: route drifted live tokens to their true owner (beyond skip+log); skip save-back of unparseable live creds](#2026-07-01-decision-gh-3-drift-guard-route-drifted-live-tokens-to-their-true-owner-beyond-skip-log-skip-save-back-of-unparseable-live-creds)
@@ -19,6 +20,30 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #credentials #relogin #freshness #gh-77 #swap-safety
+
+Judgment calls beyond the literal GH #77 spec, on branch `fix/77-relogin-freshness-guard-20260702`:
+
+1. **For the ACTIVE account, `_relogin_command_for` now returns bare `claude /login`** rather than the issue's sketched storage-dir-login-then-sync flow. Rationale: the live `~/.claude/` + `~/.claude.json` ARE the active account's authoritative slot, so a bare login writes the fresh tokens exactly where Claude reads them — one step, no sync, no window where snapshot and live disagree. The issue's storage-dir+`--finish` flow is still fully supported (for users following old docs/muscle memory): `cus relogin <name> --finish` performs the snapshot→live sync, and poll/force-poll/SOS auto-detect the fresher-snapshot signature and point at it.
+2. **The freshness guard applies to BOTH the "expected" and "unknown" classifier verdicts.** The issue framed it for the re-login case (rotated token → "unknown"), but the same destruction happens with an un-rotated out-of-band refresh (same lineage → "expected", snapshot newer). The discriminator is expiresAt either way, so both branches get the veto; "foreign"/"conflict"/"invalid" verdicts already skip.
+3. **The guard only fires when BOTH sides carry a numeric expiresAt.** Missing/garbled metadata falls through to the historical save-back — absence of evidence must not strand legitimately-refreshed live tokens (same philosophy as #72's "unknown" fallback).
+4. **`--finish` refuses only when the snapshot is STRICTLY older than live; equal or incomparable timestamps proceed.** An explicit user request shouldn't be blocked by missing metadata; the strictly-older case is the only provably-harmful one (installing deader tokens over working ones). It also refuses non-active accounts outright — installing an inactive account's tokens live IS the #70/#77 damage class.
+5. **`relogin --exec` env now matches the active-aware command**: pops CLAUDE_CONFIG_DIR when the account is active (previously only when it was named "default"), sets the storage dir otherwise — including for an inactive default, fixing the mirror-image clobber the issue noted.
+6. Incidental: replacing the generic poll "TOKEN EXPIRED" advice line fixed one pre-existing ruff F541 (cus.py finding count 30 → 29).
+
+### Walk-back path
+1. Restore storage-dir advice for active accounts: in `_relogin_command_for`, drop the `account_name == state.get("active")` branch (revert to the `account_name == "default"` special case) — not recommended, it recreates the #77 loop.
+2. Limit the guard to the "unknown" verdict: wrap the freshness check in `if verdict == "unknown":` inside `_execute_swap_locked`'s save-back and drop `tests/test_relogin_freshness.py::test_freshness_guard_applies_to_expected_verdict_too`.
+3. Make `--finish` strict about missing timestamps: change the `snap_exp < live_exp` refusal in `finish_active_relogin` to also refuse when either side is None.
+4. Full revert: `git revert` the commit titled "fix(relogin): freshness guard on the swap save-back + active-aware re-login flow (GH #77)".
+
+---
+
 
 ## 2026-07-02 — decision — GH #76 swap lock + crash journal: journal is a standalone file (not a state.json key); recovery auto-reconciles determinate crashes; lock waits instead of failing fast
 

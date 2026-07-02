@@ -1752,6 +1752,38 @@ def _recover_pending_swap() -> None:
     _clear_swap_journal()
 
 
+def _creds_expires_at(creds: Any) -> int | float | None:
+    """Extract claudeAiOauth.expiresAt (Unix ms) from a credentials payload,
+    tolerating any malformed shape. Used as the FRESHNESS discriminator for
+    GH #77: identity/lineage checks can't tell fresh tokens from dead ones
+    for the SAME account, but a re-login/refresh always advances expiresAt."""
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    exp = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+    return exp if isinstance(exp, (int, float)) else None
+
+
+def _snapshot_fresher_than_live(account_name: str) -> bool:
+    """True when the account's storage snapshot holds strictly NEWER tokens
+    (by claudeAiOauth.expiresAt) than the live ~/.claude/.credentials.json.
+
+    This is the GH #77 signature: the user re-logged in under the storage
+    dir (`CLAUDE_CONFIG_DIR=account-X/ claude`) while X was the ACTIVE
+    account — fresh tokens landed in the snapshot, but Claude keeps reading
+    the (dead) live file. Detection lets poll/SOS point at
+    `cus relogin X --finish` instead of the generic re-login advice, and
+    lets the swap save-back refuse to destroy the fresh snapshot.
+    """
+    snap_path = account_creds_path(account_name)
+    if not snap_path.exists() or not CREDS_JSON.exists():
+        return False
+    try:
+        snap_exp = _creds_expires_at(read_json(snap_path))
+        live_exp = _creds_expires_at(read_json(CREDS_JSON))
+    except (json.JSONDecodeError, OSError):
+        return False
+    return snap_exp is not None and live_exp is not None and snap_exp > live_exp
+
+
 def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> tuple[str, str | None, str]:
     """Identify which account the live credentials file actually belongs to (GH #3).
 
@@ -1957,13 +1989,50 @@ def _execute_swap_locked(target_name: str, trigger: str) -> dict:
             # refresh-token rotation on the active account looks like; the
             # save-back is the only way that rotated token gets persisted, so
             # keep the historical behavior (see classify_live_creds_owner).
-            if verdict == "unknown":
-                click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
-            # GH #79: keep a rotated backup of the snapshot we're replacing —
-            # if any clobber bug slips past the verdict above, the refresh
-            # token is recoverable via `cus restore-creds`.
-            backup_credentials_file(current_dir / ".credentials.json")
-            atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+            #
+            # ---- GH #77: freshness guard ----
+            # Identity/lineage says these live tokens may be saved back — but
+            # if the SNAPSHOT's expiresAt is strictly newer than the live
+            # file's, the snapshot was re-logged-in or refreshed out-of-band
+            # (the #77 scenario: user ran the storage-dir re-login while this
+            # account was ACTIVE, so the fresh tokens landed in the snapshot
+            # and the live file still holds the dead ones). Overwriting would
+            # silently destroy the freshly-minted refresh token at the exact
+            # moment the user is trying to recover from an outage. Note #72's
+            # identity guard structurally cannot catch this: same account,
+            # same-or-rotated lineage — freshness, not identity, is the
+            # discriminator here. The guard compares only when both sides
+            # carry a numeric expiresAt; missing/garbled data falls through
+            # to the historical save-back.
+            snap_exp = None
+            live_exp = _creds_expires_at(live_creds)
+            snap_path = current_dir / ".credentials.json"
+            if live_exp is not None and snap_path.exists():
+                try:
+                    snap_exp = _creds_expires_at(read_json(snap_path))
+                except (json.JSONDecodeError, OSError):
+                    snap_exp = None  # unreadable snapshot can't claim freshness
+            if snap_exp is not None and live_exp is not None and snap_exp > live_exp:
+                msg = (f"FRESHNESS GUARD at swap ({current} -> {target_name}): '{current}' snapshot's tokens "
+                       f"are NEWER than the live file's (snapshot expiresAt {int(snap_exp)} > live {int(live_exp)}) "
+                       f"— the snapshot was re-logged-in/refreshed out-of-band (GH #77). Skipped the save-back "
+                       f"so the fresh tokens survive; the dead live tokens are discarded by the target install. "
+                       f"(If '{current}' polls as token_expired, run `cus relogin {current} --finish` "
+                       f"before swapping back, or just swap to it — the snapshot is the fresh copy.)")
+                click.echo(f"creds-save-back: {msg}")
+                try:
+                    append_inbox("freshness-guard", f"save-back skipped — '{current}' snapshot fresher than live", msg)
+                except OSError:
+                    pass  # inbox is best-effort observability; never fail a swap over it
+            else:
+                # ---- end GH #77 freshness guard ----
+                if verdict == "unknown":
+                    click.echo(f"creds-save-back: {detail}; assuming they are '{current}'s and saving back")
+                # GH #79: keep a rotated backup of the snapshot we're replacing —
+                # if any clobber bug slips past the verdict above, the refresh
+                # token is recoverable via `cus restore-creds`.
+                backup_credentials_file(current_dir / ".credentials.json")
+                atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
         elif verdict == "foreign":
             # THE GH #3 case: a drifted pane's refresh overwrote the live file
             # with a different account's tokens. Two actions:
@@ -2989,16 +3058,115 @@ class SOSCondition:
 def _relogin_command_for(account_name: str, source_dir: str | None = None) -> str:
     """Return the exact shell command to re-login a given account.
 
-    Prefers the managed-tree location (`~/claude-accounts/account-<name>/`)
-    over legacy `~/.claude-<name>/` ad-hoc dirs. If the managed dir doesn't
-    exist yet, this still returns the managed-dir command — running it
-    creates the dir.
+    GH #77: the command must target the file Claude will actually READ for
+    this account, which depends on whether the account is ACTIVE:
+
+      - ACTIVE account (whatever its name): the live `~/.claude/` +
+        `~/.claude.json` are its authoritative slot, so a bare
+        `claude /login` (no CLAUDE_CONFIG_DIR) writes the fresh tokens
+        exactly where they're needed. The old behavior — always pointing at
+        the storage dir — put the fresh tokens in the SNAPSHOT while the
+        live file kept the dead ones: polls stayed 401 (poll reads live for
+        the active account), and the next swap-away's save-back overwrote
+        the fresh snapshot with the dead live tokens. (If the user already
+        did the storage-dir login, `cus relogin <name> --finish` syncs
+        snapshot → live.)
+      - INACTIVE account: log in under its managed storage dir
+        (`CLAUDE_CONFIG_DIR=~/claude-accounts/account-<name>/`) — the
+        snapshot is the authoritative copy for inactive accounts. This now
+        includes an inactive "default": the old unconditional
+        `claude /login` for default clobbered the ACTIVE account's live
+        tokens whenever default wasn't the one active (the mirror-image bug
+        noted in GH #77).
+
+    If the managed dir doesn't exist yet, the returned command still works —
+    running it creates the dir.
     """
-    if account_name == "default":
-        # default = live ~/.claude/, no env var needed
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    if account_name == state.get("active"):
+        # Live files are the active account's authoritative slot.
         return "claude /login"
     managed = ACCOUNTS_DIR / f"account-{account_name}"
     return f"CLAUDE_CONFIG_DIR={managed}/ claude"
+
+
+def finish_active_relogin(account_name: str) -> None:
+    """Sync a re-logged-in snapshot into the LIVE files (GH #77).
+
+    For when the user re-logged in the ACTIVE account under its storage dir
+    (old instructions, or muscle memory): the fresh tokens sit in
+    `account-<name>/.credentials.json` while Claude keeps reading the dead
+    live `~/.claude/.credentials.json`. This installs snapshot → live
+    (credentials + the account-bound .claude.json keys), completing the
+    recovery.
+
+    Raises RuntimeError (the standard caller-caught type) when the sync
+    would be wrong:
+      - account isn't active: for inactive accounts the snapshot is already
+        authoritative; there is nothing to finish — and installing an
+        inactive account's tokens live would clobber the actual active
+        account.
+      - snapshot is strictly OLDER than live: installing would replace
+        working tokens with deader ones. Equal/incomparable timestamps
+        proceed (a same-second sync is harmless; missing metadata shouldn't
+        block an explicit user request).
+    """
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    active = state.get("active")
+    if account_name != active:
+        raise RuntimeError(
+            f"'{account_name}' is not the active account (active: {active}). --finish installs a "
+            f"snapshot into the LIVE files, which belong to the active account only; for an inactive "
+            f"account the snapshot is already authoritative — nothing to finish.")
+    acct_dir = ACCOUNTS_DIR / f"account-{account_name}"
+    snap_creds = acct_dir / ".credentials.json"
+    if not snap_creds.exists():
+        raise RuntimeError(
+            f"{snap_creds} does not exist — run the re-login first: "
+            f"CLAUDE_CONFIG_DIR={acct_dir}/ claude   (then rerun --finish)")
+    try:
+        snap_exp = _creds_expires_at(read_json(snap_creds))
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"{snap_creds} unreadable ({e}) — not installing it live")
+    live_exp = None
+    if CREDS_JSON.exists():
+        try:
+            live_exp = _creds_expires_at(read_json(CREDS_JSON))
+        except (json.JSONDecodeError, OSError):
+            live_exp = None  # corrupt live file is no reason to refuse a repair
+    if snap_exp is not None and live_exp is not None and snap_exp < live_exp:
+        raise RuntimeError(
+            f"'{account_name}' snapshot's tokens are OLDER than the live file's (snapshot expiresAt "
+            f"{int(snap_exp)} < live {int(live_exp)}) — installing them would replace working tokens "
+            f"with deader ones. If you just re-logged in under {acct_dir}, the login didn't write "
+            f"there; rerun it. If the LIVE tokens are the good ones, there is nothing to finish.")
+
+    backup_credentials_file(CREDS_JSON)  # GH #79 choke point
+    atomic_copy(snap_creds, CREDS_JSON, mode=0o600)
+
+    # Also carry the account-bound identity keys over, in case the re-login
+    # refreshed them (e.g. a changed oauthAccount payload). Best-effort: a
+    # missing snapshot .claude.json just means there's nothing to merge.
+    snap_cj_path = acct_dir / ".claude.json"
+    if snap_cj_path.exists() and CLAUDE_JSON.exists():
+        try:
+            snap_cj = read_json(snap_cj_path)
+            live_cj = read_json(CLAUDE_JSON)
+        except (json.JSONDecodeError, OSError):
+            return  # creds are synced (the part that matters); skip identity merge
+        merged = False
+        for k in ACCOUNT_BOUND_KEYS:
+            if k in snap_cj and live_cj.get(k) != snap_cj[k]:
+                live_cj[k] = snap_cj[k]
+                merged = True
+        if merged:
+            write_json(CLAUDE_JSON, live_cj)
 
 
 def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
@@ -3026,7 +3194,18 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     for name, acct in accounts.items():
         if acct.get("token_expired"):
             cmd = _relogin_command_for(name)
-            action = f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll"
+            # GH #77 auto-heal: if the ACTIVE account's snapshot is fresher
+            # than the live file, the re-login already happened under the
+            # storage dir — the fix is a one-command sync, not another
+            # browser round-trip. Lead with that instead of the generic
+            # advice (which is what kept the #77 outage loop going).
+            if state.get("active") == name and _snapshot_fresher_than_live(name):
+                action = (f"The '{name}' snapshot holds FRESHER tokens than the live file — a storage-dir "
+                          f"re-login already happened (GH #77). Install it live:\n"
+                          f"      python3 ~/repos/claude-usage-swap/cus.py relogin {name} --finish\n"
+                          f"    then verify:\n      python3 ~/repos/claude-usage-swap/cus.py poll")
+            else:
+                action = f"Run interactively in a terminal:\n      {cmd}\n    Complete the browser /login, then:\n      python3 ~/repos/claude-usage-swap/cus.py poll"
             # GH #79: if a rotated credential backup exists, mention its age —
             # a token that "expired" because a clobber bug replaced it can be
             # brought back with one command (refresh tokens live ~30 days), no
@@ -5640,7 +5819,17 @@ def poll(account: str | None, no_write: bool) -> None:
             click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable and swap-eligible).")
             continue
         if u.token_expired:
-            click.echo(f"  TOKEN EXPIRED — re-auth this account (claude login under its config dir)")
+            # GH #77 auto-heal hint: for the ACTIVE account, poll reads the
+            # LIVE file — if the snapshot holds strictly newer tokens, the
+            # user already re-logged in under the storage dir and only the
+            # snapshot→live sync is missing. Without this branch the generic
+            # advice sends them into a second (useless) re-login loop.
+            if state.get("active") == name and _snapshot_fresher_than_live(name):
+                click.echo(f"  TOKEN EXPIRED (live file) — but the '{name}' snapshot is FRESHER: "
+                           f"a storage-dir re-login already happened. Run `cus relogin {name} --finish` "
+                           f"to install it live (GH #77).")
+                continue
+            click.echo(f"  TOKEN EXPIRED — re-auth this account (`cus relogin {name}` shows the right command)")
             continue
         if u.raw.get("error"):
             click.echo(f"  ERROR: {u.raw['error']}")
@@ -5706,7 +5895,13 @@ def force_poll(account: str) -> None:
         save_state(state)
         sys.exit(0)
     if u.token_expired:
-        click.echo("  TOKEN EXPIRED — re-auth this account (`cus relogin <account>`)")
+        # GH #77 auto-heal hint (same as `cus poll`): a fresher snapshot means
+        # the re-login already happened — only the snapshot→live sync is missing.
+        if state.get("active") == account and _snapshot_fresher_than_live(account):
+            click.echo(f"  TOKEN EXPIRED (live file) — but the '{account}' snapshot is FRESHER: "
+                       f"run `cus relogin {account} --finish` to install it live (GH #77).")
+        else:
+            click.echo(f"  TOKEN EXPIRED — re-auth this account (`cus relogin {account}` shows the right command)")
         update_state_with_usage(state, {account: u})
         save_state(state)
         sys.exit(2)
@@ -6918,20 +7113,49 @@ def add_cmd(name: str, exec_flag: bool) -> None:
 
 @cli.command(name="relogin")
 @click.argument("name")
-@click.option("--exec", "exec_flag", is_flag=True, help="Immediately exec `claude` under the account dir.")
-def relogin_cmd(name: str, exec_flag: bool) -> None:
+@click.option("--exec", "exec_flag", is_flag=True, help="Immediately exec `claude` in the right config context.")
+@click.option("--finish", "finish_flag", is_flag=True,
+              help="GH #77: after a storage-dir re-login of the ACTIVE account, install the fresh snapshot into the live files.")
+def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
     """Print the command to re-login an existing account (refresh OAuth tokens).
 
     Run this when `cus sos` reports a token expired for a given account.
     After the re-login, `cus poll` to update state.
+
+    GH #77: the printed command depends on whether the account is ACTIVE.
+    Active accounts re-login via bare `claude /login` (the live files are
+    their authoritative slot); inactive accounts re-login under their
+    managed storage dir. If you already re-logged an ACTIVE account under
+    its storage dir, `--finish` installs the fresh snapshot into the live
+    files (with an expiresAt freshness check so it can never install older
+    tokens over newer ones).
     """
     dst = ACCOUNTS_DIR / f"account-{name}"
     if name != "default" and not dst.exists():
         click.echo(f"Unknown account '{name}'. Run `cus list` to see configured accounts.")
         sys.exit(1)
+
+    if finish_flag:
+        try:
+            finish_active_relogin(name)
+        except RuntimeError as e:
+            click.echo(f"ERROR: {e}")
+            sys.exit(1)
+        click.echo(f"✓ Installed '{name}' snapshot into the live files ({CREDS_JSON}).")
+        click.echo(f"  Verify with: python3 ~/repos/claude-usage-swap/cus.py poll --account {name}")
+        return
+
+    try:
+        state = load_state() if STATE_JSON.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        state = {}
+    is_active = state.get("active") == name
     cmd = _relogin_command_for(name)
     click.echo(f"To re-login {name}, run:")
     click.echo(f"  {cmd}")
+    if is_active:
+        click.echo(f"  ('{name}' is the ACTIVE account, so the login writes the live files directly — GH #77.)")
+        click.echo(f"  (Already logged in under {dst}/ instead? Run: cus relogin {name} --finish)")
     click.echo()
     click.echo(f"After logging in:")
     click.echo(f"  python3 ~/repos/claude-usage-swap/cus.py poll")
@@ -6939,7 +7163,9 @@ def relogin_cmd(name: str, exec_flag: bool) -> None:
         click.echo()
         click.echo("Launching claude now...")
         env = os.environ.copy()
-        if name == "default":
+        if is_active:
+            # Live files are the active account's slot — no CLAUDE_CONFIG_DIR,
+            # matching the printed command (GH #77).
             env.pop("CLAUDE_CONFIG_DIR", None)
         else:
             env["CLAUDE_CONFIG_DIR"] = str(dst)
