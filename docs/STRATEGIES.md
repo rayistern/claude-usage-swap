@@ -47,7 +47,7 @@ headroom_strategy:
 
 ### `lowest_usage`
 
-Pattern lifted from cux's "balanced." Sorts non-blocked candidates ascending by 7d util; ties broken by 5h util. **No hard 7d cap**, no burn-before-reset logic. Picks whoever has the lowest 7-day percentage.
+Pattern lifted from cux's "balanced." Sorts non-blocked candidates ascending by 7d util; ties broken by 5h util. No burn-before-reset logic; picks whoever has the lowest 7-day percentage. (Since GH #17 the **universal hard-7d-cap filter applies to every strategy**, including this one — no strategy will pick a candidate at/above `hard_7d_cap_pct`, and, when the per-model weekly gate is on, at/above the per-model cap either. See "Per-model weekly cap" below.)
 
 Trade-off: predictable but blunt. Doesn't consider reset times or the 5h-vs-7d tension. Use when you want the simplest defensible behavior.
 
@@ -68,6 +68,21 @@ Trade-off: deterministic — you'll always rotate in priority order. Use when ac
 Cycles through accounts in name order. Ignores usage data.
 
 Trade-off: blindest possible strategy. Useful for testing.
+
+---
+
+## Per-model weekly cap (strategy-independent, GH #100)
+
+The usage API reports per-model weekly usage (e.g. Fable, Sonnet) in addition to the aggregate 5h/7d windows. `per_model_weekly.gate_enabled: true` folds this into swap decisions for the models listed in `per_model_weekly.models`.
+
+Key point: per-model weekly is a **hard cap, not a ladder signal**. It does *not* feed the progressive ladder (so a tracked model climbing through 80% → 90% does **not** trigger the gradual ladder swaps that aggregate 5h/7d do). Instead it acts only on the hard-cap paths:
+
+- **Force-swap**: when a tracked model's weekly reaches `per_model_weekly.cap_pct`, the active account is swapped off — and
+- **Target filter**: no account is chosen as a swap target while a tracked model of *its* is at/above `cap_pct`, so an exhausted account drops out of rotation until its week resets.
+
+`cap_pct` defaults to `null`, meaning "inherit the strategy's `hard_7d_cap_pct`." Set it explicitly to decouple the two ceilings — e.g. `cap_pct: 97` swaps a Fable-exhausted account off at 97% while the aggregate 7d cap stays at, say, 90%. This is the "leave the account when Fable is done for the week, and don't come back to it" behavior.
+
+**Pools interact with this** (per_session / hybrid modes): a slot's rotation-set pool decides whether the per-model cap applies to *that* slot. **premium** pool (default) honors the cap — good for premium-model work where an exhausted account is useless. **standard** pool ignores it — a model-exhausted account still has aggregate headroom that serves standard-model work, so a standard slot keeps using it rather than stranding that headroom. Set per slot via `cus pool <slot> <p>` / `cus launch --pool <p>`; the default is `per_session.default_pool`.
 
 ---
 

@@ -103,6 +103,15 @@ cus slot gc --slot slot-N
 
 ## Non-SOS issues
 
+### Some sessions say "Not logged in · Please run /login" (GH #103 / #104)
+
+Two distinct causes, both about a live credential mount going bad:
+
+- **All *bare* (non-slotted) sessions at once** → the shared `~/.claude/.credentials.json` was blanked to a logged-out shape (a bare session ran `/logout`, or a token refresh failed). Every bare session shares that one file. Fix by re-installing a healthy account into the shared mount: `cus switch <account>` (pick one no live slot holds — see below).
+- **One slotted session, while another session runs the same account** → two live mounts on one account rotate its single-use OAuth refresh token; whichever refreshes first invalidates the other, logging it out. The daemon, `cus switch`, and `cus launch` now *refuse* to create this (GH #104) — but if you forced it (or hit it before the guard shipped), recover by moving one mount to a free account: `cus switch <free-account>` for the shared mount (its save-back preserves the valid token), then relaunch the affected slot session. Keep every live mount on a distinct account.
+
+If you're launching more concurrent sessions than you have healthy accounts, `cus launch` will refuse with "every account is already live/expired/saturated" rather than double-book — exit a session, wait for a 5h/weekly reset, or `cus add` another account.
+
 ### per_session: `sync-config` says "live session — skipped"
 
 Deliberate: Claude Code rewrites its own `.claude.json`, so merging into a live mount is a lost-update race. The slot picks up the canonical sync at its next `cus launch`. Nothing to fix.

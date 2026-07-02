@@ -156,6 +156,8 @@ cus pool <slot> premium  # premium pool (default): swap off an account when its 
 cus launch --pool standard auto   # launch straight into the standard pool
 ```
 
+**`cus lock` (slot) vs `cus pin` (session)** — two different protections: `lock` freezes a *slot's account* so the daemon never swaps or gc's it (protects the credential mount); `pin` marks a *session/pane* so hot-swap orchestration won't restart it (protects the running session). You can lock a slot without pinning its session, and vice-versa.
+
 **Rollout note (429 budget):** N occupied accounts poll at the fast cadence — start with `polling.active_interval_seconds` relaxed (e.g. 300) and tighten only after a week of clean 429 logs. Do NOT shorten intervals to compensate for anything (2026-06-19 burnout).
 
 ### Launching sessions
@@ -216,6 +218,10 @@ Edit `~/claude-accounts/config.yaml`. Common changes:
 | Never swap mid-subagent | `subagent_skip.defer_below_tier: 100` (effectively always defer) |
 | Swap on every ladder trip (disable cache-aware deferral) | `lazy_swap.enabled: false` |
 | Wait longer for a cold cache before swapping | `lazy_swap.cache_window_seconds: 600` |
+| Track a model's WEEKLY cap (e.g. Fable) and leave the account when it's hit | `per_model_weekly.gate_enabled: true`, `per_model_weekly.models: [Fable]` |
+| Swap off (and stop returning to) an account when Fable's week hits 97% | `per_model_weekly.cap_pct: 97` (null = inherit `hard_7d_cap_pct`) |
+
+**Per-model weekly cap** is a hard cap, not a ladder step — a tracked model swaps its account off (and out of rotation until the week resets) *only* at `cap_pct`, not gradually at the `thresholds.steps` rungs. Full behavior + how the premium/standard pools interact with it: `docs/STRATEGIES.md` § "Per-model weekly cap".
 
 Restart the daemon after editing: `systemctl --user restart cus.service`. (`cus daemon` re-reads config on every cycle, so no restart needed if running foreground — but systemd-managed processes don't pick up config changes until restart.)
 

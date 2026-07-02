@@ -176,19 +176,40 @@ Everything above describes `mode: global` (the default): one live mount (`~/.cla
 
 - Each session launched via `cus launch` gets its own **slot dir** (`~/claude-accounts/slot-<n>/`, used as `CLAUDE_CONFIG_DIR`) holding one account's credentials. Four sessions on four accounts burn each account ~4× slower.
 - When an account crosses its ladder step, the daemon runs the **same in-place two-file swap, scoped to that slot** — the session on top keeps running mid-conversation (no `/exit`, no `--resume`), and the other slots' caches are never touched.
-- The daemon **never writes `~/.claude/`** in this mode: bare `claude` launches keep working on whatever account it holds, observed and SOS-flagged but never swapped.
+- The daemon **never writes `~/.claude/`** in per_session mode: bare `claude` launches keep working on whatever account it holds, observed and SOS-flagged but never swapped. (In `hybrid` mode — below — the daemon *does* manage `~/.claude/` too.)
 - Enter/leave with `cus mode per-session` / `cus mode global` (validated, reversible — global-mode code paths are untouched). Optional alias so every launch is slotted: `alias claude='cus launch auto --'`.
 
 **Slot locks & rotation-set pools (per_session / hybrid):**
 
 - `cus lock <slot>` / `cus unlock <slot>` — freeze a slot so the daemon never swaps its account or gc's it (the slot-level counterpart of `cus pin`, which protects a *session* from hot-swap). Shown as `🔒locked` in `cus status`.
-- `cus pool <slot> [premium|standard]` (and `cus launch --pool <p>`) — put a slot in a rotation set. **premium** (default) honors the per-model weekly cap (`per_model_weekly.cap_pct`): the slot swaps off an account, and won't swap back, once a tracked model's week hits the cap. **standard** ignores the per-model cap (only aggregate 5h/7d + `hard_7d_cap` apply), so a model-exhausted account keeps serving standard-model work instead of stranding its aggregate headroom.
+- `cus pool <slot> [premium|standard]` (and `cus launch --pool <p>`) — put a slot in a rotation set. **premium** (default) honors the per-model weekly cap (`per_model_weekly.cap_pct`, on when `per_model_weekly.gate_enabled: true`): the slot swaps off an account, and won't swap back, once a tracked model's week hits the cap — e.g. leave a Fable-exhausted account at 97% and don't return until its week resets. **standard** ignores the per-model cap (only aggregate 5h/7d + `hard_7d_cap` apply), so a model-exhausted account keeps serving standard-model work instead of stranding its aggregate headroom. Per-model weekly is a *hard cap*, not a gradual ladder — see `docs/STRATEGIES.md` § "Per-model weekly cap".
 
 ### `mode: hybrid` — manage slots AND the shared mount together (2026-07-02)
 
 `global` ignores slots (they freeze on their account); `per_session` ignores bare sessions (observe-only). If a machine has **both** `cus launch` slots and plain `claude` sessions, use `hybrid`: each cycle the daemon moves slots individually (no restart) **and** swaps the shared `~/.claude/` mount for the bare sessions (they follow it together). Reactive 429s are partitioned from a single log read — a slotted session's 429 moves only its slot, a bare session's only the shared mount. Enter with `cus mode hybrid` (same validation as per_session); leave with `cus mode global`.
 
 > **No double-booking (automatic).** Every live mount must stay on a distinct account — two mounts on one account rotate its single-use OAuth refresh token and log one session out. The daemon enforces this: the shared-mount swap never picks an account a live slot holds, and slot swaps never pick the shared mount's (or another slot's) account. `cus switch <acct>` also refuses to move the shared mount onto an account a live slot runs (override with `--force`). So hybrid is safe to run with a mix of slotted and bare sessions (GH #104).
+
+**Passing flags through to `claude` (e.g. `--dangerously-skip-permissions`).** Everything after `--` is forwarded verbatim to the `claude` process the slot execs (`launch` is declared with `ignore_unknown_options`, so unknown flags pass straight through). So a slotted, permission-skipping session is just:
+
+```bash
+cus launch auto -- --dangerously-skip-permissions          # auto-pick account
+cus launch rayi1 -- --dangerously-skip-permissions --resume X   # explicit account + more flags
+alias claude='cus launch auto -- --dangerously-skip-permissions' # make it the default
+```
+
+Prefer setting it once in `settings.json` instead of per-launch — see below.
+
+**Skip-permissions via settings (recommended over the flag).** Because slots symlink `settings.json` and `settings.local.json` back to `~/.claude/` (see the storage-roles table in `docs/ARCHITECTURE.md`), there is **one** settings file to edit and every slotted session inherits it — you do *not* configure per-account. The file-based equivalent of `--dangerously-skip-permissions` is, in `~/.claude/settings.local.json`:
+
+```jsonc
+{
+  "permissions": { "defaultMode": "bypassPermissions" },
+  "skipDangerousModePermissionPrompt": true   // skip the one-time acceptance dialog too
+}
+```
+
+Caveats: `bypassPermissions` is ignored when Claude runs as root, and a managed/policy `permissions.disableBypassPermissionsMode` overrides it. The per-account `~/claude-accounts/account-*/settings.json` stubs (`{"theme":"dark"}`) apply only to *direct* `CLAUDE_CONFIG_DIR=account-<name>` launches (the `cus add` / `cus relogin` flow), not to slotted `cus launch` sessions — those follow the symlinked `~/.claude/` settings.
 
 Details: `docs/plans/2026-07-02-per-session-accounts.md` (design + decision history) and the storage-roles inventory in `docs/ARCHITECTURE.md`.
 
