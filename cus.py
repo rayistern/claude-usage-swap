@@ -203,6 +203,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     #                 individual slots and NEVER writes ~/.claude/ (bare
     #                 launches are observe-only). Transition via `cus mode`.
     "mode": "global",
+    "per_session": {
+        # How long a slot may sit idle (no live session, per /proc) before the
+        # daemon gc's it — saving its credentials back to the owning account
+        # dir and removing the mount. Long default: a free slot is a REUSE
+        # candidate for the next `cus launch` (no swap needed when it already
+        # holds the right account), so eager reaping costs more than it saves;
+        # the risk being bounded is dead mounts accumulating real credentials.
+        "slot_gc_idle_hours": 72,
+    },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
     "thresholds": {
@@ -1176,11 +1185,18 @@ def sync_mount_claude_json(mount: Path, canonical: dict) -> dict:
     return {"changed": bool(updated), "keys_updated": updated}
 
 
-def saveback_mount_credentials(mount: Path, expected_account: str | None, state: dict) -> dict:
+def saveback_mount_credentials(mount: Path, expected_account: str | None, state: dict,
+                               only_if_fresher: bool = False) -> dict:
     """Save a mount's live credentials back to the owning account dir, with the
     full clobber-guard stack (GH #3 identity match, GH #77 freshness, GH #79
     backup rotation). Shared by slot gc, per-slot swap-out, and periodic
     save-back — one guarded implementation, not three.
+
+    only_if_fresher=True (the daemon's PERIODIC save-back, Phase 3.5): write
+    only when the live tokens are strictly newer (expiresAt) than the
+    snapshot's — i.e. the session actually refreshed since the last save.
+    Without this, every cycle would rewrite identical bytes and churn the
+    GH #79 backup rotation into uselessness.
 
     Returns {"action": "saved" | "saved_to_owner" | "skipped", "account": ...,
     "detail": ...}. Never raises on a missing/invalid live file — a mount with
@@ -1214,6 +1230,8 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
             snap_exp = None
         if snap_exp is not None and live_exp is not None and snap_exp > live_exp:
             return {"action": "skipped", "account": save_to, "detail": "snapshot fresher than live (GH #77)"}
+        if only_if_fresher and not (snap_exp is not None and live_exp is not None and live_exp > snap_exp):
+            return {"action": "skipped", "account": save_to, "detail": "live not fresher than snapshot (periodic no-op)"}
     backup_credentials_file(snap)
     atomic_write_bytes(snap, json.dumps(live_creds, indent=2).encode(), mode=0o600)
     action = "saved_to_owner" if verdict == "foreign" else "saved"
@@ -1435,9 +1453,30 @@ def _account_poll_interval(state: dict, config: dict, account_name: str) -> floa
     """
     polling_cfg = config.get("polling", {})
     flat = config.get("poll_interval_seconds", 300)
-    if state.get("active") == account_name:
+    if _account_on_fast_cadence(state, config, account_name):
         return polling_cfg.get("active_interval_seconds") or flat
     return polling_cfg.get("inactive_interval_seconds") or flat
+
+
+def _account_on_fast_cadence(state: dict, config: dict, account_name: str) -> bool:
+    """Is this account burning usage right now (→ fast poll cadence)?
+
+    global mode: exactly the active account — unchanged behavior.
+    per_session mode (Phase 3.3): accounts holding LIVE-occupied slots — each
+    is genuinely burning. The global active also stays fast while any bare
+    session holds ~/.claude/ (observe-only ≠ poll-blind). Mind the 429
+    budget: N occupied accounts means ~N× the fast-cadence traffic of global
+    mode — same trap class as the 2026-06-19 burnout — so per_session
+    rollouts should start with active_interval_seconds relaxed (e.g. 300s)
+    and tighten only after a week of clean 429 logs (the differential
+    due-gate composes per account; it does not multiply bursts thanks to
+    polling.stagger_seconds).
+    """
+    if config.get("mode", "global") != "per_session":
+        return state.get("active") == account_name
+    if account_name in occupied_slot_accounts(state):
+        return True
+    return state.get("active") == account_name and mount_in_use(CLAUDE_DIR)
 
 
 def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[bool, str]:
@@ -1468,7 +1507,7 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
         last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return True, "unparseable last_poll_ts"
-    role = "active" if state.get("active") == account_name else "inactive"
+    role = "active" if _account_on_fast_cadence(state, config, account_name) else "inactive"
     # GH #59 composition: a 5h window that reset AFTER our last poll means the
     # stored usage is pre-reset garbage — poll now regardless of cadence class,
     # so the adaptive early wake actually refreshes the account it woke for.
@@ -3722,6 +3761,281 @@ def decide_swap(
         gate="ladder",
         deferrable=cur_pct < saturation_pct,
     )
+
+
+# --------------------------------------------------------------------------
+# per_session decision loop (Phase 3)
+#
+# In per_session mode the daemon's unit of action is a SLOT MOVE
+# (slot, from_account, to_account), not a global active flip. Each account
+# with live-occupied slots is evaluated against its OWN progressive ladder by
+# shimming it in as decide_swap's "active" — every existing gate (hard 7d
+# cap, hysteresis, growth gate, defer-near-reset, min-improvement) applies
+# per account with zero duplicated logic. Executing a move is the Phase 2.1
+# in-place slot swap; the session on top is never touched.
+# --------------------------------------------------------------------------
+
+# TTL cache for the occupied-slots scan: _account_poll_interval consults
+# occupancy once per account per cycle, and each uncached scan walks all of
+# /proc. Keyed by ACCOUNTS_DIR so tests with separate temp trees never share
+# entries; a few seconds of staleness only delays a cadence/decision tweak to
+# the next cycle, which the daemon tolerates by design.
+_OCCUPIED_SLOTS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[str, list[str]]:
+    """Map account → [slot names] for slots with a LIVE session (per /proc).
+
+    Only live-occupied slots participate in per-slot swap decisions: an idle
+    slot holding a hot account burns nothing, so moving it is pure churn (gc
+    reaps it eventually). mount_in_use is the same /proc ground truth the
+    rest of per_session mode uses.
+    """
+    key = str(ACCOUNTS_DIR)
+    now = time.monotonic()
+    hit = _OCCUPIED_SLOTS_CACHE.get(key)
+    if hit and now - hit[0] < max_age_seconds:
+        return hit[1]
+    out: dict[str, list[str]] = {}
+    for name, entry in sorted(state.get("slots", {}).items()):
+        acct = entry.get("account")
+        if not acct:
+            continue
+        d = slot_path(name)
+        if d.exists() and mount_in_use(d):
+            out.setdefault(acct, []).append(name)
+    _OCCUPIED_SLOTS_CACHE[key] = (now, out)
+    return out
+
+
+def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "AccountUsage"],
+                      traces: dict | None = None) -> list[dict]:
+    """Per-slot swap decisions for one cycle (Phase 3.1).
+
+    Returns a list of move dicts: {"slot", "from", "to", "gate", "tier",
+    "deferrable", "reason"}. Multiple slots on the same hot account FAN OUT
+    to distinct targets (best-headroom-first — each pick excludes targets
+    already taken this round) rather than piling onto one; when the pool
+    runs out of distinct targets, remaining slots share the last pick
+    (doubling up beats staying on a tripped account).
+
+    `traces` (optional): account → decide_swap trace dict, for decision logs.
+    """
+    moves: list[dict] = []
+    taken: set[str] = set()
+    occupied = occupied_slot_accounts(state)
+    for acct_name, slots in sorted(occupied.items()):
+        shim = dict(state)
+        shim["active"] = acct_name
+        trace: dict = {}
+        decision = decide_swap(shim, config, usage_by_account, trace)
+        if traces is not None:
+            traces[acct_name] = trace
+        if decision is None:
+            continue
+        for slot_name in sorted(slots):
+            target = decision.target
+            if target in taken:
+                # Fan-out: re-pick with this round's taken targets excluded
+                # (the hot account stays excluded as the shim's active).
+                shim2 = dict(shim)
+                shim2["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
+                retry = pick_swap_target(shim2, config)
+                if retry is not None:
+                    target = retry.name
+                # else: pool exhausted — double up on the original target.
+            taken.add(target)
+            moves.append({
+                "slot": slot_name, "from": acct_name, "to": target,
+                "gate": decision.gate, "tier": decision.tier,
+                "deferrable": decision.deferrable, "reason": decision.reason,
+            })
+    return moves
+
+
+def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dict]:
+    """per_session counterpart of check_rate_limit_reactive (Phase 3.1/4.2).
+
+    Attributes fresh 429s to accounts via sessions.log (per-session accounts
+    are trustworthy since the Phase 2.3 hook change) and returns urgent
+    (non-deferrable, tier-3) moves for every live slot those accounts occupy.
+    A 429'd account with no live slots (a bare session on ~/.claude) yields
+    no move — bare mounts are observe-only in this mode; SOS surfaces it.
+
+    Mutates state["last_429_check_ts"] exactly like the global variant;
+    caller persists state.
+    """
+    if not config.get("reactive", {}).get("enabled", True):
+        return []
+    entries = _read_rate_limit_log_since(state.get("last_429_check_ts"))
+    state["last_429_check_ts"] = now_iso()
+    if not entries:
+        return []
+    session_account: dict[str, str] = {}
+    for e in _parse_sessions_log():
+        session_account[e.get("session_id", "")] = e.get("account", "")
+    hit_accounts = sorted({session_account.get(e["session_id"]) for e in entries}
+                          - {None, "", "unknown"})
+    if not hit_accounts:
+        return []
+    hyst = config.get("swap_hysteresis", {})
+    min_gap = hyst.get("min_seconds_between_reactive_swaps", 60) if hyst.get("enabled", True) else 0
+    occupied = occupied_slot_accounts(state)
+    moves: list[dict] = []
+    taken: set[str] = set()
+    for acct in hit_accounts:
+        last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
+        if min_gap and last_swap:
+            try:
+                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_swap.replace("Z", "+00:00"))).total_seconds()
+                if elapsed < min_gap:
+                    continue  # reactive hysteresis: this account just moved
+            except ValueError:
+                pass
+        for slot_name in occupied.get(acct, []):
+            shim = dict(state)
+            shim["active"] = acct
+            shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
+            target = pick_swap_target(shim, config)
+            if target is None:
+                continue  # nowhere safe to go; SOS handles the all-full case
+            taken.add(target.name)
+            moves.append({
+                "slot": slot_name, "from": acct, "to": target.name,
+                "gate": "reactive_429", "tier": 3, "deferrable": False,
+                "reason": f"user-facing 429 on '{acct}' session(s); {target.reason}",
+            })
+    return moves
+
+
+def _lazy_warm_slot_sessions(move: dict, config: dict) -> list:
+    """Per-move lazy_swap gate (Phase 3.2): the sessions a slot move would
+    cache-bust, when the move is deferrable and any of them is still warm.
+
+    Same contract as _lazy_warm_sessions but scoped to the move's OUTGOING
+    account: per-session accounts in sessions.log are trustworthy (Phase 2.3
+    hook), and every slot holding that account moves in the same round, so
+    account granularity == the exact set of paying sessions. Urgent moves
+    (hard cap / saturation / reactive 429) return [] — swap regardless.
+    """
+    if config.get("hot_swap", {}).get("enabled", False):
+        return []
+    lazy = config.get("lazy_swap", {})
+    if not lazy.get("enabled", True):
+        return []
+    if not move.get("deferrable", True):
+        return []
+    window = lazy.get("cache_window_seconds", 300)
+    try:
+        sessions = find_live_sessions(account_filter=move["from"])
+    except Exception:
+        return []
+    return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
+
+
+def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_execute: bool) -> None:
+    """The per_session daemon cycle after polling (Phase 3): periodic
+    save-back, long-idle slot gc, reactive-429 moves, ladder moves — all
+    per slot, never touching ~/.claude/ (bare mounts are observe-only, 3.4).
+
+    Caller (one_cycle) has already merged fresh usage into state; this
+    function persists state (usage + 429 watermark) before executing moves,
+    mirroring the global path's crash ordering.
+    """
+    # 3.5 — periodic save-back: a live session refreshes OAuth tokens into its
+    # slot's .credentials.json; without this, a machine crash loses the newest
+    # refresh token for every slotted account. only_if_fresher keeps it a
+    # no-op (no writes, no backup churn) until a session actually refreshed.
+    for name, entry in sorted(state.get("slots", {}).items()):
+        acct = entry.get("account")
+        d = slot_path(name)
+        if acct and d.exists():
+            r = saveback_mount_credentials(d, acct, state, only_if_fresher=True)
+            if r["action"] != "skipped":
+                click.echo(f"  save-back {name}: {r['action']} → account-{r['account']}")
+
+    # Slot gc (risk #5 in the plan: dead mounts holding real credentials).
+    # Only long-idle slots — a slot free for minutes is a REUSE candidate for
+    # the next `cus launch` (free launch, no swap), so reaping it eagerly
+    # would cost more than it saves. Unparseable/missing timestamps fail SAFE
+    # (never delete on bad data; doctor flags orphans instead).
+    gc_hours = config.get("per_session", {}).get("slot_gc_idle_hours", 72)
+    for name in list(state.get("slots", {})):
+        d = slot_path(name)
+        if d.exists() and mount_in_use(d):
+            continue
+        entry = state.get("slots", {}).get(name, {})
+        ref_ts = entry.get("last_launch_ts") or entry.get("created_ts")
+        if not ref_ts:
+            continue
+        try:
+            idle_s = (datetime.now(timezone.utc) - datetime.fromisoformat(ref_ts.replace("Z", "+00:00"))).total_seconds()
+        except ValueError:
+            continue
+        if idle_s >= gc_hours * 3600 and not no_execute:
+            result = gc_slot(name, state)
+            if result["action"] == "reaped":
+                sb = result["saveback"]
+                click.echo(f"  slot-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
+
+    # Urgent reactive-429 moves preempt ladder moves (same precedence as the
+    # global cycle's step 0).
+    moves = check_rate_limit_reactive_per_session(state, config)
+    traces: dict = {}
+    if not moves:
+        moves = decide_slot_swaps(state, config, usage_by_account, traces)
+
+    # Persist usage + 429 watermark + gc'd slots BEFORE acting, so a crash
+    # mid-move leaves valid state (same ordering as the global path).
+    save_state(state)
+
+    if not moves:
+        occupied = occupied_slot_accounts(state)
+        _log_decision(_build_decision_record(
+            state, config, action="hold", gate="no_slot_moves",
+            reason=f"no per-slot moves; occupied: " + (", ".join(f"{a}({'+'.join(s)})" for a, s in sorted(occupied.items())) or "none"),
+        ))
+        for name, acct in state.get("accounts", {}).items():
+            occ = " [" + "+".join(occupied[name]) + "]" if name in occupied else ""
+            te = " (TOKEN_EXPIRED)" if acct.get("token_expired") else ""
+            click.echo(f"   {name}{occ}: 5h={acct.get('current_5h_pct', 0):.1f}%, 7d={acct.get('current_7d_pct', 0):.1f}%, next={acct.get('next_swap_at_pct', 50)}%{te}")
+        return
+
+    for move in moves:
+        label = f"{move['slot']}: {move['from']} -> {move['to']}"
+        warm = _lazy_warm_slot_sessions(move, config)
+        if warm:
+            msg = (f"lazy-swap DEFER {label}: {len(warm)} cache-warm session(s) on "
+                   f"'{move['from']}' — non-urgent {move['gate']} move would burn cache (GH #56)")
+            click.echo(f"  {msg}")
+            _log_decision(_build_decision_record(
+                state, config, action="defer", gate="lazy_swap", reason=msg,
+                target=move["to"], tier=move["tier"], where={"slot": move["slot"]},
+            ))
+            continue
+        click.echo(f"  slot move: {label} ({move['gate']})")
+        click.echo(f"    reason: {move['reason']}")
+        if no_execute:
+            click.echo("    (--no-execute) skipping slot move")
+            _log_decision(_build_decision_record(
+                state, config, action="would_swap", gate=move["gate"], reason=move["reason"],
+                target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
+            ))
+            continue
+        try:
+            execute_swap(move["to"], trigger=f"auto-{move['gate']}", slot=move["slot"])
+            click.echo(f"    moved in place — session on {move['slot']} continues uninterrupted")
+            _log_decision(_build_decision_record(
+                state, config, action="swap", gate=move["gate"], reason=move["reason"],
+                target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
+            ))
+        except (RuntimeError, FileNotFoundError, ValueError) as e:
+            click.echo(f"    slot move FAILED: {type(e).__name__}: {e}", err=True)
+            _log_decision(_build_decision_record(
+                state, config, action="error", gate=move["gate"],
+                reason=f"{move['reason']} — FAILED: {e}",
+                target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
+            ))
 
 
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
@@ -6878,10 +7192,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
     def one_cycle() -> None:
         state = load_state()
         config = load_config()
-        click.echo(f"[{now_iso()}] cycle start. active={state['active']}")
+        per_session = config.get("mode", "global") == "per_session"
+        click.echo(f"[{now_iso()}] cycle start. mode={'per_session' if per_session else 'global'} active={state['active']}")
 
         # 0. Reactive check — has anything 429'd since last cycle?
-        reactive_decision = check_rate_limit_reactive(state, config)
+        # per_session handles 429s inside _per_session_cycle (attributed to
+        # the offending slot via sessions.log) — the global variant below
+        # would swap ~/.claude/, which per_session mode NEVER writes (3.4).
+        reactive_decision = None if per_session else check_rate_limit_reactive(state, config)
         if reactive_decision is not None:
             click.echo(f"  reactive (429): {reactive_decision.reason}")
             save_state(state)
@@ -6955,6 +7273,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             click.echo(f"  countdown fallback: {nm} 5h reset elapsed without a fresh poll "
                        f"— inferring 5h→0% for this cycle (GH #59)")
         maybe_reset_thresholds(state, config)
+
+        # per_session (Phase 3): decisions + execution are per SLOT from here.
+        # The daemon never writes ~/.claude/ in this mode — bare launches are
+        # observed (SOS) but not swapped, because swapping the global mount
+        # moves every bare session at once: exactly the every-session cache
+        # bust this mode exists to eliminate (3.4).
+        if per_session:
+            _per_session_cycle(state, config, usage_by_account, no_execute)
+            _emit_sos_after(load_state(), config)
+            return
 
         # 3. Decide
         trace: dict = {}
