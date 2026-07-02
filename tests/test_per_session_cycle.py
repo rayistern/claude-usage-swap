@@ -443,6 +443,59 @@ def test_launch_prepare_records_pool():
         env.restore()
 
 
+def test_reactive_entries_param_does_not_advance_watermark():
+    # Hybrid reads the 429 log once and owns the watermark; when it passes
+    # `entries` to the reactive fns, they must NOT re-advance last_429_check_ts.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        wm = "2020-01-01T00:00:00Z"
+        state["last_429_check_ts"] = wm
+        assert cus.check_rate_limit_reactive_per_session(state, _config(), entries=[]) == []
+        assert state["last_429_check_ts"] == wm
+        assert cus.check_rate_limit_reactive(state, _config(), entries=[]) is None
+        assert state["last_429_check_ts"] == wm
+        # With entries=None (default) it DOES own+advance the watermark.
+        cus.RATE_LIMIT_LOG.write_text("")  # empty log
+        cus.check_rate_limit_reactive(state, _config(), entries=None)
+        assert state["last_429_check_ts"] != wm
+    finally:
+        env.restore()
+
+
+def test_hybrid_cycle_moves_slot_and_shared_mount_together():
+    # The core hybrid promise: in ONE cycle, a hot slot moves AND the hot
+    # shared mount (bare sessions) swaps. Slot moves carry slot=slot-N;
+    # the shared-mount swap carries slot=None — how we tell them apart.
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)      # slotted session on alpha
+        state = cus.load_state()
+        state["active"] = "beta"                     # bare sessions on the shared mount = beta
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 96.0, "current_7d_pct": 20.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 5.0, "current_7d_pct": 5.0})
+        state["accounts"]["delta"].update({"current_5h_pct": 6.0, "current_7d_pct": 6.0})
+        cus.save_state(state)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        usage = {n: _usage(state["accounts"][n]["current_5h_pct"], state["accounts"][n]["current_7d_pct"])
+                 for n in ("alpha", "beta", "gamma", "delta")}
+        calls = []
+        orig = cus.execute_swap
+        cus.execute_swap = lambda target, trigger="manual", slot=None, bump_ladder=True: calls.append((target, slot))
+        try:
+            cus._hybrid_cycle(state, _config(mode="hybrid"), usage, no_execute=False)
+        finally:
+            cus.execute_swap = orig
+        slot_moves = [c for c in calls if c[1] == s1]
+        shared_moves = [c for c in calls if c[1] is None]
+        assert slot_moves, f"expected a slot move for {s1}; calls={calls}"
+        assert shared_moves, f"expected a shared-mount swap (slot=None); calls={calls}"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

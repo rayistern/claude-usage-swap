@@ -1639,7 +1639,10 @@ def _account_on_fast_cadence(state: dict, config: dict, account_name: str) -> bo
     due-gate composes per account; it does not multiply bursts thanks to
     polling.stagger_seconds).
     """
-    if config.get("mode", "global") != "per_session":
+    # per_session AND hybrid both manage live slots, so an account holding a
+    # live-occupied slot is burning and polls fast in either. hybrid also swaps
+    # the shared mount, so its active stays fast too (the fallback below).
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
         return state.get("active") == account_name
     if account_name in occupied_slot_accounts(state):
         return True
@@ -4188,7 +4191,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     return moves
 
 
-def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dict]:
+def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: list | None = None) -> list[dict]:
     """per_session counterpart of check_rate_limit_reactive (Phase 3.1/4.2).
 
     Attributes fresh 429s to the SLOT the offending session runs on right now
@@ -4202,11 +4205,17 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dic
 
     Mutates state["last_429_check_ts"] exactly like the global variant;
     caller persists state.
+
+    `entries` (GH #99 hybrid): when None (default) reads the 429 log and
+    advances the watermark itself. Hybrid mode passes the SLOT-attributable
+    partition of a single read and owns the watermark, so we don't re-read or
+    re-advance here (see check_rate_limit_reactive for the partition rationale).
     """
     if not config.get("reactive", {}).get("enabled", True):
         return []
-    entries = _read_rate_limit_log_since(state.get("last_429_check_ts"))
-    state["last_429_check_ts"] = now_iso()
+    if entries is None:
+        entries = _read_rate_limit_log_since(state.get("last_429_check_ts"))
+        state["last_429_check_ts"] = now_iso()
     if not entries:
         return []
     # Resolve each 429'd session to the slot it is CURRENTLY on, then that
@@ -4283,15 +4292,9 @@ def _lazy_warm_slot_sessions(move: dict, config: dict) -> list:
     return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
 
 
-def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_execute: bool) -> None:
-    """The per_session daemon cycle after polling (Phase 3): periodic
-    save-back, long-idle slot gc, reactive-429 moves, ladder moves — all
-    per slot, never touching ~/.claude/ (bare mounts are observe-only, 3.4).
-
-    Caller (one_cycle) has already merged fresh usage into state; this
-    function persists state (usage + 429 watermark) before executing moves,
-    mirroring the global path's crash ordering.
-    """
+def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
+    """Periodic per-slot credential save-back + long-idle slot gc. Shared by
+    the per_session and hybrid cycles (extracted 2026-07-02, GH #99)."""
     # 3.5 — periodic save-back: a live session refreshes OAuth tokens into its
     # slot's .credentials.json; without this, a machine crash loses the newest
     # refresh token for every slotted account. only_if_fresher keeps it a
@@ -4332,33 +4335,16 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
                 sb = result["saveback"]
                 click.echo(f"  slot-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
 
-    # Urgent reactive-429 moves preempt ladder moves (same precedence as the
-    # global cycle's step 0).
-    moves = check_rate_limit_reactive_per_session(state, config)
-    traces: dict = {}
-    if not moves:
-        moves = decide_slot_swaps(state, config, usage_by_account, traces)
 
-    # Persist usage + 429 watermark + gc'd slots BEFORE acting, so a crash
-    # mid-move leaves valid state (same ordering as the global path).
-    save_state(state)
+def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute: bool) -> None:
+    """Execute (or dry-run/lazy-defer) a list of slot move dicts. Shared by the
+    per_session and hybrid cycles (extracted 2026-07-02, GH #99).
 
-    if not moves:
-        occupied = occupied_slot_accounts(state)
-        _log_decision(_build_decision_record(
-            state, config, action="hold", gate="no_slot_moves",
-            reason=f"no per-slot moves; occupied: " + (", ".join(f"{a}({'+'.join(s)})" for a, s in sorted(occupied.items())) or "none"),
-        ))
-        for name, acct in state.get("accounts", {}).items():
-            occ = " [" + "+".join(occupied[name]) + "]" if name in occupied else ""
-            te = " (TOKEN_EXPIRED)" if acct.get("token_expired") else ""
-            click.echo(f"   {name}{occ}: 5h={acct.get('current_5h_pct', 0):.1f}%, 7d={acct.get('current_7d_pct', 0):.1f}%, next={acct.get('next_swap_at_pct', 50)}%{te}")
-        return
-
-    # Fan-out ladder dedup (review finding 2026-07-02): several slots on ONE
-    # hot account move in the same cycle, but that account's ladder step is
-    # shared and must advance exactly once — the first executed move bumps it,
-    # the rest pass bump_ladder=False.
+    Fan-out ladder dedup (review finding 2026-07-02): several slots on ONE hot
+    account move in the same cycle, but that account's ladder step is shared and
+    must advance exactly once — the first executed move bumps it, the rest pass
+    bump_ladder=False.
+    """
     ladder_bumped: set[str] = set()
     for move in moves:
         label = f"{move['slot']}: {move['from']} -> {move['to']}"
@@ -4397,6 +4383,148 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
                 reason=f"{move['reason']} — FAILED: {e}",
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
             ))
+
+
+def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_execute: bool) -> None:
+    """The per_session daemon cycle after polling (Phase 3): periodic
+    save-back, long-idle slot gc, reactive-429 moves, ladder moves — all
+    per slot, never touching ~/.claude/ (bare mounts are observe-only, 3.4).
+
+    Caller (one_cycle) has already merged fresh usage into state; this
+    function persists state (usage + 429 watermark) before executing moves,
+    mirroring the global path's crash ordering.
+    """
+    _slot_saveback_and_gc(state, config, no_execute)
+
+    # Urgent reactive-429 moves preempt ladder moves (same precedence as the
+    # global cycle's step 0).
+    moves = check_rate_limit_reactive_per_session(state, config)
+    traces: dict = {}
+    if not moves:
+        moves = decide_slot_swaps(state, config, usage_by_account, traces)
+
+    # Persist usage + 429 watermark + gc'd slots BEFORE acting, so a crash
+    # mid-move leaves valid state (same ordering as the global path).
+    save_state(state)
+
+    if not moves:
+        occupied = occupied_slot_accounts(state)
+        _log_decision(_build_decision_record(
+            state, config, action="hold", gate="no_slot_moves",
+            reason=f"no per-slot moves; occupied: " + (", ".join(f"{a}({'+'.join(s)})" for a, s in sorted(occupied.items())) or "none"),
+        ))
+        for name, acct in state.get("accounts", {}).items():
+            occ = " [" + "+".join(occupied[name]) + "]" if name in occupied else ""
+            te = " (TOKEN_EXPIRED)" if acct.get("token_expired") else ""
+            click.echo(f"   {name}{occ}: 5h={acct.get('current_5h_pct', 0):.1f}%, 7d={acct.get('current_7d_pct', 0):.1f}%, next={acct.get('next_swap_at_pct', 50)}%{te}")
+        return
+
+    _execute_slot_moves(moves, state, config, no_execute)
+
+
+def _execute_global_mount_swap(decision: "SwapDecision", state: dict, config: dict, no_execute: bool) -> None:
+    """Execute (or dry-run/lazy-defer) a swap of the shared ~/.claude/ mount —
+    the global path's decide→defer→execute logic, minus SOS (caller emits it).
+
+    Used by hybrid mode to manage bare sessions alongside slots (GH #99). Global
+    mode keeps its own inline copy in one_cycle so its tested flow is untouched;
+    this deliberately mirrors it. Both are candidates to unify once hybrid is
+    proven in the field.
+    """
+    if decision is None:
+        return
+    click.echo(f"  global (shared mount) swap: {state['active']} -> {decision.target} (tier {decision.tier})")
+    click.echo(f"    reason: {decision.reason}")
+    lazy_warm = _lazy_warm_sessions(decision, config)
+    if lazy_warm:
+        warm_panes = sorted({s.pane for s in lazy_warm if s.pane and s.pane != "no-tmux"})
+        msg = (f"lazy-swap DEFER (shared mount): {len(lazy_warm)} cache-warm bare session(s) "
+               f"across {len(warm_panes)} pane(s) — non-urgent {decision.gate} swap to "
+               f"{decision.target} would burn cache (GH #56)")
+        click.echo(f"  {msg}")
+        _log_decision(_build_decision_record(
+            state, config, action="defer", gate="lazy_swap", reason=msg,
+            target=decision.target, tier=decision.tier,
+            where={"warm_pane_count": len(warm_panes), "panes": warm_panes},
+        ))
+        return
+    if no_execute:
+        click.echo("    (--no-execute) skipping shared-mount swap")
+        _log_decision(_build_decision_record(
+            state, config, action="would_swap", gate=decision.gate,
+            reason=decision.reason, target=decision.target, tier=decision.tier,
+            where=_migrating_panes(),
+        ))
+        return
+    if config.get("hot_swap", {}).get("enabled", False):
+        try:
+            hot_swap_orchestrate(decision, state, config)
+        except NameError:
+            execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
+    else:
+        execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
+        click.echo(f"    swapped shared mount (bare sessions follow; slots unaffected)")
+    _log_decision(_build_decision_record(
+        state, config, action="swap", gate=decision.gate,
+        reason=decision.reason, target=decision.target, tier=decision.tier,
+        where=_migrating_panes(),
+    ))
+
+
+def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute: bool) -> None:
+    """Hybrid daemon cycle (GH #99): manage per-session SLOTS individually AND
+    the shared ~/.claude/ mount for bare sessions, in ONE cycle.
+
+    Slots move in place (no session restart); the shared mount swaps like global
+    mode (every bare session follows it on its next request). Reactive 429s are
+    partitioned from a SINGLE log read: a slot-attributable 429 moves only that
+    slot, a bare-session 429 moves only the shared mount — never both, and the
+    watermark advances exactly once.
+
+    Ordering note: the shared-mount decision is computed on the polled state and
+    executed AFTER slot moves. Slots and the shared mount can, in a saturated
+    pool, pick the same target account (independent decisions); that's a
+    tolerated v1 double-up — a follow-up can cross-exclude. See GH #99.
+    """
+    _slot_saveback_and_gc(state, config, no_execute)
+
+    # Reactive 429 — partition one read so slots and the shared mount don't
+    # both act on the same entry (see the reactive fns' `entries` param).
+    slot_moves: list[dict] = []
+    bare_decision = None
+    if config.get("reactive", {}).get("enabled", True):
+        all_entries = _read_rate_limit_log_since(state.get("last_429_check_ts"))
+        state["last_429_check_ts"] = now_iso()
+        slot_entries, bare_entries = [], []
+        for e in all_entries:
+            (slot_entries if session_current_slot(e["session_id"]) else bare_entries).append(e)
+        slot_moves = check_rate_limit_reactive_per_session(state, config, entries=slot_entries)
+        bare_decision = check_rate_limit_reactive(state, config, entries=bare_entries)
+
+    # Proactive slot moves only when no urgent slot 429 preempts them.
+    traces: dict = {}
+    if not slot_moves:
+        slot_moves = decide_slot_swaps(state, config, usage_by_account, traces)
+
+    # Proactive shared-mount swap (for bare sessions) only when no urgent bare
+    # 429 preempts it. decide_swap operates on state["active"] = the shared
+    # mount's account, exactly as in global mode.
+    global_decision = bare_decision if bare_decision is not None else decide_swap(state, config, usage_by_account, {})
+
+    # Persist usage + 429 watermark BEFORE acting (crash-safe ordering).
+    save_state(state)
+
+    if slot_moves:
+        _execute_slot_moves(slot_moves, state, config, no_execute)
+    _execute_global_mount_swap(global_decision, state, config, no_execute)
+
+    if not slot_moves and global_decision is None:
+        occupied = occupied_slot_accounts(state)
+        _log_decision(_build_decision_record(
+            state, config, action="hold", gate="no_moves",
+            reason="hybrid: no slot moves and no shared-mount swap; occupied: "
+                   + (", ".join(f"{a}({'+'.join(s)})" for a, s in sorted(occupied.items())) or "none"),
+        ))
 
 
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
@@ -6664,7 +6792,7 @@ def _read_rate_limit_log_since(since_ts: str | None) -> list[dict]:
     return out
 
 
-def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
+def check_rate_limit_reactive(state: dict, config: dict, entries: list | None = None) -> SwapDecision | None:
     """If there's a recent 429 since last check, force a swap on the active account.
 
     Returns a Tier-3 SwapDecision (force) so hot_swap_orchestrate skips
@@ -6674,21 +6802,29 @@ def check_rate_limit_reactive(state: dict, config: dict) -> SwapDecision | None:
     (default 60s — shorter than the ladder gate because reactive 429s are
     real emergencies). Prevents rapid-fire reactive swaps when the
     rate_limit_log churns or sessions.log mapping is briefly stale.
+
+    `entries` (GH #99 hybrid): when None (default) this reads the 429 log
+    itself and advances the watermark — the global-mode behavior. Hybrid mode
+    reads the log ONCE and partitions it (slot-attributable vs bare) so a
+    slot's 429 doesn't also bounce the shared mount; it passes this function
+    only the BARE entries and owns the watermark itself, so we neither re-read
+    nor re-advance it here.
     """
     if not config.get("reactive", {}).get("enabled", True):
         return None
-    watermark = state.get("last_429_check_ts")
-    fresh = _read_rate_limit_log_since(watermark)
-    if not fresh:
+    owns_watermark = entries is None
+    if owns_watermark:
+        watermark = state.get("last_429_check_ts")
+        entries = _read_rate_limit_log_since(watermark)
         # Bump watermark to now so we don't keep scanning old entries
         state["last_429_check_ts"] = now_iso()
+    if not entries:
         return None
 
-    state["last_429_check_ts"] = now_iso()
     # Only react if at least one 429 was on the active account's session
     active = state["active"]
     matched_session = None
-    for entry in fresh:
+    for entry in entries:
         sess_log = _parse_sessions_log()
         sess_account_map = {e["session_id"]: e["account"] for e in sess_log}
         if sess_account_map.get(entry["session_id"]) == active:
@@ -7085,9 +7221,12 @@ def status() -> None:
     state = read_json(STATE_JSON)
     config = load_config()
     color_on = sys.stdout.isatty()
-    per_session = config.get("mode", "global") == "per_session"
+    mode = config.get("mode", "global")
+    per_session = mode == "per_session"
     if per_session:
         click.echo(f"Mode: per_session (global mount observe-only). Bare-launch account: {state['active']}")
+    elif mode == "hybrid":
+        click.echo(f"Mode: hybrid (slots + shared mount both managed). Shared-mount account: {state['active']}")
     else:
         click.echo(f"Active account: {state['active']}")
     click.echo()
@@ -7736,14 +7875,17 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
     def one_cycle() -> None:
         state = load_state()
         config = load_config()
-        per_session = config.get("mode", "global") == "per_session"
-        click.echo(f"[{now_iso()}] cycle start. mode={'per_session' if per_session else 'global'} active={state['active']}")
+        mode = config.get("mode", "global")
+        per_session = mode == "per_session"
+        hybrid = mode == "hybrid"
+        click.echo(f"[{now_iso()}] cycle start. mode={mode} active={state['active']}")
 
         # 0. Reactive check — has anything 429'd since last cycle?
-        # per_session handles 429s inside _per_session_cycle (attributed to
-        # the offending slot via sessions.log) — the global variant below
-        # would swap ~/.claude/, which per_session mode NEVER writes (3.4).
-        reactive_decision = None if per_session else check_rate_limit_reactive(state, config)
+        # per_session + hybrid handle 429s AFTER polling (inside their cycle
+        # fns), attributed to the offending slot — the pre-poll global variant
+        # here would swap ~/.claude/, which per_session NEVER writes and which
+        # hybrid handles itself (partitioned from slot 429s).
+        reactive_decision = None if (per_session or hybrid) else check_rate_limit_reactive(state, config)
         if reactive_decision is not None:
             click.echo(f"  reactive (429): {reactive_decision.reason}")
             save_state(state)
@@ -7825,6 +7967,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # bust this mode exists to eliminate (3.4).
         if per_session:
             _per_session_cycle(state, config, usage_by_account, no_execute)
+            _emit_sos_after(load_state(), config)
+            return
+
+        # Hybrid (GH #99): manage slots individually AND the shared mount for
+        # bare sessions in one cycle. Like per_session, decisions happen after
+        # polling; unlike it, the shared mount IS swapped (for bare sessions).
+        if hybrid:
+            _hybrid_cycle(state, config, usage_by_account, no_execute)
             _emit_sos_after(load_state(), config)
             return
 
@@ -8041,8 +8191,8 @@ def hooks_list_cmd() -> None:
 
 
 CONFIG_EXPLAIN_MAP: dict[str, str] = {
-    "mode": "Live-mount topology (docs/plans/2026-07-02-per-session-accounts.md). `global` (default): one live mount (~/.claude/), the daemon swaps it in place, every session follows the active account. `per_session`: each session launched via `cus launch` gets its own slot dir (~/claude-accounts/slot-N/) holding one account; the daemon swaps individual slots in place (sessions never restart) and NEVER writes ~/.claude/ (bare launches are observed, not swapped). Switch with `cus mode per-session` / `cus mode global` — never edit this key by hand mid-flight.",
-    "per_session": "per_session-mode tuning. `slot_gc_idle_hours: 72`: how long a slot may sit with no live session before the daemon reaps it (credentials save back to the owning account dir first). Long default because a free slot is a reuse candidate for the next `cus launch` (no swap needed when it already holds the right account). `default_pool: premium`: rotation-set a slot joins when it doesn't declare one at launch (GH #99). `premium` slots honor the per-model weekly gate (swap off an account once a tracked model's week hits per_model_weekly.cap_pct, never swap back); `standard` slots ignore it (keep using that account's aggregate headroom for standard-model work). Set per slot via `cus launch --pool <p>` / `cus pool <slot> <p>`. Only meaningful in per_session mode.",
+    "mode": "Live-mount topology (docs/plans/2026-07-02-per-session-accounts.md). `global` (default): one live mount (~/.claude/), the daemon swaps it in place, every session follows the active account; slots are ignored. `per_session`: each session launched via `cus launch` gets its own slot dir (~/claude-accounts/slot-N/) holding one account; the daemon swaps individual slots in place (sessions never restart) and NEVER writes ~/.claude/ (bare launches are observed, not swapped). `hybrid` (GH #99): does BOTH — manages slots individually AND swaps the shared ~/.claude/ mount for bare sessions each cycle (bare sessions follow the shared swap together; slots move independently). Reactive 429s are partitioned so a slot's 429 moves only that slot and a bare session's only the shared mount. Switch with `cus mode per-session|hybrid|global` — never edit this key by hand mid-flight.",
+    "per_session": "per_session-mode tuning. `slot_gc_idle_hours: 72`: how long a slot may sit with no live session before the daemon reaps it (credentials save back to the owning account dir first). Long default because a free slot is a reuse candidate for the next `cus launch` (no swap needed when it already holds the right account). `default_pool: premium`: rotation-set a slot joins when it doesn't declare one at launch (GH #99). `premium` slots honor the per-model weekly gate (swap off an account once a tracked model's week hits per_model_weekly.cap_pct, never swap back); `standard` slots ignore it (keep using that account's aggregate headroom for standard-model work). Set per slot via `cus launch --pool <p>` / `cus pool <slot> <p>`. Only meaningful in per_session / hybrid mode.",
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
     "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
     "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
@@ -9774,19 +9924,25 @@ def _set_config_mode(new_mode: str) -> None:
 
 
 @cli.command(name="mode")
-@click.argument("new_mode", required=False, type=click.Choice(["per-session", "per_session", "global"]))
+@click.argument("new_mode", required=False, type=click.Choice(["per-session", "per_session", "global", "hybrid"]))
 @click.option("--force", is_flag=True, help="global transition: proceed even with live slot sessions (they keep running, unmanaged).")
 def mode_cmd(new_mode: str | None, force: bool) -> None:
-    """Show or switch the live-mount topology (global | per_session).
+    """Show or switch the live-mount topology (global | per_session | hybrid).
 
     per-session: validates every pool account (doctor-heals its dir, checks
     its snapshot carries a refresh token), ensures one free slot exists, and
     flips config. The global mount keeps whatever account it holds — bare
-    launches continue working, observe-only.
+    launches continue working, observe-only (never swapped).
+
+    hybrid (GH #99): same slot setup as per_session, BUT the daemon ALSO swaps
+    the shared ~/.claude/ mount for bare sessions each cycle — so a machine
+    with both `cus launch` slots AND plain `claude` sessions has everything
+    managed. Slots move independently (no restart); bare sessions follow the
+    shared-mount swap (they mass-bounce together, inherent to a shared mount).
 
     global: reaps every idle slot (credentials saved back), flips config.
     Walk-back is always `cus mode global` — global-mode code paths are
-    untouched by per_session, so it restores today's exact behavior.
+    untouched by per_session/hybrid, so it restores today's exact behavior.
 
     Both directions need a daemon restart to take effect mid-cycle:
     `systemctl --user restart cus.service` (the daemon re-reads config each
@@ -9803,7 +9959,10 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
         return
 
     state = load_state()
-    if new_mode == "per_session":
+    if new_mode in ("per_session", "hybrid"):
+        # Both modes manage slots, so both need every account to be a healthy
+        # launch source and at least one slot to exist. hybrid additionally
+        # keeps swapping the shared mount (handled in the daemon, not here).
         # Validation: every pool account must be a healthy launch source.
         problems: list[str] = []
         for name in sorted(state.get("accounts", {})):
@@ -9832,10 +9991,14 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
             name, _ = create_slot(state)
             save_state(state)
             click.echo(f"  created first slot: {name}")
-        _set_config_mode("per_session")
-        click.echo(click.style("mode: per_session", fg="green", bold=True))
+        _set_config_mode(new_mode)
+        click.echo(click.style(f"mode: {new_mode}", fg="green", bold=True))
         click.echo("  launch sessions with `cus launch` (or: alias claude='cus launch auto --')")
-        click.echo("  bare `claude` keeps working on ~/.claude/ — observed, never swapped")
+        if new_mode == "hybrid":
+            click.echo("  bare `claude` on ~/.claude/ IS managed too — the daemon swaps the shared")
+            click.echo("  mount for bare sessions (they follow it together on the next request)")
+        else:
+            click.echo("  bare `claude` keeps working on ~/.claude/ — observed, never swapped")
         click.echo("  rollout note: consider relaxing polling.active_interval_seconds (e.g. 300) —")
         click.echo("  N occupied accounts poll at the fast cadence now (429-budget, see plan 3.3)")
         click.echo("  walk-back: `cus mode global`")
