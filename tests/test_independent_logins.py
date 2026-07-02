@@ -469,6 +469,49 @@ def test_duplicate_family_detected_and_warned_and_sos():
         env.restore()
 
 
+# --------------------------------------------------------------------------
+# Track A — lane sharing (multiple sessions per mount, no extra login)
+# --------------------------------------------------------------------------
+
+def _make_live_lane(env: "_Env", slot: str, account: str) -> None:
+    """Scaffold a slot dir holding `account` and make it appear live (one pid)."""
+    state = cus.load_state()
+    state["slots"] = {slot: {"account": account}}
+    cus.save_state(state)
+    cus.scaffold_mount_dir(cus.slot_path(slot))
+    live = cus.slot_path(slot)
+    cus.mount_pids = lambda m: [999] if str(m) == str(live) else []
+    cus._OCCUPIED_SLOTS_CACHE.clear()
+
+
+def test_lane_sharing_joins_existing_lane_no_swap():
+    env = _Env()
+    try:
+        env.set_config({"per_session": {"lane_sharing": True}})
+        _make_live_lane(env, "slot-1", "alpha")
+        name, d, acct = cus._launch_prepare("alpha", cus.load_state(), cus.load_config())
+        # Joined the existing lane — same slot, no new one allocated.
+        assert (name, acct) == ("slot-1", "alpha")
+        assert d == cus.slot_path("slot-1")
+        assert set(cus.load_state()["slots"]) == {"slot-1"}, "no second mount created"
+    finally:
+        env.restore()
+
+
+def test_lane_sharing_off_still_refuses_double_book():
+    env = _Env()
+    try:
+        env.set_config({"per_session": {"lane_sharing": False}})
+        _make_live_lane(env, "slot-1", "alpha")
+        # Default behavior (gate off, no sharing): #104 refuses a 2nd mount.
+        import pytest as _pt
+        with _pt.raises(Exception) as ei:
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config())
+        assert "already running on a live mount" in str(ei.value) or "GH #104" in str(ei.value)
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

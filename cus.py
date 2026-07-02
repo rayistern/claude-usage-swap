@@ -237,6 +237,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # every session, nothing to segment). Set per slot via
         # `cus launch --pool <p>` or `cus pool <slot> <p>`.
         "default_pool": "premium",
+        # GH #109 lanes: when true, `cus launch <account>` JOINS the live mount
+        # already holding that account (multiple sessions share one config dir /
+        # login and swap together) instead of allocating a fresh slot. This is
+        # the no-extra-login path: one account lives on one lane, seeded from the
+        # login it already has. The one-account-per-live-mount invariant (#104)
+        # still holds — lanes SATISFY it by sharing rather than copying. Default
+        # off keeps today's 1-session-per-slot behavior. To run one account on
+        # two INDEPENDENTLY-swappable lanes instead of sharing, use the
+        # independent-login escape hatch (independent_logins, below).
+        "lane_sharing": False,
     },
     # GH #109: per-(slot, account) independent-login store.
     #
@@ -10612,6 +10622,33 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         click.echo(f"launch: picked '{account}' ({target.reason})")
     elif account not in state.get("accounts", {}):
         raise click.ClickException(f"unknown account '{account}'. Known: {sorted(state.get('accounts', {}))}")
+
+    # Lane sharing (GH #109 lanes): if the chosen account is already live on a
+    # slot lane, JOIN that lane (share its config dir) rather than refusing
+    # (#104) or minting a second mount. Multiple sessions on one lane share one
+    # login and swap together — the no-extra-login path. The lane already holds
+    # the account, so there is NO swap and NO clobber (same dir, same family).
+    # We only join a SLOT lane, never the global mount (a slot on the global
+    # active would be a genuine second mount of that account → falls through to
+    # the #104 guard / independent-login hatch below).
+    if config.get("per_session", {}).get("lane_sharing", False):
+        occ = occupied_slot_accounts(state)  # account -> [live slot names]
+        lanes = sorted(occ.get(account, []),
+                       key=lambda n: int(n.removeprefix(SLOT_PREFIX)) if n.removeprefix(SLOT_PREFIX).isdigit() else 1 << 30)
+        if lanes:
+            lane = lanes[0]
+            lane_dir = slot_path(lane)
+            click.echo(f"launch: joining lane {lane} already on '{account}' (lane sharing — shared login, swap together)")
+            # Heal the lane's layout, but DON'T sync .claude.json: it has a live
+            # writer (the sessions already on this lane), so a sync would race
+            # their writes (same rule as the daemon's periodic save-back).
+            for f in doctor_mount(lane_dir, fix=True):
+                click.echo(f"launch: doctor healed {lane}/{f['entry']} ({f['problem']})")
+            state = load_state()
+            entry = state.setdefault("slots", {}).setdefault(lane, {"account": account, "created_ts": now_iso()})
+            entry["last_launch_ts"] = now_iso()
+            save_state(state)
+            return lane, lane_dir, account
 
     # Duplicate-mount guard (GH #104): refuse to launch onto an account already
     # live on another mount (another slot, or the shared mount with live bare
