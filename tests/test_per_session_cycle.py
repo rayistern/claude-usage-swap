@@ -283,6 +283,51 @@ def test_periodic_saveback_only_when_fresher():
         env.restore()
 
 
+def test_decide_slot_swaps_skips_locked_slot():
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 85.0, "current_7d_pct": 20.0})
+        usage = {"alpha": _usage(85.0, 20.0), "beta": _usage(10.0, 10.0), "gamma": _usage(20.0, 15.0)}
+        cfg = _config(session_locks={"locked_slots": [s1]})
+        moves = cus.decide_slot_swaps(state, cfg, usage)
+        # Only the unlocked slot moves; the locked one is frozen in place.
+        assert {m["slot"] for m in moves} == {s2}
+
+        # Locking BOTH slots: the hot account produces no moves at all.
+        cfg_all = _config(session_locks={"locked_slots": [s1, s2]})
+        assert cus.decide_slot_swaps(state, cfg_all, usage) == []
+    finally:
+        env.restore()
+
+
+def test_reactive_429_skips_locked_slot():
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        from datetime import datetime, timedelta, timezone
+        def _iso(minutes_ago: float) -> str:
+            return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
+        cus.SESSIONS_LOG.write_text(f"{_iso(10)},sA,alpha,%1,/tmp\n")
+        cus.RATE_LIMIT_LOG.write_text(f"{_iso(1)},sA,429 rate limit\n")
+        state["last_429_check_ts"] = _iso(5)
+        _orig_scs = cus.session_current_slot
+        cus.session_current_slot = lambda sid: {"sA": s1}.get(sid)
+        try:
+            # A real 429 on a locked slot must NOT move it (the lock is the
+            # user's explicit override; SOS surfaces the exhaustion instead).
+            cfg = _config(session_locks={"locked_slots": [s1]})
+            assert cus.check_rate_limit_reactive_per_session(state, cfg) == []
+        finally:
+            cus.session_current_slot = _orig_scs
+    finally:
+        env.restore()
+
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

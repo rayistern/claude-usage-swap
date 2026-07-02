@@ -431,6 +431,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "per_model_weekly": {
         "gate_enabled": False,
         "models": [],
+        # Separate threshold for the per-model weekly gate. None (default) =
+        # inherit the strategy's hard_7d_cap_pct, keeping the original fold-in
+        # behavior byte-identical. Set e.g. 90 to force-swap the active account
+        # when a tracked model's week hits 90% (and to filter swap targets at
+        # that level) while the aggregate-7d cap keeps its own value — lets
+        # "swap when Fable hits 90%" coexist with a lower aggregate ceiling.
+        "cap_pct": None,
     },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
@@ -449,6 +456,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "session_locks": {
         "pinned": {},            # {pane_id: account_name} — never swap these
         "never_restart_patterns": [],  # list of regex; matched against tmux pane name
+        # Slot-level lock (per_session mode). Slot names listed here are frozen:
+        # the daemon never moves the slot's account (ladder, hard-cap, and
+        # reactive-429 slot moves all skip it) and idle slot-gc won't reap it.
+        # Distinct from `pinned` (which protects a SESSION from hot-swap
+        # orchestration): a lock protects the SLOT's credential mount itself.
+        # Manage via `cus lock <slot>` / `cus unlock <slot>`.
+        "locked_slots": [],
     },
     "daemon": {
         "log_path": str(DAEMON_LOG),
@@ -1916,6 +1930,15 @@ def _hard_7d_cap_for_config(config: dict) -> float:
     return strategy_cfg.get("hard_7d_cap_pct") or config.get("smart_strategy", {}).get("hard_7d_cap_pct", 80)
 
 
+def _model_weekly_cap_for_config(config: dict) -> float:
+    """Threshold the per-model weekly gate trips at. `per_model_weekly.cap_pct`
+    when set; otherwise the strategy's hard_7d_cap_pct — the original fold-in
+    design compared per-model % against the same hard cap, so the fallback
+    keeps unmodified configs byte-identical."""
+    cap = config.get("per_model_weekly", {}).get("cap_pct")
+    return float(cap) if cap is not None else _hard_7d_cap_for_config(config)
+
+
 def _account_effective_pct(acct: dict, config: dict) -> float:
     """Apply thresholds.{five_hour,seven_day} config when computing an
     account's "effective" usage % — i.e. the value the ladder logic actually
@@ -2118,9 +2141,13 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # to any tracked per-model weekly — so we never swap ONTO an account whose
     # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
     # when the gate is off, so this is exactly the old aggregate-7d filter then.
+    # The per-model comparison uses its own cap (per_model_weekly.cap_pct,
+    # falling back to hard_7d) so the two ceilings can differ.
+    model_cap = _model_weekly_cap_for_config(config)
     safe_7d = [
         (n, a) for n, a in candidates
-        if max(a.get("current_7d_pct", 0), _max_model_weekly_from_acct(a, config)) < hard_7d
+        if a.get("current_7d_pct", 0) < hard_7d
+        and _max_model_weekly_from_acct(a, config) < model_cap
     ]
     cap_fallback = not safe_7d
     if safe_7d:
@@ -3638,8 +3665,18 @@ def decide_swap(
     # tracked model's weekly cap is exhausted, even if aggregate 7d has room.
     # 0.0 when the gate is off, so the hard-cap trigger is unchanged for
     # unmodified installs. Per-model is weekly-only, so it belongs on this cap.
-    cur_7d = max(cur_7d, _max_model_weekly_from_usage(cur_usage, config))
-    if cur_7d >= hard_7d_cap:
+    # The model comparison uses its own threshold (per_model_weekly.cap_pct,
+    # falling back to hard_7d_cap) so e.g. "Fable at 90" can coexist with an
+    # aggregate ceiling of 80.
+    cur_model = _max_model_weekly_from_usage(cur_usage, config)
+    model_cap = _model_weekly_cap_for_config(config)
+    agg_tripped = cur_7d >= hard_7d_cap
+    model_tripped = cur_model > 0 and cur_model >= model_cap
+    if agg_tripped or model_tripped:
+        # For the operator-facing messages below: show whichever signal tripped
+        # (the model % when only the model cap tripped, else the aggregate).
+        cur_7d = cur_7d if agg_tripped else cur_model
+        hard_7d_cap = hard_7d_cap if agg_tripped else model_cap
         # Hard 7d cap is normally a bypass path (it's the user's invariant)
         # but apply minimum hysteresis so a previous cap-swap can't be
         # immediately undone — and only allow the swap if the picker has
@@ -3672,7 +3709,10 @@ def decide_swap(
         # If the picker had to fall back to a DEGRADED candidate (also above
         # hard_7d_cap), swapping doesn't actually help — both accounts are
         # exhausted. Don't churn; the SOS layer will surface it.
-        if "[DEGRADED:" in target.reason and f"no targets below 7d cap {int(hard_7d_cap)}%" in target.reason:
+        # Match the annotation WITHOUT the cap number: with a separate
+        # per_model_weekly.cap_pct, the cap that tripped here can differ from
+        # the aggregate cap pick_swap_target wrote into the annotation.
+        if "[DEGRADED:" in target.reason and "no targets below 7d cap" in target.reason:
             msg = (
                 f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but all "
                 f"other accounts are ALSO above cap — not swapping (would just churn); SOS will fire"
@@ -4000,6 +4040,17 @@ def live_sessions_on_slot(slot_name: str) -> list:
     return [s for s in sessions if pane_mount_name(s.pane) == slot_name]
 
 
+def _locked_slots(config: dict) -> set[str]:
+    """Slot names frozen by `session_locks.locked_slots` (cus lock/unlock).
+
+    A locked slot's account is never moved by the daemon — ladder, hard-cap,
+    and reactive-429 slot moves all skip it, and idle slot-gc won't reap it.
+    The lock is user intent ("this slot stays put no matter what"), so it
+    lives in config.yaml next to the session pins, not in daemon state.
+    """
+    return {str(s) for s in (config.get("session_locks", {}).get("locked_slots") or [])}
+
+
 def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "AccountUsage"],
                       traces: dict | None = None) -> list[dict]:
     """Per-slot swap decisions for one cycle (Phase 3.1).
@@ -4015,8 +4066,17 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     """
     moves: list[dict] = []
     taken: set[str] = set()
+    locked = _locked_slots(config)
     occupied = occupied_slot_accounts(state)
     for acct_name, slots in sorted(occupied.items()):
+        # Locked slots are frozen — drop them before running the account's
+        # swap decision so an account whose only slots are locked doesn't
+        # burn a decide_swap (and so fan-out never counts them).
+        movable = [s for s in sorted(slots) if s not in locked]
+        for s in sorted(set(slots) - set(movable)):
+            click.echo(f"  skip {s}: locked (session_locks.locked_slots)")
+        if not movable:
+            continue
         shim = dict(state)
         shim["active"] = acct_name
         trace: dict = {}
@@ -4025,7 +4085,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
             traces[acct_name] = trace
         if decision is None:
             continue
-        for slot_name in sorted(slots):
+        for slot_name in movable:
             target = decision.target
             if target in taken:
                 # Fan-out: re-pick with this round's taken targets excluded
@@ -4069,10 +4129,16 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dic
     # Resolve each 429'd session to the slot it is CURRENTLY on, then that
     # slot's current occupant. Dedupe: one move per hit slot.
     slot_to_account: dict[str, str] = {}
+    locked = _locked_slots(config)
     for e in entries:
         slot_name = session_current_slot(e["session_id"])
         if not slot_name:
             continue  # bare session or resolvable-to-no-slot → observe-only
+        if slot_name in locked:
+            # The user froze this slot; even a real 429 doesn't move it.
+            # SOS surfaces the exhausted-account condition instead.
+            click.echo(f"  reactive-429 on {slot_name}: locked — not moving (session_locks.locked_slots)")
+            continue
         acct = state.get("slots", {}).get(slot_name, {}).get("account")
         if acct:
             slot_to_account[slot_name] = acct
@@ -4170,6 +4236,8 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
             idle_s = (datetime.now(timezone.utc) - datetime.fromisoformat(ref_ts.replace("Z", "+00:00"))).total_seconds()
         except ValueError:
             continue
+        if name in _locked_slots(config):
+            continue  # locked slot: standing reservation; never idle-reaped
         if idle_s >= gc_hours * 3600 and not no_execute:
             result = gc_slot(name, state)
             if result["action"] == "reaped":
@@ -6977,13 +7045,15 @@ def status() -> None:
     if slots_state or slot_dirs_on_disk:
         click.echo("Slots:")
         seen = set()
+        locked_slot_names = _locked_slots(config)
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
             pids = mount_pids(d)
             live_col = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+            lock_col = click.style("  🔒locked", fg="yellow") if d.name in locked_slot_names else ""
             orphan = "" if d.name in slots_state else click.style("  [orphan — not in state]", fg="yellow")
-            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{orphan}")
+            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{orphan}")
         for name in sorted(set(slots_state) - seen):
             click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
         click.echo()
@@ -6991,10 +7061,13 @@ def status() -> None:
     # Locks
     pins = config.get("session_locks", {}).get("pinned", {}) or {}
     patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
-    if pins or patterns:
+    locked_slots_cfg = sorted(_locked_slots(config))
+    if pins or patterns or locked_slots_cfg:
         click.echo("Locks:")
         for k, v in pins.items():
             click.echo(f"  pinned: {k} -> {v}")
+        for s in locked_slots_cfg:
+            click.echo(f"  locked slot: {s}")
         for p in patterns:
             click.echo(f"  never_restart: {p}")
         click.echo()
@@ -7890,9 +7963,9 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
-    "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` folds the highest tracked per-model weekly % into the weekly-cap logic: force-swap the active account when a model's week is exhausted, and never pick a swap target whose model-week is at/above `hard_7d_cap_pct`. `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
+    "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` folds the highest tracked per-model weekly % into the weekly-cap logic: force-swap the active account when a model's week is exhausted, and never pick a swap target whose model-week is at/above the model cap. `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 90 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
-    "session_locks": "Per-session pinning. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
+    "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
 }
@@ -7996,6 +8069,60 @@ def unpin(pane_or_session: str) -> None:
         click.echo(f"Unpinned {pane_or_session}")
     else:
         click.echo(f"{pane_or_session} was not pinned")
+
+
+def _normalize_slot_name(slot_name: str) -> str:
+    """Accept both `slot-2` and bare `2` — the CLI convenience mirrors how
+    slots are displayed (`slot-N`) vs how users abbreviate them."""
+    return slot_name if slot_name.startswith("slot-") else f"slot-{slot_name}"
+
+
+@cli.command()
+@click.argument("slot_name")
+def lock(slot_name: str) -> None:
+    """Lock a slot (e.g. slot-1) so the daemon never swaps its account.
+
+    Ladder, hard-cap, and reactive-429 slot moves all skip a locked slot,
+    and idle slot-gc won't reap it. per_session-mode counterpart of `pin`
+    (which protects a session from hot-swap orchestration): a lock freezes
+    the slot's credential mount itself. Persists in config.yaml under
+    session_locks.locked_slots. Undo with `cus unlock <slot>`.
+    """
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    name = _normalize_slot_name(slot_name)
+    state = load_state()
+    if name not in (state.get("slots") or {}) and not slot_path(name).exists():
+        # Locking ahead of slot creation is allowed (the lock is pure config),
+        # but flag it — the common case is a typo, not pre-provisioning.
+        click.echo(click.style(f"note: {name} does not currently exist (no state entry or dir); locking anyway", fg="yellow"))
+    user_cfg = read_yaml(CONFIG_YAML)
+    locked = user_cfg.setdefault("session_locks", {}).setdefault("locked_slots", [])
+    if name in locked:
+        click.echo(f"{name} is already locked")
+        return
+    locked.append(name)
+    write_yaml(CONFIG_YAML, user_cfg)
+    click.echo(f"Locked {name} — the daemon will not swap or gc this slot (unlock with `cus unlock {name}`)")
+
+
+@cli.command()
+@click.argument("slot_name")
+def unlock(slot_name: str) -> None:
+    """Remove a slot lock set by `cus lock`."""
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    name = _normalize_slot_name(slot_name)
+    user_cfg = read_yaml(CONFIG_YAML)
+    locked = user_cfg.get("session_locks", {}).get("locked_slots", []) or []
+    if name in locked:
+        locked.remove(name)
+        write_yaml(CONFIG_YAML, user_cfg)
+        click.echo(f"Unlocked {name}")
+    else:
+        click.echo(f"{name} was not locked")
 
 
 def _pct_is_unknown(acct: dict, key: str | None = None) -> bool:

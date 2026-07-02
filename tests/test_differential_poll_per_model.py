@@ -365,3 +365,62 @@ def test_flat_config_staleness_unchanged():
     })
     conds = _stale_conditions(st, FLAT_CFG)
     assert len(conds) == 1
+
+
+# --------------------------------------------------------------------------
+# per_model_weekly.cap_pct — separate threshold for the model gate
+# --------------------------------------------------------------------------
+
+def _cap_cfg(cap_pct, hard_cap=80, steps=None):
+    """Gate on, model cap set explicitly, aggregate hard cap independent."""
+    return dict(
+        GATE_ON,
+        strategy="smart",
+        smart_strategy={"hard_7d_cap_pct": hard_cap},
+        per_model_weekly={"gate_enabled": True, "models": [], "cap_pct": cap_pct},
+        swap_hysteresis={"enabled": False},
+        thresholds={"five_hour": True, "seven_day": True, "steps": steps or [50, 75, 90]},
+    )
+
+
+def test_model_cap_pct_none_inherits_hard_cap():
+    assert cus._model_weekly_cap_for_config(_cap_cfg(None, hard_cap=80)) == 80
+    assert cus._model_weekly_cap_for_config(_cap_cfg(90, hard_cap=80)) == 90
+
+
+def test_decide_swap_model_cap_pct_trips_independently_of_hard_cap():
+    # Aggregate 7d 40% is under the 80% hard cap; Fable week 85% is under a
+    # 90% model cap → hold. Raise Fable to 92% → the model cap (not the
+    # aggregate one) force-swaps. Ladder is parked at 95 so only the hard-cap
+    # trigger can fire.
+    accounts = {
+        "a": {"current_5h_pct": 30.0, "current_7d_pct": 40.0, "next_swap_at_pct": 95},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 50},
+    }
+    cfg = _cap_cfg(90, hard_cap=80)
+    st = _state(active="a", accounts=accounts)
+    usage_under = {"a": _usage(per_model={"Fable": cus.UsageWindow(utilization=85.0, resets_at=None)})}
+    assert cus.decide_swap(st, cfg, usage_under) is None
+    usage_over = {"a": _usage(per_model={"Fable": cus.UsageWindow(utilization=92.0, resets_at=None)})}
+    decision = cus.decide_swap(st, cfg, usage_over)
+    assert decision is not None and decision.gate == "hard_7d_cap" and decision.target == "b"
+
+
+def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
+    # Sole candidate 'b' has Fable at 85% (aggregate 10%). Under a 90% model
+    # cap it is a SAFE pick (no degraded fallback); once the model cap drops
+    # to 80% it is filtered and only survives via the degraded "no targets
+    # below cap" fallback. Ladder steps parked at [95] so the would-re-trip
+    # filter stays out of the way — this isolates the cap filter itself.
+    accounts = {
+        "a": {"current_5h_pct": 90.0, "current_7d_pct": 50.0, "next_swap_at_pct": 95},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 95,
+              "per_model_weekly_pct": {"Fable": 85.0}},
+    }
+    st = _state(active="a", accounts=accounts)
+    loose = dict(_cap_cfg(90, steps=[95]), strategy="lowest_usage")
+    tight = dict(_cap_cfg(80, steps=[95]), strategy="lowest_usage")
+    picked_loose = cus.pick_swap_target(st, loose)
+    picked_tight = cus.pick_swap_target(st, tight)
+    assert picked_loose.name == "b" and "[DEGRADED:" not in picked_loose.reason
+    assert picked_tight.name == "b" and "no targets below 7d cap" in picked_tight.reason
