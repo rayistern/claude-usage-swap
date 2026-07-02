@@ -496,6 +496,61 @@ def test_hybrid_cycle_moves_slot_and_shared_mount_together():
         env.restore()
 
 
+def test_decide_slot_swaps_excludes_cross_mount_accounts():
+    # GH #104: a slot must never move onto an account another live mount holds.
+    # alpha (slot) is hot; beta is the shared-mount account (excluded); gamma is
+    # the only other fresh account → the slot must pick gamma, never beta.
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 2.0, "current_7d_pct": 2.0})   # lowest — would win if not excluded
+        state["accounts"]["gamma"].update({"current_5h_pct": 8.0, "current_7d_pct": 8.0})
+        cus.save_state(state)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        usage = {n: _usage(state["accounts"][n]["current_5h_pct"], state["accounts"][n]["current_7d_pct"])
+                 for n in ("alpha", "beta", "gamma", "delta")}
+        moves = cus.decide_slot_swaps(state, _config(), usage, exclude_accounts={"beta"})
+        assert moves and moves[0]["slot"] == s1
+        assert moves[0]["to"] != "beta", f"slot must not move onto excluded 'beta'; got {moves[0]['to']}"
+    finally:
+        env.restore()
+
+
+def test_hybrid_never_double_books_an_account():
+    # GH #104: in one hybrid cycle the slot move and the shared-mount swap must
+    # land on DISTINCT accounts, and neither on the other mount's account.
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)     # slot on alpha (hot)
+        state = cus.load_state()
+        state["active"] = "beta"                    # shared mount on beta (hot)
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 96.0, "current_7d_pct": 20.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 5.0, "current_7d_pct": 5.0})
+        state["accounts"]["delta"].update({"current_5h_pct": 6.0, "current_7d_pct": 6.0})
+        cus.save_state(state)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        usage = {n: _usage(state["accounts"][n]["current_5h_pct"], state["accounts"][n]["current_7d_pct"])
+                 for n in ("alpha", "beta", "gamma", "delta")}
+        calls = []
+        orig = cus.execute_swap
+        cus.execute_swap = lambda target, trigger="manual", slot=None, bump_ladder=True: calls.append((target, slot))
+        try:
+            cus._hybrid_cycle(state, _config(mode="hybrid"), usage, no_execute=False)
+        finally:
+            cus.execute_swap = orig
+        slot_target = next((t for t, sl in calls if sl == s1), None)
+        shared_target = next((t for t, sl in calls if sl is None), None)
+        assert slot_target and shared_target, f"expected both a slot and a shared move; calls={calls}"
+        assert slot_target != shared_target, f"double-booked: both mounts took {slot_target}"
+        assert slot_target != "beta", "slot must not take the shared mount's account"
+        assert shared_target != "alpha", "shared mount must not take the slot's account"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -188,7 +188,7 @@ Everything above describes `mode: global` (the default): one live mount (`~/.cla
 
 `global` ignores slots (they freeze on their account); `per_session` ignores bare sessions (observe-only). If a machine has **both** `cus launch` slots and plain `claude` sessions, use `hybrid`: each cycle the daemon moves slots individually (no restart) **and** swaps the shared `~/.claude/` mount for the bare sessions (they follow it together). Reactive 429s are partitioned from a single log read — a slotted session's 429 moves only its slot, a bare session's only the shared mount. Enter with `cus mode hybrid` (same validation as per_session); leave with `cus mode global`.
 
-> ⚠️ **Do not put the same account on the shared mount and a live slot at once** (e.g. `cus switch <acct>` where a slot already runs `<acct>`). OAuth refresh tokens are single-use and rotate; two live mounts on one account invalidate each other and one gets logged out (GH #104). Keep the shared-mount account distinct from every slot account.
+> **No double-booking (automatic).** Every live mount must stay on a distinct account — two mounts on one account rotate its single-use OAuth refresh token and log one session out. The daemon enforces this: the shared-mount swap never picks an account a live slot holds, and slot swaps never pick the shared mount's (or another slot's) account. `cus switch <acct>` also refuses to move the shared mount onto an account a live slot runs (override with `--force`). So hybrid is safe to run with a mix of slotted and bare sessions (GH #104).
 
 Details: `docs/plans/2026-07-02-per-session-accounts.md` (design + decision history) and the storage-roles inventory in `docs/ARCHITECTURE.md`.
 

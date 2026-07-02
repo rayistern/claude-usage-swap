@@ -143,7 +143,7 @@ Both directions print what changed. `cus mode global` refuses while slot session
 
 **Which mode?** `per_session` if every session is launched via `cus launch` (bare sessions are observe-only, never swapped). `hybrid` if you have a MIX of slotted and plain `claude` sessions and want both managed — slots move independently, bare sessions follow the shared-mount swap. `global` (default) if you don't use slots.
 
-> ⚠️ **Duplicate-mount hazard (GH #104):** never leave the same account live on the shared mount AND a slot (e.g. `cus switch <acct>` while a slot runs `<acct>`). Single-use OAuth refresh tokens rotate; the two mounts invalidate each other and one session gets logged out. Keep the shared-mount account distinct from every slot account. If it happens: move the shared mount to a free account with `cus switch <free>` (save-back preserves the valid token), then relaunch the affected slot session.
+> **No double-booking (automatic, GH #104):** every live mount stays on a distinct account — two mounts on one account rotate its single-use OAuth refresh token and log one session out. The daemon enforces this in global and hybrid modes (the shared-mount swap skips accounts a live slot holds; slot swaps skip the shared mount's and other slots' accounts), and `cus switch <acct>` refuses to move the shared mount onto a live-slot account (use `--force` to override). Manual recovery if you ever force it into that state: move the shared mount to a free account with `cus switch <free>` (save-back preserves the valid token), then relaunch the affected slot session.
 
 ### Slot locks & rotation-set pools
 

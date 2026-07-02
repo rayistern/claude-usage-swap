@@ -4125,8 +4125,34 @@ def _config_for_pool(config: dict, pool: str) -> dict:
     return config
 
 
+def _live_slot_accounts(state: dict) -> set[str]:
+    """Accounts currently held by a LIVE-occupied slot (per /proc ground truth).
+
+    Used to keep every live mount on a DISTINCT account (GH #104): two live
+    mounts on one account both refresh its single-use OAuth token, rotating it
+    out from under the other and logging that session out. The shared-mount and
+    per-slot swap pickers exclude these so a mount never lands on an account
+    another mount is already signed in on.
+    """
+    return set(occupied_slot_accounts(state).keys())
+
+
+def _state_excluding_accounts(state: dict, keep: str | None, drop: set) -> dict:
+    """Shallow state copy whose `accounts` dict omits `drop` (minus `keep`), so
+    a swap-target picker cannot choose an account another live mount already
+    holds (GH #104). `keep` is the mount's own current account, always retained
+    (it's the one being evaluated / left). Returns the original state unchanged
+    when there is nothing to drop."""
+    drop = set(drop) - ({keep} if keep else set())
+    if not drop:
+        return state
+    shim = dict(state)
+    shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
+    return shim
+
+
 def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "AccountUsage"],
-                      traces: dict | None = None) -> list[dict]:
+                      traces: dict | None = None, exclude_accounts: set | None = None) -> list[dict]:
     """Per-slot swap decisions for one cycle (Phase 3.1).
 
     Returns a list of move dicts: {"slot", "from", "to", "gate", "tier",
@@ -4142,10 +4168,18 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     a standard slot ignores it (keeps using that account's aggregate headroom) —
     so they can't share one decide_swap. See `_config_for_pool` / GH #99.
 
+    `exclude_accounts` (GH #104): accounts NO slot may swap onto — e.g. the
+    account the shared mount holds in hybrid mode, so a slot never double-books
+    it. A group's OWN account is never excluded from itself (it's the one being
+    evaluated/left). Seeded into `taken` so fan-out re-picks avoid them too.
+
     `traces` (optional): "account:pool" → decide_swap trace dict, for logs.
     """
+    exclude = set(exclude_accounts or ())
     moves: list[dict] = []
-    taken: set[str] = set()
+    # Seed with the cross-mount exclusions so BOTH the primary pick (via the
+    # per-group accounts shim below) and the fan-out re-pick avoid them.
+    taken: set[str] = set(exclude)
     locked = _locked_slots(config)
     occupied = occupied_slot_accounts(state)
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
@@ -4162,6 +4196,11 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         cfg_view = _config_for_pool(config, pool)
         shim = dict(state)
         shim["active"] = acct_name
+        # Drop cross-mount-excluded accounts from the candidate pool for THIS
+        # group's decision (keep the group's own account — it's being left).
+        drop = exclude - {acct_name}
+        if drop:
+            shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
         if traces is not None:
@@ -4191,7 +4230,8 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     return moves
 
 
-def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: list | None = None) -> list[dict]:
+def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: list | None = None,
+                                          exclude_accounts: set | None = None) -> list[dict]:
     """per_session counterpart of check_rate_limit_reactive (Phase 3.1/4.2).
 
     Attributes fresh 429s to the SLOT the offending session runs on right now
@@ -4239,7 +4279,9 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
     hyst = config.get("swap_hysteresis", {})
     min_gap = hyst.get("min_seconds_between_reactive_swaps", 60) if hyst.get("enabled", True) else 0
     moves: list[dict] = []
-    taken: set[str] = set()
+    # Seed with cross-mount exclusions (GH #104): even an urgent 429 escape must
+    # not land on an account another live mount holds.
+    taken: set[str] = set(exclude_accounts or ())
     for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
@@ -4251,7 +4293,9 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
                 pass
         shim = dict(state)
         shim["active"] = acct
-        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
+        # Keep the slot's own account present (pick excludes the active anyway);
+        # drop this-round targets + cross-mount exclusions.
+        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in taken}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
         # a premium slot's may not.
@@ -4481,12 +4525,21 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
     slot, a bare-session 429 moves only the shared mount — never both, and the
     watermark advances exactly once.
 
-    Ordering note: the shared-mount decision is computed on the polled state and
-    executed AFTER slot moves. Slots and the shared mount can, in a saturated
-    pool, pick the same target account (independent decisions); that's a
-    tolerated v1 double-up — a follow-up can cross-exclude. See GH #99.
+    No double-booking (GH #104): every live mount must end on a DISTINCT
+    account — two mounts on one account rotate its single-use refresh token and
+    log one out. So slot swaps exclude the shared mount's account, and the
+    shared-mount swap excludes every account a slot holds (or is moving onto)
+    this cycle.
     """
     _slot_saveback_and_gc(state, config, no_execute)
+
+    # Cross-mount exclusions (GH #104). The shared mount holds state["active"];
+    # each live slot holds its own account. A slot must never move onto the
+    # shared account or another slot's account; the shared mount must never move
+    # onto any slot's account.
+    shared_active = state.get("active")
+    slot_accts = _live_slot_accounts(state)
+    exclude_for_slots = slot_accts | ({shared_active} if shared_active else set())
 
     # Reactive 429 — partition one read so slots and the shared mount don't
     # both act on the same entry (see the reactive fns' `entries` param).
@@ -4498,18 +4551,29 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         slot_entries, bare_entries = [], []
         for e in all_entries:
             (slot_entries if session_current_slot(e["session_id"]) else bare_entries).append(e)
-        slot_moves = check_rate_limit_reactive_per_session(state, config, entries=slot_entries)
-        bare_decision = check_rate_limit_reactive(state, config, entries=bare_entries)
+        slot_moves = check_rate_limit_reactive_per_session(
+            state, config, entries=slot_entries, exclude_accounts=exclude_for_slots)
+        # Bare reactive escape must avoid accounts slots hold or are moving onto.
+        bare_excl = slot_accts | {m["to"] for m in slot_moves}
+        bare_decision = check_rate_limit_reactive(
+            _state_excluding_accounts(state, shared_active, bare_excl), config, entries=bare_entries)
 
     # Proactive slot moves only when no urgent slot 429 preempts them.
     traces: dict = {}
     if not slot_moves:
-        slot_moves = decide_slot_swaps(state, config, usage_by_account, traces)
+        slot_moves = decide_slot_swaps(state, config, usage_by_account, traces,
+                                       exclude_accounts=exclude_for_slots)
 
     # Proactive shared-mount swap (for bare sessions) only when no urgent bare
     # 429 preempts it. decide_swap operates on state["active"] = the shared
-    # mount's account, exactly as in global mode.
-    global_decision = bare_decision if bare_decision is not None else decide_swap(state, config, usage_by_account, {})
+    # mount's account; its candidate pool excludes every account a slot holds or
+    # is moving onto this cycle, so the shared mount can't double-book one.
+    if bare_decision is not None:
+        global_decision = bare_decision
+    else:
+        shared_excl = slot_accts | {m["to"] for m in slot_moves}
+        global_decision = decide_swap(
+            _state_excluding_accounts(state, shared_active, shared_excl), config, usage_by_account, {})
 
     # Persist usage + 429 watermark BEFORE acting (crash-safe ordering).
     save_state(state)
@@ -7524,8 +7588,9 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
 @click.argument("target")
 @click.option("--dry-run", is_flag=True, help="Show what would happen without writing anything.")
 @click.option("--trigger", default="manual", help="Tag for the swap history entry.")
-def switch(target: str, dry_run: bool, trigger: str) -> None:
-    """Atomically swap to a different account.
+@click.option("--force", is_flag=True, help="Swap even onto an account a live slot already holds (GH #104: normally refused — two live mounts on one account log one out).")
+def switch(target: str, dry_run: bool, trigger: str, force: bool) -> None:
+    """Atomically swap the shared ~/.claude/ mount to a different account.
 
     Delegates to execute_swap() which is the same primitive the daemon uses.
     Both paths use atomic_copy / atomic_write_bytes for all credential
@@ -7547,6 +7612,18 @@ def switch(target: str, dry_run: bool, trigger: str) -> None:
     if target == current:
         click.echo(f"{target} is already active. Nothing to do.")
         return
+
+    # Duplicate-mount guard (GH #104): putting the shared mount on an account a
+    # LIVE slot already holds makes two live mounts share one account — their
+    # single-use OAuth refresh tokens rotate and one session gets logged out
+    # (this is exactly what happened 2026-07-02). Refuse unless --force.
+    slot_owner = occupied_slot_accounts(state)  # account -> [live slot names]
+    if target in slot_owner and not force:
+        click.echo(click.style(
+            f"refusing: a live slot ({', '.join(slot_owner[target])}) already runs '{target}'. "
+            f"Putting it on the shared mount too would rotate its refresh token and log one session out "
+            f"(GH #104). Pick an account no slot holds, or `--force` if you really mean it.", fg="red"))
+        sys.exit(1)
 
     target_dir = ACCOUNTS_DIR / f"account-{target}"
     current_dir = ACCOUNTS_DIR / f"account-{current}"
@@ -7978,9 +8055,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
             _emit_sos_after(load_state(), config)
             return
 
-        # 3. Decide
+        # 3. Decide. Even in global mode a machine can have live `cus launch`
+        # slots alongside bare sessions; the shared-mount swap must not land on
+        # an account a slot already holds, or the two mounts rotate each other's
+        # refresh token and one gets logged out (GH #104). Exclude live-slot
+        # accounts from the candidate pool (no-op when there are no slots).
         trace: dict = {}
-        decision = decide_swap(state, config, usage_by_account, trace)
+        decide_state = _state_excluding_accounts(state, state.get("active"), _live_slot_accounts(state))
+        decision = decide_swap(decide_state, config, usage_by_account, trace)
 
         # Persist usage updates BEFORE acting on swap (so a crash during
         # swap leaves valid usage state)
