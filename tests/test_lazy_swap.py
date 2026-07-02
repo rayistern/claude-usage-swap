@@ -40,6 +40,22 @@ def _decision(deferrable: bool) -> "cus.SwapDecision":
                             gate="ladder", deferrable=deferrable)
 
 
+# GH #91 test-hygiene fix: these tests patch cus-module functions in place
+# and used to leave the stubs installed, poisoning every test module that
+# runs after this one under pytest (test_live_session_scan.py exercises the
+# REAL find_live_sessions and was getting the 'deadbeef' stub). Capture the
+# originals at import — collection happens before any test mutates cus — and
+# restore them when this module's tests finish.
+_REAL_FIND_LIVE_SESSIONS = cus.find_live_sessions
+_REAL_CACHE_WARM = cus.cache_warm
+
+
+def teardown_module(_module=None):
+    """pytest module-teardown hook: undo the in-place cus patches."""
+    cus.find_live_sessions = _REAL_FIND_LIVE_SESSIONS
+    cus.cache_warm = _REAL_CACHE_WARM
+
+
 def _patch_sessions(monkeypatch_like, sessions, warm: bool):
     """Replace find_live_sessions + cache_warm on the cus module."""
     cus.find_live_sessions = lambda *a, **k: list(sessions)
@@ -102,6 +118,7 @@ def _run_all() -> int:
         except Exception as e:  # noqa: BLE001 — standalone runner wants the message
             failed += 1
             print(f"FAIL  {t.__name__}: {e}")
+    teardown_module()
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     return 1 if failed else 0
 
