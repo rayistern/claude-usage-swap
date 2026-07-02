@@ -1,6 +1,12 @@
 # claude-usage-swap (`cus`)
 
-Auto-rotate Claude Code OAuth accounts based on usage thresholds. Single-file Python, Linux-only, ~2000 LOC.
+[![CI](https://github.com/rayistern/claude-usage-swap/actions/workflows/ci.yml/badge.svg)](https://github.com/rayistern/claude-usage-swap/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+
+Auto-rotate Claude Code OAuth accounts based on usage thresholds. Single-file Python, Linux-only.
+
+> ⚠️ **Read [`SECURITY.md`](SECURITY.md) first.** `cus` reads and moves your Claude OAuth credentials, and it relies on the *undocumented* `CLAUDE_CONFIG_DIR` and OAuth usage endpoint (Anthropic can change these anytime). Whether multi-account rotation fits your subscription's Terms of Service is yours to determine. MIT, no warranty, use at your own risk.
 
 When one of your Claude Pro/Max accounts approaches its 5-hour or weekly cap, `cus` swaps the active credentials to a different account — atomically, with optional hot-swap of in-flight tmux sessions so conversations preserve via `claude --resume`.
 
