@@ -328,6 +328,121 @@ def test_reactive_429_skips_locked_slot():
 
 
 
+
+def _usage_pm(five_h, seven_d, fable=None):
+    """AccountUsage with an optional Fable per-model weekly window."""
+    pm = {}
+    if fable is not None:
+        pm["Fable"] = cus.UsageWindow(utilization=fable, resets_at=None)
+    return cus.AccountUsage(
+        five_hour=cus.UsageWindow(utilization=five_h, resets_at=None),
+        seven_day=cus.UsageWindow(utilization=seven_d, resets_at=None),
+        per_model_weekly=pm,
+    )
+
+
+def _pool_config(**overrides):
+    """Gate-on config: Fable capped at 97, aggregate hard cap 80."""
+    return _config(
+        strategy="smart",
+        smart_strategy={"hard_7d_cap_pct": 80},
+        per_model_weekly={"gate_enabled": True, "models": ["Fable"], "cap_pct": 97},
+        **overrides,
+    )
+
+
+def test_slot_pool_defaults_and_explicit():
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        cfg = _config()  # default_pool defaults to "premium"
+        assert cus._slot_pool(state, s1, cfg) == "premium"
+        state["slots"][s1]["pool"] = "standard"
+        assert cus._slot_pool(state, s1, cfg) == "standard"
+        # Unknown value falls back to the configured default.
+        state["slots"][s1]["pool"] = "bogus"
+        assert cus._slot_pool(state, s1, cfg) == "premium"
+    finally:
+        env.restore()
+
+
+def test_config_for_pool_disables_model_gate_for_standard():
+    cfg = _pool_config()
+    assert cfg["per_model_weekly"]["gate_enabled"] is True
+    prem = cus._config_for_pool(cfg, "premium")
+    std = cus._config_for_pool(cfg, "standard")
+    assert prem is cfg  # premium: unchanged object
+    assert std["per_model_weekly"]["gate_enabled"] is False
+    assert cfg["per_model_weekly"]["gate_enabled"] is True  # original untouched
+
+
+def test_premium_slot_swaps_off_model_exhausted_standard_holds():
+    # alpha's Fable week is at 98% (over the 97 cap) but aggregate is low.
+    # A PREMIUM slot on alpha must swap off it (hard-cap force-swap); a
+    # STANDARD slot on alpha must HOLD (model gate ignored, aggregate under cap).
+    env = _Env()
+    try:
+        s_prem = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 10.0, "current_7d_pct": 15.0,
+                                           "per_model_weekly_pct": {"Fable": 98.0}})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage_pm(10.0, 15.0, fable=98.0), "beta": _usage_pm(5.0, 10.0)}
+        cfg = _pool_config()
+
+        # Premium (default pool): swaps off alpha.
+        moves = cus.decide_slot_swaps(state, cfg, usage)
+        assert len(moves) == 1 and moves[0]["from"] == "alpha" and moves[0]["pool"] == "premium"
+        assert moves[0]["gate"] == "hard_7d_cap"
+
+        # Retag the slot standard: same numbers → HOLD.
+        state["slots"][s_prem]["pool"] = "standard"
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        assert cus.decide_slot_swaps(state, cfg, usage) == []
+    finally:
+        env.restore()
+
+
+def test_two_pools_same_account_decide_independently():
+    # Two live slots on alpha (Fable exhausted): one premium, one standard.
+    # The premium one moves, the standard one stays — proving (account, pool)
+    # grouping produces independent decisions in a single cycle.
+    env = _Env()
+    try:
+        s_prem = env.make_slot("alpha", live=True)
+        s_std = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["slots"][s_std]["pool"] = "standard"
+        state["accounts"]["alpha"].update({"current_5h_pct": 10.0, "current_7d_pct": 15.0,
+                                           "per_model_weekly_pct": {"Fable": 98.0}})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        usage = {"alpha": _usage_pm(10.0, 15.0, fable=98.0), "beta": _usage_pm(5.0, 10.0)}
+        moves = cus.decide_slot_swaps(state, _pool_config(), usage)
+        by_slot = {m["slot"]: m for m in moves}
+        assert set(by_slot) == {s_prem}, f"only the premium slot moves, got {list(by_slot)}"
+        assert by_slot[s_prem]["pool"] == "premium"
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_records_pool():
+    env = _Env()
+    try:
+        state = cus.load_state()
+        cfg = _config()
+        slot_name, _, acct = cus._launch_prepare("alpha", state, cfg, pool="standard")
+        fresh = cus.load_state()
+        assert fresh["slots"][slot_name]["pool"] == "standard"
+        # Default when unspecified = premium.
+        state2 = cus.load_state()
+        slot2, _, _ = cus._launch_prepare("beta", state2, cfg)
+        assert cus.load_state()["slots"][slot2]["pool"] == "premium"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
