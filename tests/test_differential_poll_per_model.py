@@ -127,6 +127,36 @@ def test_flat_config_polls_everyone_each_interval():
     assert not cus._account_poll_due(st, FLAT_CFG, "b")[0]
 
 
+def test_5h_rollover_forces_due_despite_slow_cadence():
+    """GH #59 composition (review amendment): _adaptive_sleep_seconds wakes
+    the daemon just after the soonest 5h reset SO THAT the reset account gets
+    repolled promptly. The due-gate must therefore treat 'window rolled over
+    since last poll' as due regardless of cadence class — otherwise the early
+    wake finds the account not-due, skips it, and the daemon flies on the
+    countdown-inferred 0% for up to a whole inactive interval."""
+    reset_at = NOW - timedelta(minutes=10)
+    st = _state(active="a", accounts={"a": {}, "b": {
+        "last_poll_ts": _iso(NOW - timedelta(minutes=20)),  # predates the reset
+        "five_hour_resets_at": _iso(reset_at),
+        "current_5h_pct": 96.0,
+    }})
+    due, why = cus._account_poll_due(st, DIFF_CFG, "b")
+    assert due and "5h window reset" in why
+
+
+def test_no_rollover_override_once_post_reset_state_observed():
+    # The last poll happened AFTER the reset, so the stored 0% is real —
+    # the slow inactive cadence applies again (no poll-storm after resets).
+    reset_at = NOW - timedelta(minutes=10)
+    st = _state(active="a", accounts={"a": {}, "b": {
+        "last_poll_ts": _iso(NOW - timedelta(minutes=5)),  # after the reset
+        "five_hour_resets_at": _iso(reset_at),
+        "current_5h_pct": 0.0,
+    }})
+    due, _ = cus._account_poll_due(st, DIFF_CFG, "b")
+    assert not due
+
+
 # --------------------------------------------------------------------------
 # _parse_per_model_weekly — API-shape parsing
 # --------------------------------------------------------------------------

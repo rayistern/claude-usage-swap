@@ -939,8 +939,19 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     cadence. Returns (due, human-readable reason).
 
     Due when the account has never been polled, its stored timestamp is
-    unparseable (fail-open — poll rather than starve observability), or at least
-    its class interval (`_account_poll_interval`) has elapsed since last_poll_ts.
+    unparseable (fail-open — poll rather than starve observability), its 5h
+    window has rolled over since the last poll (so the stored % is the stale
+    PRE-reset value), or at least its class interval (`_account_poll_interval`)
+    has elapsed since last_poll_ts.
+
+    The 5h-rollover override exists to compose with GH #59's adaptive repoll
+    (review amendment 2026-07-02): `_adaptive_sleep_seconds` deliberately
+    SHORTENS the daemon's inter-cycle sleep so it wakes just after the soonest
+    known 5h reset and repolls promptly. Without this override, that early wake
+    would find the reset account "not due" (elapsed < its class interval —
+    especially an INACTIVE account on the slow cadence) and skip the poll,
+    leaving the daemon running on the countdown-INFERRED 0% for up to a full
+    inactive interval and defeating the adaptive repoll entirely.
     """
     interval = _account_poll_interval(state, config, account_name)
     acct = state.get("accounts", {}).get(account_name, {})
@@ -951,8 +962,13 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
         last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return True, "unparseable last_poll_ts"
-    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
     role = "active" if state.get("active") == account_name else "inactive"
+    # GH #59 composition: a 5h window that reset AFTER our last poll means the
+    # stored usage is pre-reset garbage — poll now regardless of cadence class,
+    # so the adaptive early wake actually refreshes the account it woke for.
+    if _five_hour_rolled_since_poll(acct):
+        return True, f"5h window reset since last poll ({role}; GH #59 adaptive repoll)"
+    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
     if elapsed >= interval:
         return True, f"due ({role}: {elapsed:.0f}s >= {interval:.0f}s)"
     return False, f"{role}: {elapsed:.0f}s < {interval:.0f}s"
