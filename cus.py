@@ -1108,15 +1108,22 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     picker excludes the active account, but for a launch every account is a
     candidate.
 
-    Spreading: accounts already occupying a slot (or the global active, which
-    bare sessions burn) are excluded on the first pass so N sessions land on
-    N accounts; if that empties the pool, the second pass allows doubling up.
-    Final fallback (e.g. a strategy that can't handle the sentinel): lowest
-    estimated effective %.
+    Spreading: accounts on ANOTHER mount are excluded on the first pass so N
+    sessions land on N accounts. The fallback narrows to only LIVE-mount
+    accounts as the hard floor — an account on a live mount is NEVER returned
+    (two live mounts on one account rotate its single-use token and log one
+    out — GH #104), but an IDLE slot's account is fair game to reuse (no live
+    mount holds it). If even that leaves nothing, returns None so the caller
+    reports "all healthy accounts are in use" instead of double-booking.
     """
-    occupied = {e.get("account") for e in state.get("slots", {}).values() if e.get("account")}
+    # Spread preference: any account a slot entry names, plus the shared active.
+    spread_occupied = {e.get("account") for e in state.get("slots", {}).values() if e.get("account")}
     if state.get("active"):
-        occupied.add(state["active"])
+        spread_occupied.add(state["active"])
+    # Hard floor: accounts on a LIVE mount — never double-book these.
+    live_occupied = _live_slot_accounts(state)
+    if state.get("active") and mount_in_use(CLAUDE_DIR):
+        live_occupied.add(state["active"])
 
     def _try(excluded: set) -> SwapTarget | None:
         shim = dict(state)
@@ -1129,10 +1136,12 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         except Exception:
             return None
 
-    target = _try(occupied) or _try(set())
+    # First: spread across all mounts. Fallback: allow reusing idle-slot
+    # accounts, but still never a live-mount account.
+    target = _try(spread_occupied) or _try(live_occupied)
     if target is None:
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
-                 if not a.get("token_expired") and not a.get("poll_error")]
+                 if not a.get("token_expired") and not a.get("poll_error") and n not in live_occupied]
         if cands:
             n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
@@ -9893,7 +9902,7 @@ def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
 
 
 def _launch_prepare(account: str | None, state: dict, config: dict,
-                    pool: str | None = None) -> tuple[str, Path, str]:
+                    pool: str | None = None, force: bool = False) -> tuple[str, Path, str]:
     """Everything `cus launch` does BEFORE the exec: pick account, acquire +
     heal + sync a slot, install the account's credentials into it.
 
@@ -9914,11 +9923,27 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     if account in (None, "auto"):
         target = pick_launch_account(state, _config_for_pool(config, pool))
         if target is None:
-            raise click.ClickException("no launchable account (all expired/saturated?) — see `cus status` / `cus sos`")
+            raise click.ClickException(
+                "no launchable account: every account is already on a live mount, expired, or saturated "
+                "(GH #104 — won't double-book a live account). Exit a session, wait for a 5h/weekly reset, "
+                "or add an account. See `cus status` / `cus sos`.")
         account = target.name
         click.echo(f"launch: picked '{account}' ({target.reason})")
     elif account not in state.get("accounts", {}):
         raise click.ClickException(f"unknown account '{account}'. Known: {sorted(state.get('accounts', {}))}")
+
+    # Duplicate-mount guard (GH #104): refuse to launch onto an account already
+    # live on another mount (another slot, or the shared mount with live bare
+    # sessions) — the two would rotate each other's single-use refresh token
+    # and log one session out. `--force` overrides for the rare intentional case.
+    live_mount_accts = _live_slot_accounts(state)
+    if state.get("active") and mount_in_use(CLAUDE_DIR):
+        live_mount_accts.add(state["active"])
+    if account in live_mount_accts and not force:
+        raise click.ClickException(
+            f"'{account}' is already running on a live mount. Launching a second session on it would rotate "
+            f"its login token and sign one of them out (GH #104). Pick another account (or `cus launch auto`), "
+            f"or pass --force if you really want two sessions sharing '{account}'.")
 
     acct_state = state.get("accounts", {}).get(account, {})
     if acct_state.get("token_expired"):
@@ -9960,8 +9985,9 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
 @click.argument("account", required=False)
 @click.option("--pool", type=click.Choice(list(VALID_POOLS)), default=None,
               help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
+@click.option("--force", is_flag=True, help="Launch even onto an account already live on another mount (GH #104: normally refused — two live mounts on one account sign one out).")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
-def launch_cmd(account: str | None, pool: str | None, claude_args: tuple[str, ...]) -> None:
+def launch_cmd(account: str | None, pool: str | None, force: bool, claude_args: tuple[str, ...]) -> None:
     """Launch claude in its own slot, pinned to an account (per_session).
 
     ACCOUNT is an account name, or omitted/'auto' to pick the best by the
@@ -9975,10 +10001,13 @@ def launch_cmd(account: str | None, pool: str | None, claude_args: tuple[str, ..
     The session keeps its slot (and its pool) for life; the daemon moves
     ACCOUNTS through slots (in-place, no restart), never sessions. Optional
     alias to make every launch slotted:  alias claude='cus launch auto --'
+
+    An account already live on another mount is refused (GH #104) — it would
+    sign one of the two out; use `--force` to override, or `auto` to spread.
     """
     state = load_state()
     config = load_config()
-    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool)
+    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force)
     click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(slot_dir)

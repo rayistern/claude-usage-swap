@@ -551,6 +551,48 @@ def test_hybrid_never_double_books_an_account():
         env.restore()
 
 
+def test_pick_launch_account_never_picks_a_live_account():
+    # GH #104: even when a live-slot account is the lowest-usage (would-win)
+    # candidate, launch must not pick it — a second live mount on it signs one
+    # session out. alpha is on a live slot at 0%; beta is the lowest FREE one.
+    env = _Env()
+    try:
+        env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["active"] = None  # no bare shared session in this test
+        state["accounts"]["alpha"].update({"current_5h_pct": 0.0, "current_7d_pct": 0.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 20.0, "current_7d_pct": 20.0})
+        state["accounts"]["delta"].update({"current_5h_pct": 30.0, "current_7d_pct": 30.0})
+        cus.save_state(state)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        picked = cus.pick_launch_account(state, _config())
+        assert picked is not None and picked.name != "alpha", f"must not pick the live account; got {picked and picked.name}"
+        assert picked.name == "beta", f"expected lowest FREE account 'beta'; got {picked.name}"
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_refuses_explicit_live_account():
+    # GH #104: `cus launch alpha` when alpha is already on a live slot is
+    # refused (unless --force).
+    env = _Env()
+    try:
+        env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["active"] = None
+        cus.save_state(state)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        refused = False
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), _config())
+        except Exception as e:  # click.ClickException
+            refused = "already running on a live mount" in str(e)
+        assert refused, "launching an explicit already-live account must be refused"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
