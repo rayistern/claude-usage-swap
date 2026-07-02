@@ -117,6 +117,12 @@ cus rename <old> <new>        # rename an account (preserves config + history)
 # Locks
 cus pin <pane> <account>      # pin a tmux pane to an account (never swap)
 cus unpin <pane>              # remove pin
+cus lock <slot>               # freeze a SLOT's account (per_session/hybrid): never swapped or gc'd
+cus unlock <slot>             # remove a slot lock
+
+# Rotation-set pools (per_session/hybrid)
+cus pool <slot>               # show a slot's pool
+cus pool <slot> standard      # retag a slot: premium (honor per-model cap) vs standard (ignore it)
 
 # Low-level (rarely needed after `cus install`)
 cus init                      # re-discover + migrate accounts
@@ -172,6 +178,17 @@ Everything above describes `mode: global` (the default): one live mount (`~/.cla
 - When an account crosses its ladder step, the daemon runs the **same in-place two-file swap, scoped to that slot** — the session on top keeps running mid-conversation (no `/exit`, no `--resume`), and the other slots' caches are never touched.
 - The daemon **never writes `~/.claude/`** in this mode: bare `claude` launches keep working on whatever account it holds, observed and SOS-flagged but never swapped.
 - Enter/leave with `cus mode per-session` / `cus mode global` (validated, reversible — global-mode code paths are untouched). Optional alias so every launch is slotted: `alias claude='cus launch auto --'`.
+
+**Slot locks & rotation-set pools (per_session / hybrid):**
+
+- `cus lock <slot>` / `cus unlock <slot>` — freeze a slot so the daemon never swaps its account or gc's it (the slot-level counterpart of `cus pin`, which protects a *session* from hot-swap). Shown as `🔒locked` in `cus status`.
+- `cus pool <slot> [premium|standard]` (and `cus launch --pool <p>`) — put a slot in a rotation set. **premium** (default) honors the per-model weekly cap (`per_model_weekly.cap_pct`): the slot swaps off an account, and won't swap back, once a tracked model's week hits the cap. **standard** ignores the per-model cap (only aggregate 5h/7d + `hard_7d_cap` apply), so a model-exhausted account keeps serving standard-model work instead of stranding its aggregate headroom.
+
+### `mode: hybrid` — manage slots AND the shared mount together (2026-07-02)
+
+`global` ignores slots (they freeze on their account); `per_session` ignores bare sessions (observe-only). If a machine has **both** `cus launch` slots and plain `claude` sessions, use `hybrid`: each cycle the daemon moves slots individually (no restart) **and** swaps the shared `~/.claude/` mount for the bare sessions (they follow it together). Reactive 429s are partitioned from a single log read — a slotted session's 429 moves only its slot, a bare session's only the shared mount. Enter with `cus mode hybrid` (same validation as per_session); leave with `cus mode global`.
+
+> ⚠️ **Do not put the same account on the shared mount and a live slot at once** (e.g. `cus switch <acct>` where a slot already runs `<acct>`). OAuth refresh tokens are single-use and rotate; two live mounts on one account invalidate each other and one gets logged out (GH #104). Keep the shared-mount account distinct from every slot account.
 
 Details: `docs/plans/2026-07-02-per-session-accounts.md` (design + decision history) and the storage-roles inventory in `docs/ARCHITECTURE.md`.
 

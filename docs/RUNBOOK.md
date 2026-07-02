@@ -135,10 +135,26 @@ Added 2026-07-02 (plan: `docs/plans/2026-07-02-per-session-accounts.md`). Each s
 ```bash
 cus mode                 # show current mode
 cus mode per-session     # validate pool (doctor-heal + refresh-token check), create first slot, flip config
+cus mode hybrid          # like per-session, but ALSO swaps the shared ~/.claude/ mount for bare sessions (GH #99)
 cus mode global          # reap idle slots (creds saved back), flip config — restores today's exact behavior
 ```
 
 Both directions print what changed. `cus mode global` refuses while slot sessions are live (exit them, or `--force` to leave them running unmanaged).
+
+**Which mode?** `per_session` if every session is launched via `cus launch` (bare sessions are observe-only, never swapped). `hybrid` if you have a MIX of slotted and plain `claude` sessions and want both managed — slots move independently, bare sessions follow the shared-mount swap. `global` (default) if you don't use slots.
+
+> ⚠️ **Duplicate-mount hazard (GH #104):** never leave the same account live on the shared mount AND a slot (e.g. `cus switch <acct>` while a slot runs `<acct>`). Single-use OAuth refresh tokens rotate; the two mounts invalidate each other and one session gets logged out. Keep the shared-mount account distinct from every slot account. If it happens: move the shared mount to a free account with `cus switch <free>` (save-back preserves the valid token), then relaunch the affected slot session.
+
+### Slot locks & rotation-set pools
+
+```bash
+cus lock <slot>          # freeze a slot: daemon never swaps its account or gc's it (per_session/hybrid)
+cus unlock <slot>        # remove the lock
+cus pool <slot>          # show a slot's rotation-set pool
+cus pool <slot> standard # standard pool: ignore the per-model weekly cap (keep using model-exhausted accounts)
+cus pool <slot> premium  # premium pool (default): swap off an account when its tracked model hits per_model_weekly.cap_pct
+cus launch --pool standard auto   # launch straight into the standard pool
+```
 
 **Rollout note (429 budget):** N occupied accounts poll at the fast cadence — start with `polling.active_interval_seconds` relaxed (e.g. 300) and tighten only after a week of clean 429 logs. Do NOT shorten intervals to compensate for anything (2026-06-19 burnout).
 
