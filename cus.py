@@ -798,6 +798,58 @@ def update_backoff(acct: dict, success: bool, config: dict) -> None:
     acct["poll_backoff_until_ts"] = until.isoformat().replace("+00:00", "Z")
 
 
+def _account_poll_interval(state: dict, config: dict, account_name: str) -> float:
+    """Resolve the poll cadence (seconds) for one account under the differential
+    poll schedule (2026-07-02).
+
+    The ACTIVE account is polled on the fast `polling.active_interval_seconds`
+    cadence — it's the only account actually burning usage, so we want to catch
+    its ramp toward the swap threshold before it overshoots. INACTIVE accounts
+    are polled on the slow `polling.inactive_interval_seconds` cadence — they're
+    idle, needed only for swap-target selection, so a stale-ish reading is fine.
+
+    Both fall back to the legacy flat `poll_interval_seconds` when unset, so an
+    unmodified config keeps polling every account every cycle (backward-compat).
+
+    Why this exists: flat fast polling of all N accounts sends N requests per
+    interval to the per-IP-throttled /api/oauth/usage endpoint. On 2026-07-02,
+    flat 60s x 5 accounts dropped every account into 429 poll-backoff (cus went
+    blind). Fast-active / slow-inactive cuts the steady-state request rate to
+    ~1 per active-interval plus the occasional inactive refresh, keeping us well
+    under the throttle while polling the account that matters MORE often, not
+    less. See GH #84 for the burn-rate-adaptive evolution of the active cadence.
+    """
+    polling_cfg = config.get("polling", {})
+    flat = config.get("poll_interval_seconds", 300)
+    if state.get("active") == account_name:
+        return polling_cfg.get("active_interval_seconds") or flat
+    return polling_cfg.get("inactive_interval_seconds") or flat
+
+
+def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[bool, str]:
+    """Whether `account_name` is due for a poll this cycle under differential
+    cadence. Returns (due, human-readable reason).
+
+    Due when the account has never been polled, its stored timestamp is
+    unparseable (fail-open — poll rather than starve observability), or at least
+    its class interval (`_account_poll_interval`) has elapsed since last_poll_ts.
+    """
+    interval = _account_poll_interval(state, config, account_name)
+    acct = state.get("accounts", {}).get(account_name, {})
+    last = acct.get("last_poll_ts")
+    if not last:
+        return True, "no prior poll"
+    try:
+        last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return True, "unparseable last_poll_ts"
+    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+    role = "active" if state.get("active") == account_name else "inactive"
+    if elapsed >= interval:
+        return True, f"due ({role}: {elapsed:.0f}s >= {interval:.0f}s)"
+    return False, f"{role}: {elapsed:.0f}s < {interval:.0f}s"
+
+
 def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int | None]:
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
@@ -5330,15 +5382,34 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 execute_swap(reactive_decision.target, trigger="reactive-429")
             return
 
-        # 1. Poll — skip accounts currently in poll-backoff (per-account
-        # exponential delay after 429, to avoid prolonging the throttle).
+        # 1. Poll — differential cadence (2026-07-02): the ACTIVE account is
+        # polled fast (catch its usage ramp), inactive accounts slowly (they're
+        # idle, only needed for target selection). This keeps the per-IP-throttled
+        # /api/oauth/usage endpoint well under its burst limit while reacting
+        # quickly on the one account that's actually burning — see
+        # _account_poll_due / _account_poll_interval. Accounts in 429 poll-backoff
+        # are skipped regardless of cadence.
+        #
+        # Anti-burst stagger: when >1 account falls due in the same cycle (e.g.
+        # cold start, or two inactive intervals coinciding), space the successive
+        # HTTP polls by `polling.stagger_seconds` so they don't hit the per-IP
+        # throttle as a single burst. No delay before the first poll of a cycle.
         usage_by_account: dict[str, AccountUsage] = {}
+        stagger = config.get("polling", {}).get("stagger_seconds", 0) or 0
+        polled_this_cycle = 0
         for name in state["accounts"]:
             in_backoff, until = account_in_backoff(state, name)
             if in_backoff:
                 click.echo(f"  skip {name}: in poll-backoff until {until}")
                 continue
+            due, why = _account_poll_due(state, config, name)
+            if not due:
+                click.echo(f"  skip {name}: not due ({why})")
+                continue
+            if polled_this_cycle > 0 and stagger > 0:
+                time.sleep(stagger)
             usage_by_account[name] = poll_account_usage(name)
+            polled_this_cycle += 1
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
@@ -5460,8 +5531,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         return
 
     config = load_config()
-    interval = config.get("poll_interval_seconds", 300)
-    click.echo(f"daemon starting. poll_interval={interval}s. Ctrl-C to stop.")
+    # Loop tick = the fastest cadence (active-account interval) so the active
+    # account can actually be polled that often; per-account due-checks inside
+    # one_cycle() gate which accounts are polled each tick. Falls back to the
+    # flat poll_interval_seconds when the differential keys aren't set.
+    polling_cfg = config.get("polling", {})
+    flat = config.get("poll_interval_seconds", 300)
+    interval = polling_cfg.get("active_interval_seconds") or flat
+    inactive_interval = polling_cfg.get("inactive_interval_seconds") or flat
+    click.echo(f"daemon starting. tick={interval}s (active), "
+               f"inactive={inactive_interval}s. Ctrl-C to stop.")
     try:
         while True:
             try:
@@ -5516,7 +5595,8 @@ def hooks_list_cmd() -> None:
 
 CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
-    "poll_interval_seconds": "How often the daemon calls Anthropic's OAuth usage endpoint per account. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default.",
+    "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
+    "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
     "strategy": "Swap target picker — see docs/STRATEGIES.md. `smart` (recommended): hard 7d cap + burn-before-reset for 5h windows about to expire. `headroom`: weighted 5h+7d score with hard 7d cap. `lowest_usage`: cux balanced — sort by 7d util only. `drain`: deplete-current. `strict_priority`: priority order. `round_robin`: cycle by name.",
     "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
