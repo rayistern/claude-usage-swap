@@ -3702,6 +3702,32 @@ def _latest_stops_per_session() -> dict[str, str]:
     return result
 
 
+def _transcript_index() -> dict[str, Path]:
+    """One-shot {session_id: transcript_path} index of ~/.claude/projects.
+
+    GH #91: find_live_sessions used to call _find_transcript() per session,
+    whose fallback path globs EVERY project directory when the direct
+    cwd-encoded candidate is missing. With a sessions.log accumulated over
+    weeks (~13k unique ids, ~10.6k of them direct-path misses) against a
+    ~300-dir / ~11k-file projects tree, that multiplied into ~3M stat calls
+    — measured at 7.6 MINUTES on the 2026-07-02 incident box, which stalled
+    the daemon loop mid-swap exactly when observability mattered most.
+
+    A single glob("*/*.jsonl") walk visits each project dir once (~11k
+    entries, sub-second) and makes every per-session lookup O(1). Duplicate
+    session ids across project dirs are possible in principle (transcript
+    moved between cwds); last-seen wins, matching the old fallback's
+    "first glob hit" arbitrariness closely enough for liveness inference.
+    """
+    projects_root = CLAUDE_DIR / "projects"
+    index: dict[str, Path] = {}
+    if not projects_root.exists():
+        return index
+    for jsonl in projects_root.glob("*/*.jsonl"):
+        index[jsonl.stem] = jsonl
+    return index
+
+
 def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
     """Best-effort enumeration of live Claude Code sessions on this machine.
 
@@ -3715,6 +3741,7 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
     """
     entries = _parse_sessions_log()
     latest_stops = _latest_stops_per_session()
+    transcripts = _transcript_index()  # GH #91: one scan, O(1) per-session lookups
     now = datetime.now(timezone.utc)
 
     # Deduplicate by session_id (keep latest entry — newest registration wins
@@ -3740,7 +3767,10 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
             except ValueError:
                 pass
 
-        transcript = _find_transcript(sid, e.get("cwd", ""))
+        # GH #91: O(1) index lookup instead of _find_transcript(), whose
+        # glob fallback made this loop take minutes at sessions.log scale
+        # (see _transcript_index docstring for the incident numbers).
+        transcript = transcripts.get(sid)
         if transcript and transcript.exists():
             mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
             if (now - mtime).total_seconds() < 3600:
@@ -6483,14 +6513,36 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                f"inactive={inactive_interval}s. Ctrl-C to stop.")
     try:
         while True:
+            cycle_t0 = time.monotonic()
             try:
                 one_cycle()
             except Exception as e:
                 click.echo(f"ERROR in cycle: {type(e).__name__}: {e}", err=True)
+            cycle_secs = time.monotonic() - cycle_t0
             # GH #59: adaptive repoll — wake just after the soonest known 5h
             # reset (if sooner than the normal interval) to refresh real data
             # promptly instead of running on the countdown-inferred value.
-            time.sleep(_adaptive_sleep_seconds(load_state(), config, interval))
+            intended = _adaptive_sleep_seconds(load_state(), config, interval)
+            # GH #91 heartbeat: log cycle wall-clock + intended sleep every
+            # tick, so an inter-cycle gap in the log is attributable — a slow
+            # cycle body shows up in `took`, a deliberate long sleep in
+            # `sleeping`, and an oversleep (scheduler starvation / system
+            # suspend) in the post-sleep check below. The 2026-07-02 incident
+            # (11-min silent gap during a swap+burn) was undiagnosable for
+            # lack of exactly this line.
+            click.echo(f"[{now_iso()}] cycle end. took {cycle_secs:.1f}s; sleeping {intended:.0f}s")
+            if cycle_secs > interval:
+                click.echo(f"  WARNING: cycle body ({cycle_secs:.0f}s) exceeded "
+                           f"the {interval:.0f}s tick — in-cycle stall (GH #91)")
+            slept_t0 = time.monotonic()
+            time.sleep(intended)
+            overslept = time.monotonic() - slept_t0 - intended
+            # 30s slop: time.sleep() legitimately overshoots by scheduler
+            # jitter; only flag gaps big enough to mean starvation/suspend.
+            if overslept > 30:
+                click.echo(f"[{now_iso()}] WARNING: overslept by {overslept:.0f}s "
+                           f"(intended {intended:.0f}s) — scheduler starvation "
+                           f"or system suspend (GH #91)")
     except KeyboardInterrupt:
         click.echo("\ndaemon stopped.")
 
