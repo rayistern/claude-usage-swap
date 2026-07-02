@@ -160,6 +160,16 @@ USAGE_API_BETA = os.environ.get("CUS_USAGE_BETA", "oauth-2025-04-20")
 USAGE_API_TIMEOUT_SECONDS = 10
 USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 
+# OAuth token refresh (2026-07-02, token_self_refresh). UNDOCUMENTED endpoint —
+# extracted via `strings` on the installed @anthropic-ai/claude-code binary's
+# own OAuth client config (the `Tys` prod object), not a published API. It's
+# the exact request the `claude` CLI itself makes to silently refresh a
+# live account's access token every ~hour. Both overridable via env in case
+# Anthropic rotates either without notice; see _refresh_account_token.
+OAUTH_TOKEN_URL = os.environ.get("CUS_OAUTH_TOKEN_URL", "https://platform.claude.com/v1/oauth/token")
+OAUTH_CLIENT_ID = os.environ.get("CUS_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+OAUTH_REFRESH_TIMEOUT_SECONDS = 10
+
 
 # --------------------------------------------------------------------------
 # Defaults — everything overridable via config.yaml
@@ -342,6 +352,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "adaptive_repoll": True,
         "repoll_buffer_seconds": 20,
         "min_repoll_seconds": 30,
+    },
+    # token_self_refresh (2026-07-02, GH #13 follow-up): before flagging an
+    # inactive account token_stale, attempt a plain OAuth refresh_token grant
+    # against the same undocumented endpoint the `claude` CLI itself uses (see
+    # OAUTH_TOKEN_URL / _refresh_account_token). Costs no usage quota (a pure
+    # auth call, not an inference call) and creates no session. ANY failure —
+    # network, non-200, malformed response — falls straight through to the
+    # pre-existing token_stale flag; a successful refresh is a pure bonus,
+    # never a new failure mode. Set `enabled: false` to revert to the
+    # pre-2026-07-02 behavior (never talk to this endpoint) if Anthropic ever
+    # changes its shape and this starts erroring on every stale account.
+    "token_self_refresh": {
+        "enabled": True,
     },
     "subagent_skip": {
         "enabled": True,
@@ -1002,6 +1025,88 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
         return None, None
 
 
+def _refresh_account_token(account_name: str) -> bool:
+    """Best-effort OAuth refresh_token grant for an inactive account whose
+    stored access token has aged out (the token_stale condition, GH #13).
+
+    Talks to the SAME undocumented endpoint the `claude` CLI itself uses to
+    silently refresh a live account's token every ~hour — extracted
+    2026-07-02 via `strings` on the installed @anthropic-ai/claude-code
+    binary's own OAuth client config (OAUTH_TOKEN_URL / OAUTH_CLIENT_ID
+    above). It is NOT a published API. Costs no usage quota (a pure
+    token-mint call, not a `/v1/messages` inference call) and creates no
+    session — unlike spawning a real `claude` probe session, which was
+    considered and rejected for exactly those two reasons.
+
+    Returns True only on a CONFIRMED successful refresh (new access token
+    written back to the account's stored `.credentials.json`). Returns False
+    on ANY failure — disabled via `token_self_refresh.enabled`, missing or
+    unreadable creds, missing refresh token, network error, non-200, or a
+    malformed response. Callers MUST treat False as "fall back to the
+    pre-existing token_stale behavior", never as an error to surface —
+    Anthropic can change the client_id/URL/response shape without notice,
+    so silent, total fallback on any surprise is the only safe posture.
+    """
+    if not load_config().get("token_self_refresh", {}).get("enabled", True):
+        return False
+
+    creds_path = account_creds_path(account_name)
+    if not creds_path.exists():
+        return False
+    try:
+        creds = read_json(creds_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    refresh_token = oauth.get("refreshToken")
+    if not refresh_token:
+        return False
+
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+        "scope": " ".join(oauth.get("scopes") or []),
+    }).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "claude-usage-swap/0.1 (+https://github.com/rayistern/claude-usage-swap)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+            json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+    access_token = data.get("access_token")
+    expires_in = data.get("expires_in")
+    if not isinstance(access_token, str) or not access_token or not isinstance(expires_in, (int, float)):
+        return False
+
+    oauth["accessToken"] = access_token
+    oauth["refreshToken"] = data.get("refresh_token") or refresh_token
+    oauth["expiresAt"] = int(time.time() * 1000) + int(expires_in * 1000)
+    scope = data.get("scope")
+    if isinstance(scope, str) and scope:
+        oauth["scopes"] = scope.split(" ")
+    creds["claudeAiOauth"] = oauth
+
+    try:
+        backup_credentials_file(creds_path)
+        write_json(creds_path, creds, mode=0o600)
+    except OSError:
+        return False
+    return True
+
+
 def poll_account_usage(account_name: str) -> AccountUsage:
     """Query the Anthropic OAuth usage endpoint for one account.
 
@@ -1020,6 +1125,12 @@ def poll_account_usage(account_name: str) -> AccountUsage:
     out (>1 hour since the last swap-to-this-account), because we wrote
     the access token to storage at swap-time but only the LIVE creds file
     gets the periodic refresh.
+
+    2026-07-02 (token_self_refresh): before falling back to token_stale, try
+    a self-refresh via _refresh_account_token. On success this re-reads a
+    fresh token/expiry and falls through to the normal HTTP poll below,
+    exactly as if the account had never gone stale. On any failure it's
+    unchanged from the pre-2026-07-02 behavior.
     """
     token, expires_at = _read_access_token_with_expiry(account_name)
     if not token:
@@ -1038,13 +1149,17 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             now_ms = int(time.time() * 1000)
             # 30s grace — don't fire on tokens that are about to expire mid-flight
             if int(expires_at) < now_ms - 30_000:
-                u = AccountUsage.empty()
-                u.token_stale = True
-                u.raw = {
-                    "error": "stored access token expired (refresh token still valid)",
-                    "expired_minutes_ago": (now_ms - int(expires_at)) // 60_000,
-                }
-                return u
+                stale_expires_at = expires_at
+                if _refresh_account_token(account_name):
+                    token, expires_at = _read_access_token_with_expiry(account_name)
+                if not token or expires_at is None or int(expires_at) < now_ms - 30_000:
+                    u = AccountUsage.empty()
+                    u.token_stale = True
+                    u.raw = {
+                        "error": "stored access token expired (refresh token still valid)",
+                        "expired_minutes_ago": (now_ms - int(stale_expires_at)) // 60_000,
+                    }
+                    return u
         except (TypeError, ValueError):
             pass
 
@@ -6544,6 +6659,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
     "lazy_swap": "Cache-aware lazy background swap (GH #56). Consulted ONLY when `hot_swap.enabled` is false. A background swap never interrupts a session; its only cost is a one-time prompt-cache rebuild on the live sessions that migrate. So `enabled: true` (default) DEFERS a non-urgent swap (ladder below saturation, burn-before-reset) while any live session's last activity is younger than `cache_window_seconds: 300` (≈ Anthropic's prompt-cache TTL) — it re-fires once the cache is cold (free) or the swap turns urgent. Urgent swaps (hard 7d cap, 5h saturation, reactive 429) are never deferred. Set `enabled: false` to swap immediately on every ladder trip (old behavior). Inspect deferrals with `cus decisions`.",
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
+    "token_self_refresh": "OAuth self-refresh for `token_stale` accounts (2026-07-02, GH #13 follow-up). `enabled: true` (default): before flagging an inactive account token_stale, POST a refresh_token grant to the same undocumented endpoint the `claude` CLI itself uses (extracted from the installed binary — not a published API). Costs no usage quota and creates no session, unlike spawning a real `claude` probe session would. Any failure (network, non-200, malformed response) falls straight through to the pre-existing token_stale flag. Set `enabled: false` to revert to never talking to this endpoint, e.g. if Anthropic changes its shape and it starts erroring.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` folds the highest tracked per-model weekly % into the weekly-cap logic: force-swap the active account when a model's week is exhausted, and never pick a swap target whose model-week is at/above `hard_7d_cap_pct`. `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
