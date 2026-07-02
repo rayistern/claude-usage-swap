@@ -5679,6 +5679,7 @@ def status() -> None:
 
     state = read_json(STATE_JSON)
     config = load_config()
+    color_on = sys.stdout.isatty()
     click.echo(f"Active account: {state['active']}")
     click.echo()
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
@@ -5706,7 +5707,7 @@ def status() -> None:
             if est - polled >= 1.0:
                 rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
                 est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct')} {_fmt_pct(a, 'current_7d_pct')} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
         # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
         # sub-line only for accounts that have any, sorted highest-first so a
         # model nearing its own weekly cap is the first thing the eye lands on.
@@ -6654,40 +6655,69 @@ def unpin(pane_or_session: str) -> None:
         click.echo(f"{pane_or_session} was not pinned")
 
 
-def _pct_is_unknown(acct: dict) -> bool:
-    """Return True when an account's stored current_*_pct should not be displayed.
+def _pct_is_unknown(acct: dict, key: str | None = None) -> bool:
+    """Return True when `key`'s stored current_*_pct should not be displayed.
 
-    The percentages get displayed as "?" instead of a number when ANY of the
+    The percentage gets displayed as "?" instead of a number when ANY of the
     blocker flags is set, because we don't actually have current data — what's
     stored is last-known-good which may be hours old.
 
-    `token_stale` is included because when the stored access token has aged out
-    we skip the poll entirely and preserve the prior `current_*_pct` values.
-    Across a 5h reset boundary that preserved value silently lies — e.g. a
-    pre-stale 100% gets surfaced as `5h:100%` even after the window has reset
-    to zero. Treating token_stale as unknown surfaces `?` until the account is
-    actually used and the refresh-token-driven mint refreshes our data.
+    `rate_limited` / `token_expired` / `poll_error` always count as unknown,
+    for any key.
+
+    `token_stale` is special-cased per-window:
+      - `current_5h_pct` is treated as KNOWN (not unknown) under token_stale
+        alone. GH #59's reset-inference (`_five_hour_rolled_since_poll` /
+        `_apply_countdown_reset_inference`) already corrects `current_5h_pct`
+        across a 5h reset boundary independent of polling — that inference
+        runs every daemon cycle regardless of token_stale — so the preserved
+        value is safe to surface (see `_pct_is_stale_known`, which callers
+        use to decide whether to mark it as not-yet-reconfirmed).
+      - `current_7d_pct` (and an unspecified/None key) stays unknown under
+        token_stale. There is no equivalent reset-inference for the 7-day
+        window, so a preserved value could silently lie across a week
+        boundary — e.g. a pre-stale 95% surfaced as `7d:95%` after the week
+        actually rolled over to ~0. Keep showing "?" there until a real poll
+        reconfirms it.
 
     Shows "?" rather than the buggy "0.0" sentinel (or stale numbers) per the
     2026-05-20 user feedback: 0% implied "no usage" which was equally
     misleading as 100% from the prior sentinel bug.
     """
-    return bool(
-        acct.get("rate_limited")
-        or acct.get("token_expired")
-        or acct.get("poll_error")
-        or acct.get("token_stale")
-    )
+    if acct.get("rate_limited") or acct.get("token_expired") or acct.get("poll_error"):
+        return True
+    if acct.get("token_stale"):
+        return key != "current_5h_pct"
+    return False
 
 
-def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1) -> str:
-    """Format a percentage for display, returning '?' if stale.
+def _pct_is_stale_known(acct: dict, key: str) -> bool:
+    """True when `key`'s value is last-known-good but NOT reconfirmed by a live poll.
+
+    Only ever true for `current_5h_pct` under `token_stale` (with no other
+    blocking flag) — see `_pct_is_unknown`'s docstring for why 5h, but not
+    7d, is safe to surface this way. Callers use this to mark the number
+    (dim styling / trailing `~`) instead of showing it identically to a
+    freshly-polled value.
+    """
+    return key == "current_5h_pct" and bool(acct.get("token_stale")) and not _pct_is_unknown(acct, key)
+
+
+def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool = False) -> str:
+    """Format a percentage for display, returning '?' if unknown.
 
     Use this in any user-facing output of current_5h_pct or current_7d_pct.
+    When the value is last-known-but-unvalidated (`_pct_is_stale_known`),
+    appends a trailing `~` (and dims it if `color_on`) so it reads as
+    "not reconfirmed" rather than a normal fresh reading.
     """
-    if _pct_is_unknown(acct):
+    if _pct_is_unknown(acct, key):
         return f"{'?':>{width}}"
     val = acct.get(key, 0.0)
+    if _pct_is_stale_known(acct, key):
+        raw = f"{val:.{prec}f}~"
+        padded = f"{raw:>{width}}"
+        return click.style(padded, dim=True) if color_on else padded
     return f"{val:>{width}.{prec}f}"
 
 
@@ -6857,6 +6887,19 @@ def _sl_pct(value: float, nxt: float, on: bool) -> str:
     if value >= nxt * 0.8:
         return click.style(txt, fg="yellow")
     return click.style(txt, fg="green")
+
+
+def _sl_mark_stale(txt: str, color_on: bool) -> str:
+    """Mark a last-known (not-yet-reconfirmed) percentage: dim + trailing '~'.
+
+    Used for `current_5h_pct` under `token_stale` (see `_pct_is_stale_known`).
+    Deliberately skips `_sl_pct`'s proximity coloring (red/yellow/green) —
+    the point here is "this number hasn't been reconfirmed by a live poll",
+    not "how close is it to the swap threshold". The trailing '~' carries
+    that meaning even with NO_COLOR or a non-color terminal.
+    """
+    marked = f"{txt}~"
+    return click.style(marked, dim=True) if color_on else marked
 
 
 def _sl_rolled_5h_label(acct: dict, current_pct: float, color_on: bool) -> str:
@@ -7034,8 +7077,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     nxt_lbl = (lambda n: click.style(f"nxt:{n}%", dim=True) if color_on else f"nxt:{n}%")
 
     if not is_verbose:
-        # Compact mode. Render "?" if we don't have reliable data.
-        if _pct_is_unknown(acct):
+        # Compact mode. Render "?" per-window when we don't have reliable data
+        # for that window — 5h and 7d are judged independently (see
+        # _pct_is_unknown: token_stale alone leaves 5h displayable but 7d
+        # still unknown).
+        unknown5 = _pct_is_unknown(acct, "current_5h_pct")
+        unknown7 = _pct_is_unknown(acct, "current_7d_pct")
+        if unknown5 and unknown7:
             pin_bit = f" {pin_lbl}" if pin_lbl else ""
             click.echo(f"cus:{active_lbl}{pin_bit} 5h:? 7d:? {nxt_lbl(nx)} · {render_stamp}", color=color_on)
             return
@@ -7045,21 +7093,35 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         # poll interval of showing e.g. 96% on a window that actually reset to
         # ~0). Compact is the DEFAULT rendering, so before this it was the one
         # place the stale number still showed bare.
-        rolled5 = _five_hour_rolled_since_poll(acct)
-        if rolled5:
-            fh_piece = _sl_rolled_5h_label(acct, fh, color_on)
-            # The stale % must not drive the near-swap-point marker either —
-            # the window just reset, so its real contribution is ~0. (If the
-            # daemon's countdown inference already zeroed current_5h_pct this
-            # is a no-op; this covers renders before that cycle runs.)
+        if unknown5:
+            fh_piece = "5h:?"
             marker_fh = 0.0
         else:
-            fh_piece = f"5h:{_sl_pct(fh, nx, color_on)}"
-            marker_fh = fh
+            rolled5 = _five_hour_rolled_since_poll(acct)
+            if rolled5:
+                fh_piece = _sl_rolled_5h_label(acct, fh, color_on)
+                # The stale % must not drive the near-swap-point marker either —
+                # the window just reset, so its real contribution is ~0. (If the
+                # daemon's countdown inference already zeroed current_5h_pct this
+                # is a no-op; this covers renders before that cycle runs.)
+                marker_fh = 0.0
+            elif _pct_is_stale_known(acct, "current_5h_pct"):
+                # token_stale but not rolled: show the last-known 5h value,
+                # marked as not-yet-reconfirmed, instead of hiding it or
+                # showing it identically to a fresh poll.
+                fh_piece = f"5h:{_sl_mark_stale(f'{fh:.0f}%', color_on)}"
+                marker_fh = fh
+            else:
+                fh_piece = f"5h:{_sl_pct(fh, nx, color_on)}"
+                marker_fh = fh
+        # A masked (unknown) 7d value doesn't feed the near-swap-point marker —
+        # we have no reset-inference for the 7-day window (unlike 5h above),
+        # so a preserved pre-boundary number could falsely trip the warning.
+        marker_sd = 0.0 if unknown7 else sd
         flag_marker = ""
-        if max(marker_fh, sd) >= nx:
+        if max(marker_fh, marker_sd) >= nx:
             flag_marker = "⚠"
-        elif max(marker_fh, sd) >= nx * 0.8:
+        elif max(marker_fh, marker_sd) >= nx * 0.8:
             flag_marker = "·"
         prefix_bits = [f"cus:{active_lbl}"]
         if pin_lbl:
@@ -7083,8 +7145,9 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 poll_part = f" ({_fmt_duration(remaining)} to poll)"
             else:
                 poll_part = " (poll due)"
+        sd_piece = "7d:?" if unknown7 else f"7d:{_sl_pct(sd, nx, color_on)}"
         click.echo(
-            f"{prefix} {fh_piece} 7d:{_sl_pct(sd, nx, color_on)} "
+            f"{prefix} {fh_piece} {sd_piece} "
             f"{nxt_lbl(nx)}{poll_part} · {render_stamp}",
             color=color_on,
         )
@@ -7107,12 +7170,19 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         h5 = a.get("current_5h_pct", 0)
         h7 = a.get("current_7d_pct", 0)
         nxt = a.get("next_swap_at_pct", 50)
-        unknown = _pct_is_unknown(a)
+        # 5h and 7d are judged independently — token_stale alone leaves 5h
+        # displayable (GH #59 reset-inference keeps it honest across a
+        # reset boundary) but 7d still unknown (no equivalent inference).
+        unknown5 = _pct_is_unknown(a, "current_5h_pct")
+        unknown7 = _pct_is_unknown(a, "current_7d_pct")
+        stale5 = _pct_is_stale_known(a, "current_5h_pct")
         flags = []
         if a.get("token_expired"):
             flags.append("EXP")
         if a.get("rate_limited"):
             flags.append("429")
+        if a.get("token_stale"):
+            flags.append("STALE")
         flag_str = "(" + ",".join(flags) + ")" if flags else ""
         marker = "*" if is_active else ""
         # GH #38: bold-cyan the active account; dim the others so the eye lands
@@ -7121,15 +7191,22 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         if color_on:
             name_lbl = click.style(name_lbl, fg="cyan", bold=True) if is_active else click.style(name_lbl, dim=True)
         parts = [name_lbl]
-        pct5 = "?" if unknown else _sl_pct(h5, nxt, color_on)
-        pct7 = "?" if unknown else _sl_pct(h7, nxt, color_on)
+        if unknown5:
+            pct5 = "?"
+        elif stale5:
+            # token_stale but not rolled: last-known 5h value, marked as
+            # not-yet-reconfirmed rather than shown identically to a fresh poll.
+            pct5 = _sl_mark_stale(f"{h5:.0f}%", color_on)
+        else:
+            pct5 = _sl_pct(h5, nxt, color_on)
+        pct7 = "?" if unknown7 else _sl_pct(h7, nxt, color_on)
         if show_resets:
             r5 = _time_until(a.get("five_hour_resets_at"))
             r7 = _time_until(a.get("seven_day_resets_at"))
-            r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown else ""
+            r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown7 else ""
             r7_str = click.style(r7_raw, dim=True) if color_on and r7_raw else r7_raw
             rolled5 = _five_hour_rolled_since_poll(a)
-            if rolled5 and not unknown:
+            if rolled5 and not unknown5:
                 # GH #59: the live countdown has elapsed — the 5h window rolled
                 # over since our last poll, so the displayed % is pre-reset
                 # stale. Flag it (↻reset, was X%) rather than showing the stale
@@ -7138,7 +7215,7 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
                 # Rendering shared with compact mode via _sl_rolled_5h_label.
                 parts.append(_sl_rolled_5h_label(a, h5, color_on))
             else:
-                r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown else ""
+                r5_raw = f"·{_fmt_duration(r5)}" if r5 is not None and r5 > 0 and not unknown5 else ""
                 # Time left on the ACTIVE account's 5h clock is the key operational
                 # number — it's the runway on the account you're actually using AND
                 # what the burn-before-reset trigger (GH #42) keys on — so make it

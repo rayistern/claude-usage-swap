@@ -128,14 +128,33 @@ def test_compact_normal_pct_when_not_rolled():
         env.restore()
 
 
-def test_compact_unknown_data_still_renders_question_marks():
-    """token_stale etc. → the '?' early-return stays in charge; a rolled
-    window with unreliable data must not fabricate a 'was X%' claim."""
-    env = _StatuslineEnv(_rolled_acct(token_stale=True))
+def test_compact_hard_blocker_still_renders_question_marks():
+    """A hard blocker (rate_limited/token_expired/poll_error) still forces
+    the blanket '?' early-return; a rolled window with truly unreliable data
+    must not fabricate a 'was X%' claim. (token_stale ALONE no longer
+    qualifies as a hard blocker for 5h — see
+    test_compact_token_stale_5h_still_shows_rollover_badge below.)"""
+    env = _StatuslineEnv(_rolled_acct(rate_limited=True))
     try:
         out = CliRunner().invoke(cus.statusline_cmd, ["--compact"]).output
         assert "5h:?" in out
         assert "↻reset" not in out
+    finally:
+        env.restore()
+
+
+def test_compact_token_stale_5h_still_shows_rollover_badge():
+    """token_stale alone no longer blanks 5h. GH #59's reset-inference
+    (`_five_hour_rolled_since_poll`) corrects `current_5h_pct` across a reset
+    boundary independent of whether polling itself succeeded, so a
+    token_stale account whose 5h window has rolled still gets the honest
+    ↻reset(was X%) badge rather than a stale bare number OR a blanket '?'.
+    7d has no equivalent reset-inference and must stay '?'."""
+    env = _StatuslineEnv(_rolled_acct(token_stale=True))
+    try:
+        out = CliRunner().invoke(cus.statusline_cmd, ["--compact"]).output
+        assert "5h:↻reset(was 96%)" in out
+        assert "7d:?" in out
     finally:
         env.restore()
 
