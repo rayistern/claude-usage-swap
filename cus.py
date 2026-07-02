@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -236,6 +237,47 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # every session, nothing to segment). Set per slot via
         # `cus launch --pool <p>` or `cus pool <slot> <p>`.
         "default_pool": "premium",
+        # GH #109 lanes: when true, `cus launch <account>` JOINS the live mount
+        # already holding that account (multiple sessions share one config dir /
+        # login and swap together) instead of allocating a fresh slot. This is
+        # the no-extra-login path: one account lives on one lane, seeded from the
+        # login it already has. The one-account-per-live-mount invariant (#104)
+        # still holds — lanes SATISFY it by sharing rather than copying. Default
+        # off keeps today's 1-session-per-slot behavior. To run one account on
+        # two INDEPENDENTLY-swappable lanes instead of sharing, use the
+        # independent-login escape hatch (independent_logins, below).
+        "lane_sharing": False,
+    },
+    # GH #109: per-(slot, account) independent-login store.
+    #
+    # Today a slot's live .credentials.json is a COPY of one account's canonical
+    # snapshot (execute_swap -> atomic_copy(account-<name>/.credentials.json)).
+    # Anthropic rotates the OAuth refresh token on every ~hourly refresh, so two
+    # live mounts seeded from the same snapshot diverge and one gets its refresh
+    # token blanked — the #104/#103/#3 clobber family. The #109 experiment
+    # (2026-07-02) proved two INDEPENDENT `/login` flows for the SAME account
+    # yield two independent refresh-token families that don't invalidate each
+    # other, so one account can safely back multiple live mounts if each mount
+    # uses its own independent login.
+    #
+    # Phase 1 (shipped) is ADDITIVE: the on-disk store, the `cus login-mount`
+    # provisioning command, and status/sos surfacing. `use_independent_logins`
+    # is the Phase 2 gate — when OFF (default) the swap path is bit-for-bit the
+    # copy path we ship today; when ON, execute_swap prefers a stored
+    # independent login for the (slot, account) pair and only falls back to the
+    # shared-snapshot copy when no login is provisioned. Kept OFF until the
+    # store is populated and Phase 2's swap-path change lands (backward-compat
+    # per the non-breaking-by-default rule).
+    "independent_logins": {
+        "use_independent_logins": False,
+        # Assumed OAuth refresh-token lifetime. UNCONFIRMED — the #109 Phase 0
+        # to-CONFIRM list still owes a measured idle-expiry number; 30 days is
+        # the community-reported figure and only drives the sos near-expiry
+        # nudge, never a hard action. Revise once Phase 0 measures it.
+        "refresh_token_ttl_days": 30,
+        # sos warns this many days before a provisioned login's assumed expiry
+        # so the operator can re-login before a swap would fall back to a copy.
+        "warn_expiry_within_days": 5,
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -995,6 +1037,338 @@ def list_slot_dirs() -> list[Path]:
         except ValueError:
             return 1 << 30  # non-numeric suffix sorts last, still listed
     return sorted((p for p in ACCOUNTS_DIR.glob(SLOT_PREFIX + "*") if p.is_dir()), key=_idx)
+
+
+# --------------------------------------------------------------------------
+# Per-(slot, account) independent-login store (GH #109, 2026-07-02)
+# --------------------------------------------------------------------------
+# See DEFAULT_CONFIG["independent_logins"] for the WHY. In short: a slot's live
+# creds are today a copy of one account snapshot, and copies of one refresh-token
+# family clobber each other on rotation (#104/#103/#3). This store holds an
+# INDEPENDENT `/login` per (account, slot) so the same account can back several
+# live mounts without a shared token family to clobber.
+#
+# Layout: ~/claude-accounts/logins/<account>/<slot>/
+#     .credentials.json  — the independent OAuth blob (what Phase 2 installs
+#                          into the slot instead of the shared-snapshot copy)
+#     .claude.json       — identity `/login` wrote here; used to verify the
+#                          login landed on the RIGHT account (duplicate-identity
+#                          failure mode, 2026-07-01) and to fingerprint expiry
+#     provenance.json    — {account, slot, minted_ts, source_email, refresh_fp}
+#
+# Everything here is READ-ONLY with respect to the swap path in Phase 1 — it is
+# populated by `cus login-mount` and consumed only by status/sos. The swap path
+# (execute_swap) is unchanged until the Phase 2 gate flips (see the seam comment
+# at the target-creds install in _execute_swap_locked).
+
+LOGIN_STORE_DIRNAME = "logins"
+
+
+def login_store_root() -> Path:
+    """Root of the per-(slot, account) independent-login store."""
+    return ACCOUNTS_DIR / LOGIN_STORE_DIRNAME
+
+
+def login_store_dir(account: str, slot: str) -> Path:
+    """Dir holding one (account, slot) pair's independent login."""
+    return login_store_root() / account / slot
+
+
+def login_store_creds_path(account: str, slot: str) -> Path:
+    return login_store_dir(account, slot) / ".credentials.json"
+
+
+def login_store_cj_path(account: str, slot: str) -> Path:
+    return login_store_dir(account, slot) / ".claude.json"
+
+
+def login_store_provenance_path(account: str, slot: str) -> Path:
+    return login_store_dir(account, slot) / "provenance.json"
+
+
+def _credential_refresh_token(creds: Any) -> str | None:
+    """Refresh token out of a parsed credentials blob, or None.
+
+    Mirrors the defensive extraction in classify_live_creds_owner: any process
+    can scribble a list/string/number where a dict is expected, so never assume
+    dict shape."""
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    rt = oauth.get("refreshToken") if isinstance(oauth, dict) else None
+    return rt if isinstance(rt, str) and rt else None
+
+
+def _refresh_fingerprint(refresh_token: str) -> str:
+    """Short, non-reversible fingerprint of a refresh token for provenance.
+
+    We record a fingerprint rather than the token itself so provenance.json is
+    safe to read/diff/log while still letting us tell two independent login
+    families apart (the whole point of #109 is that they MUST differ). Twelve
+    hex chars of SHA-256 is ample to distinguish a handful of logins without
+    being a credential."""
+    return "sha256:" + hashlib.sha256(refresh_token.encode()).hexdigest()[:12]
+
+
+def has_independent_login(account: str, slot: str) -> bool:
+    """True iff a usable independent login exists for this (account, slot).
+
+    "Usable" = the creds file parses and carries a refresh token; an
+    access-token-only or logout-shaped file is treated as absent (it cannot
+    seed a swap — same reasoning as classify_live_creds_owner's "invalid")."""
+    path = login_store_creds_path(account, slot)
+    if not path.exists():
+        return False
+    try:
+        return _credential_refresh_token(read_json(path)) is not None
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def read_login_provenance(account: str, slot: str) -> dict | None:
+    """Provenance record for a provisioned login, or None if unreadable."""
+    path = login_store_provenance_path(account, slot)
+    if not path.exists():
+        return None
+    try:
+        prov = read_json(path)
+        return prov if isinstance(prov, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def login_store_identity(account: str, slot: str) -> dict:
+    """Identity facets (email/uuid/userID) recorded by `/login` in the store
+    dir's .claude.json — used to verify the login landed on the right account."""
+    path = login_store_cj_path(account, slot)
+    if not path.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(path))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def account_canonical_identity(account: str) -> dict:
+    """Identity facets from an account's canonical snapshot .claude.json.
+
+    Reads oauthAccount straight from account-<name>/.claude.json rather than
+    meta.yaml's oauth_email: the 2026-07-01 duplicate-identity incident showed
+    meta.yaml can lie while .claude.json's oauthAccount is authoritative."""
+    path = ACCOUNTS_DIR / f"account-{account}" / ".claude.json"
+    if not path.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(path))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def scaffold_login_store_dir(account: str, slot: str) -> Path:
+    """Create (idempotently) a minimum-viable CLAUDE_CONFIG_DIR to `/login`
+    into for this (account, slot) pair, and return it.
+
+    Mirrors `cus add`'s account-dir scaffold — empty .claude.json (so onboarding
+    doesn't fight the login flow) plus the shared symlinks — because that scaffold
+    is the proven-working target for an interactive login. Credentials land at
+    <dir>/.credentials.json (a real file, never a symlink), which IS the store
+    entry, so there is no separate capture/copy step to drift."""
+    dst = login_store_dir(account, slot)
+    dst.mkdir(parents=True, exist_ok=True)
+    if not (dst / ".claude.json").exists():
+        write_json(dst / ".claude.json", {})
+    for sub in SHARED_SYMLINK_SUBDIRS:
+        link = dst / sub
+        target = CLAUDE_DIR / sub
+        if target.exists() and not link.exists():
+            link.symlink_to(target)
+    return dst
+
+
+def write_login_provenance(account: str, slot: str, source_email: str | None,
+                           bootstrapped: bool = False) -> dict:
+    """Record provenance for a provisioned login and return it.
+
+    Called by `cus login-mount --finish` (after verifying a valid, right-account
+    interactive login) and by `--from-existing` (bootstrap from the snapshot).
+    Fingerprints the refresh token so later reads can tell families apart
+    without re-storing the secret. `bootstrapped=True` marks an entry that is a
+    COPY of the account's snapshot family (not an independent login) — only
+    clobber-safe as the SOLE live mount for that account; a second mount of the
+    same account must be a real `/login`."""
+    creds = read_json(login_store_creds_path(account, slot))
+    rt = _credential_refresh_token(creds)
+    prov = {
+        "account": account,
+        "slot": slot,
+        "minted_ts": now_iso(),
+        "source_email": source_email or "unknown",
+        "refresh_fp": _refresh_fingerprint(rt) if rt else None,
+        "bootstrapped": bootstrapped,
+    }
+    write_json(login_store_provenance_path(account, slot), prov)
+    return prov
+
+
+def duplicate_login_families() -> list[dict]:
+    """Store entries whose refresh-token fingerprint is shared by MORE THAN ONE
+    (account, slot) pair — i.e. the SAME token family installed on two mounts.
+
+    This is the precise failure this whole feature exists to prevent: two live
+    mounts sharing one refresh-token family clobber on rotation. It happens if
+    an account is bootstrapped (`--from-existing`) onto two slots, or a store
+    entry is hand-copied. Returns one dict per offending fingerprint:
+    {refresh_fp, pairs: ["slot->account", ...]}."""
+    by_fp: dict[str, list[str]] = {}
+    for rec in list_provisioned_logins():
+        prov = rec.get("provenance") or {}
+        fp = prov.get("refresh_fp")
+        if fp:
+            by_fp.setdefault(fp, []).append(f"{rec['slot']}->{rec['account']}")
+    return [{"refresh_fp": fp, "pairs": sorted(pairs)}
+            for fp, pairs in by_fp.items() if len(pairs) > 1]
+
+
+def login_age_days(account: str, slot: str) -> float | None:
+    """Days since this login was minted (per provenance), or None if unknown."""
+    prov = read_login_provenance(account, slot)
+    minted = prov.get("minted_ts") if prov else None
+    if not minted:
+        return None
+    try:
+        minted_dt = datetime.fromisoformat(minted.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - minted_dt).total_seconds() / 86400.0
+
+
+def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, float | None]:
+    """Classify a provisioned login's freshness against the ASSUMED refresh-token
+    lifetime. Returns (state, days_left) where state is one of:
+      "ok"      — comfortably within lifetime
+      "near"    — within warn_expiry_within_days of assumed expiry
+      "expired" — past the assumed lifetime (a swap would fall back to a copy)
+      "unknown" — no provenance timestamp to judge by
+
+    The lifetime is a config assumption (refresh_token_ttl_days), NOT a measured
+    fact — #109 Phase 0 still owes the real number. This only drives a soft sos
+    nudge, never a hard action, so an over/under-estimate degrades gracefully."""
+    cfg = config.get("independent_logins", {}) if isinstance(config, dict) else {}
+    ttl = cfg.get("refresh_token_ttl_days", 30)
+    warn_within = cfg.get("warn_expiry_within_days", 5)
+    age = login_age_days(account, slot)
+    if age is None:
+        return ("unknown", None)
+    days_left = ttl - age
+    if days_left <= 0:
+        return ("expired", days_left)
+    if days_left <= warn_within:
+        return ("near", days_left)
+    return ("ok", days_left)
+
+
+def list_provisioned_logins() -> list[dict]:
+    """Enumerate every (account, slot) pair with a store dir on disk.
+
+    Returns dicts with account, slot, has_login (usable creds present), the
+    provenance record (if any), and the identity email `/login` recorded — the
+    raw material for status/sos surfacing. Sorted by (account, slot index)."""
+    root = login_store_root()
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for account_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        account = account_dir.name
+        for slot_d in sorted(p for p in account_dir.iterdir() if p.is_dir()):
+            slot = slot_d.name
+            ident = login_store_identity(account, slot)
+            out.append({
+                "account": account,
+                "slot": slot,
+                "has_login": has_independent_login(account, slot),
+                "provenance": read_login_provenance(account, slot),
+                "identity_email": ident.get("emailAddress"),
+            })
+    def _sort_key(rec: dict) -> tuple:
+        try:
+            idx = int(rec["slot"].removeprefix(SLOT_PREFIX))
+        except ValueError:
+            idx = 1 << 30
+        return (rec["account"], idx)
+    return sorted(out, key=_sort_key)
+
+
+def _slots_missing_logins(state: dict) -> list[tuple[str, str]]:
+    """(slot, account) pairs where the slot currently holds an account but has
+    NO independent login provisioned — the lazy-provisioning to-do list.
+
+    Under the Phase 2 gate, each such pair would fall back to the shared-snapshot
+    copy (the clobber path) on its next swap, so these are exactly the pairs an
+    operator should `cus login-mount`. Ordered by slot index."""
+    slots = state.get("slots", {}) if isinstance(state, dict) else {}
+    out: list[tuple[str, str]] = []
+    for slot_name, entry in slots.items():
+        account = entry.get("account") if isinstance(entry, dict) else None
+        if not account:
+            continue  # empty slot — nothing to host yet
+        if not has_independent_login(account, slot_name):
+            out.append((slot_name, account))
+    def _idx(pair: tuple[str, str]) -> int:
+        try:
+            return int(pair[0].removeprefix(SLOT_PREFIX))
+        except ValueError:
+            return 1 << 30
+    return sorted(out, key=_idx)
+
+
+def independent_logins_enabled(config: dict | None = None) -> bool:
+    """Whether the Phase 2 gate is on (independent_logins.use_independent_logins).
+
+    OFF by default → the swap path is bit-for-bit today's shared-snapshot copy."""
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("independent_logins", {}).get("use_independent_logins", False))
+
+
+def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path,
+                        config: dict | None = None) -> tuple[Path, bool]:
+    """Which creds file to install into a live mount when swapping to target_name.
+
+    Returns (path, used_independent). Phase 2 (#109): a SLOT swap, with the gate
+    on and an independent login provisioned for (target, slot), installs THAT
+    login's own token family — so two live mounts on one account never share a
+    refresh-token family to clobber (#104/#103/#3). Every other case (gate off,
+    no slot, no provisioned login) returns the shared per-account snapshot, i.e.
+    today's copy path. Lazy fallback is deliberate: an un-provisioned pair still
+    works (as a copy), it just isn't clobber-safe until `cus login-mount` runs."""
+    if slot is not None and independent_logins_enabled(config) and has_independent_login(target_name, slot):
+        return (login_store_creds_path(target_name, slot), True)
+    return (snapshot_creds, False)
+
+
+def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_bytes: bytes) -> str:
+    """Save a slot's live creds back into its (account, slot) independent-login
+    store entry, instead of the shared account snapshot (Phase 3a, #109).
+
+    WHY this must NOT go through classify_live_creds_owner: an independent login
+    deliberately carries a refresh token that matches NO account snapshot, so the
+    snapshot-matcher would verdict "unknown" and write the independent family
+    over the shared snapshot — reconciling the two families and re-introducing
+    the exact clobber this design removes (handoff §5.5). The mount has exactly
+    one writer session in per_session mode, so the live file provably belongs to
+    this (account, slot) family; we save it straight back to the store.
+
+    Carries the GH #77 freshness guard (never overwrite a newer stored login,
+    e.g. one just re-provisioned) and the GH #79 backup. Returns a status word."""
+    store_path = login_store_creds_path(account, slot)
+    live_exp = _creds_expires_at(live_creds)
+    if store_path.exists() and live_exp is not None:
+        try:
+            store_exp = _creds_expires_at(read_json(store_path))
+        except (json.JSONDecodeError, OSError):
+            store_exp = None  # unreadable store entry can't claim freshness
+        if store_exp is not None and store_exp > live_exp:
+            return "skipped-stale"
+    backup_credentials_file(store_path)
+    atomic_write_bytes(store_path, live_bytes, mode=0o600)
+    return "saved"
 
 
 def _pid_config_dir(pid: int) -> str | None:
@@ -2906,6 +3280,10 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # finished has already persisted its state.json, so `current` below is
     # never a stale pre-lock snapshot (the #76 interleaving scenario).
     state = load_state()
+    # Loaded once up front (not just for the ladder below): the #109 gate decides
+    # both the creds save-back destination and the install source, both earlier
+    # than the ladder block that historically owned this load.
+    config = load_config()
     if target_name not in state["accounts"]:
         raise ValueError(f"Unknown account '{target_name}'. Known: {sorted(state['accounts'].keys())}")
     if slot is None:
@@ -2944,6 +3322,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     if current_dir is not None:
         migrate_account_dir(current_dir)
 
+    # GH #109: `target_creds` is the shared per-account snapshot. It is the
+    # DEFAULT install source below (the `atomic_copy(install_src, ...)`), but
+    # when the Phase 2 gate is on and a slot swap has an independent login for
+    # (target, slot), swap_install_source substitutes that login's own family so
+    # two live mounts on one account don't clobber on rotation (#104/#103/#3).
+    # Gate off (default) => install_src == target_creds, i.e. today's copy path.
     target_creds = target_dir / ".credentials.json"
     target_cj = target_dir / ".claude.json"
     if not target_creds.exists():
@@ -3027,7 +3411,22 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             live_creds = None
             click.echo(f"creds-save-back: SKIPPED — live {live_creds_path} unparseable ({e}); "
                        f"keeping '{current}' snapshot as-is")
-    if live_creds is not None:
+    # Phase 3a (#109): if this mount runs a per-(current, slot) INDEPENDENT
+    # login family (gate on + a login provisioned for the OUTGOING account on
+    # THIS slot), its live refresh token matches no account snapshot by design.
+    # Route the save-back to its own store entry so classify_live_creds_owner
+    # below never sees it, verdicts "unknown", and clobbers current's shared
+    # snapshot with the independent family (handoff §5.5). Gated: with the gate
+    # off this branch is never taken and behavior is unchanged.
+    if (live_creds is not None and slot is not None and current is not None
+            and independent_logins_enabled(config) and has_independent_login(current, slot)):
+        status_word = saveback_to_login_store(current, slot, live_creds, live_creds_bytes)
+        if status_word == "skipped-stale":
+            click.echo(f"creds-save-back: SKIPPED — stored login for ({slot}, {current}) is newer "
+                       f"than the live file; kept the store entry (GH #77-style guard)")
+        else:
+            click.echo(f"creds-save-back: saved ({slot}, {current}) independent login back to its store entry (GH #109)")
+    elif live_creds is not None:
         verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
         if verdict in ("expected", "unknown"):
             # "expected": provably current's tokens — the normal save-back.
@@ -3139,7 +3538,13 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # backup of the live file itself makes the install step independently
     # recoverable.
     backup_credentials_file(live_creds_path)
-    atomic_copy(target_creds, live_creds_path, mode=0o600)
+    # Phase 2 (#109): pick the install source — the (target, slot) independent
+    # login when the gate is on and one is provisioned, else the shared snapshot
+    # (today's copy path). See swap_install_source for the full rationale.
+    install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    atomic_copy(install_src, live_creds_path, mode=0o600)
+    if used_independent:
+        click.echo(f"creds-install: installed independent login for ({slot}, {target_name}) — GH #109")
 
     # Update state with progressive-threshold bookkeeping
     ts = now_iso()
@@ -3158,7 +3563,7 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # account's shared ladder exactly ONCE, not once per slot, else a single
     # 50% trip could jump straight to 90% (review finding 2026-07-02).)
     if current is not None and bump_ladder:
-        config = load_config()
+        # config was already loaded at the top of this function (reused here).
         cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
         ladder = list(cfg_steps) + [100]  # 100 = force sentinel
         current_acct = state["accounts"].get(current)
@@ -5082,6 +5487,82 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 summary=f"Orphan slot dir {d.name} holds credentials but has no state entry",
                 action=f"Reap it (saves creds back first): `python3 ~/repos/claude-usage-swap/cus.py slot gc --slot {d.name}`",
                 affected=d.name,
+            ))
+
+    # Condition 10: independent-login store health (GH #109). Fires only for
+    # pairs the operator has ALREADY provisioned, so it stays silent for anyone
+    # not using the feature (no false nags in the default copy-path config).
+    provisioned = list_provisioned_logins()
+    mismatched: list[str] = []
+    expired: list[str] = []
+    expiring: list[str] = []
+    for rec in provisioned:
+        acct, slot = rec["account"], rec["slot"]
+        if not rec["has_login"]:
+            continue  # dir with no usable creds — a half-finished provision, not an alarm
+        # Wrong-account stored login: --finish refuses this, but a hand-edited
+        # store or a --force override could leave one behind. It would seed a
+        # swap with the wrong account's tokens, so treat it as critical.
+        if _identities_match(login_store_identity(acct, slot), account_canonical_identity(acct)) is False:
+            mismatched.append(f"{slot}->{acct}")
+        exp_state, _ = login_expiry_state(acct, slot, config)
+        if exp_state == "expired":
+            expired.append(f"{slot}->{acct}")
+        elif exp_state == "near":
+            expiring.append(f"{slot}->{acct}")
+    if mismatched:
+        out.append(SOSCondition(
+            severity="critical",
+            summary=f"Independent login(s) stored under the wrong account: {', '.join(mismatched)}",
+            action=("A stored login's identity does not match its account. Re-provision it: "
+                    "`cus login-mount <slot> <account>` and log in as the correct account."),
+            affected="system",
+        ))
+    if expired:
+        out.append(SOSCondition(
+            severity="warning",
+            summary=f"Independent login(s) past assumed refresh-token lifetime: {', '.join(expired)}",
+            action=("Re-provision so swaps don't fall back to the shared-snapshot copy: "
+                    "`cus login-mount <slot> <account>` then `--finish`. "
+                    "(Lifetime is an assumption — see #109 Phase 0.)"),
+            affected="system",
+        ))
+    if expiring:
+        out.append(SOSCondition(
+            severity="warning",
+            summary=f"Independent login(s) expiring soon (assumed): {', '.join(expiring)}",
+            action="Re-provision before they lapse: `cus login-mount <slot> <account>` then `--finish`.",
+            affected="system",
+        ))
+    # The precise clobber invariant: no two store entries may share ONE refresh
+    # family. Violated by bootstrapping (`--from-existing`) an account onto two
+    # slots, or hand-copying an entry. These two mounts WILL clobber on rotation
+    # — exactly what independent logins exist to prevent. Critical regardless of
+    # the gate, because the operator has provisioned them expecting safety.
+    for dup in duplicate_login_families():
+        out.append(SOSCondition(
+            severity="critical",
+            summary=f"Independent-login families collide across mounts: {', '.join(dup['pairs'])} share one token family",
+            action=("Two live mounts on one refresh-token family clobber on rotation. Give the extra "
+                    "mount(s) their OWN login: `cus login-mount <slot> <account>` (a real /login, "
+                    "NOT --from-existing — only the browser flow mints a distinct family)."),
+            affected="system",
+        ))
+
+    # Condition 11: Phase 2 gate is ON but some occupied slots have no
+    # independent login — their next swap falls back to the shared-snapshot copy
+    # (the #104/#103/#3 clobber path this feature exists to remove). Only
+    # actionable, hence only raised, when the gate is on.
+    if config.get("independent_logins", {}).get("use_independent_logins", False):
+        missing = _slots_missing_logins(state)
+        if missing:
+            pairs = ", ".join(f"{s}->{a}" for s, a in missing)
+            out.append(SOSCondition(
+                severity="warning",
+                summary=f"independent_logins is ON but these slots lack a login (swap will copy-fallback): {pairs}",
+                action=("Provision each: `cus login-mount <slot> <account>` then `--finish`. "
+                        "Until then, swaps into these slots use the shared-snapshot copy."),
+                affected="system",
             ))
 
     return out
@@ -7346,6 +7827,12 @@ def status() -> None:
         click.echo("Slots:")
         seen = set()
         locked_slot_names = _locked_slots(config)
+        # GH #109 independent-login annotation. Stay invisible until the feature
+        # is actually in use — either the Phase 2 gate is on, or at least one
+        # login has been provisioned — so users not using it see no new column.
+        il_cfg = config.get("independent_logins", {})
+        il_flag = il_cfg.get("use_independent_logins", False)
+        il_visible = il_flag or bool(list_provisioned_logins())
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
@@ -7357,7 +7844,18 @@ def status() -> None:
             pool = _slot_pool(state, d.name, config)
             pool_col = click.style(f"  [{pool}]", fg="cyan") if pool != config.get("per_session", {}).get("default_pool", "premium") else ""
             orphan = "" if d.name in slots_state else click.style("  [orphan — not in state]", fg="yellow")
-            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{pool_col}{orphan}")
+            login_col = ""
+            if il_visible and entry.get("account"):
+                acct = entry["account"]
+                if has_independent_login(acct, d.name):
+                    login_col = click.style("  [indep-login ✓]", fg="green")
+                elif il_flag:
+                    # Gate is ON but no login provisioned → this swap will fall
+                    # back to the shared-snapshot copy (clobber path). Actionable.
+                    login_col = click.style("  [indep-login MISSING]", fg="yellow")
+                else:
+                    login_col = click.style("  [copy]", fg="cyan")
+            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{pool_col}{login_col}{orphan}")
         for name in sorted(set(slots_state) - seen):
             click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
         click.echo()
@@ -9371,6 +9869,199 @@ def relogin_cmd(name: str, exec_flag: bool, finish_flag: bool) -> None:
         os.execvpe("claude", ["claude"], env)
 
 
+def _login_mount_status_line(rec: dict, config: dict) -> str:
+    """One-line human summary of a provisioned-login record for `--list`."""
+    account, slot = rec["account"], rec["slot"]
+    if not rec["has_login"]:
+        return (f"  {account:<12} {slot:<10} "
+                + click.style("dir exists but NO usable login — run login-mount ... --finish "
+                              "after logging in", fg="yellow"))
+    state, days_left = login_expiry_state(account, slot, config)
+    email = rec.get("identity_email") or "?"
+    prov = rec.get("provenance") or {}
+    fp = prov.get("refresh_fp") or "?"
+    if state == "expired":
+        fresh = click.style(f"EXPIRED ~{-days_left:.0f}d ago (assumed)", fg="red")
+    elif state == "near":
+        fresh = click.style(f"expiring in ~{days_left:.0f}d (assumed)", fg="yellow")
+    elif state == "ok":
+        fresh = click.style(f"~{days_left:.0f}d left (assumed)", fg="green")
+    else:
+        fresh = "age unknown"
+    return f"  {account:<12} {slot:<10} {email:<28} {fp}  {fresh}"
+
+
+@cli.command(name="login-mount")
+@click.argument("slot", required=False)
+@click.argument("account", required=False)
+@click.option("--exec", "exec_flag", is_flag=True,
+              help="Immediately exec `claude` under the login-store dir to start the /login.")
+@click.option("--finish", "finish_flag", is_flag=True,
+              help="After the /login completes, verify it landed on the right account and record provenance.")
+@click.option("--list", "list_flag", is_flag=True,
+              help="List every provisioned independent login and exit.")
+@click.option("--force", is_flag=True,
+              help="With --finish: record provenance even if the login's identity does not match the account.")
+@click.option("--from-existing", "from_existing", is_flag=True,
+              help="Seed the store from the account's on-disk snapshot instead of an interactive /login. "
+                   "No browser needed, but only clobber-safe as the SOLE live mount for that account.")
+def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
+                    finish_flag: bool, list_flag: bool, force: bool, from_existing: bool) -> None:
+    """Provision an INDEPENDENT `/login` for an account into one slot (GH #109).
+
+    Today a slot's live credentials are a COPY of one account snapshot; two
+    slots on the same account share one OAuth refresh-token family and clobber
+    each other on rotation (#104/#103/#3). This gives a (slot, account) pair its
+    OWN login family so the same account can safely back multiple live mounts.
+
+    Two-step, mirroring `cus relogin` (the /login flow is interactive — a browser
+    + paste-back — and cannot be driven for you):
+
+      1. `cus login-mount slot-3 rayi1`  → scaffolds the store dir and prints the
+         `CLAUDE_CONFIG_DIR=... claude` command. Run it yourself and log in AS
+         rayi1 (the SAME Anthropic account the slot will host).
+      2. `cus login-mount slot-3 rayi1 --finish`  → verifies the login landed on
+         rayi1 (not a wrong account — see the 2026-07-01 duplicate-identity
+         incident) and records provenance.
+
+    BOOTSTRAP (no login): `cus login-mount slot-3 rayi1 --from-existing` seeds the
+    store from rayi1's on-disk snapshot. Use this for an account that backs just
+    ONE live mount — it costs no browser login. It is NOT independent from the
+    snapshot, so a SECOND simultaneous mount of the same account still needs a
+    real `/login` (only the browser flow mints a distinct refresh-token family).
+    `cus sos` flags any two mounts that end up sharing one family.
+
+    Provisioning is LAZY: mint a login the first time a mount needs to host an
+    account. `cus login-mount --list` (or `cus status`) shows what exists.
+
+    The swap path consumes these only when independent_logins.use_independent_logins
+    is on (Phase 2 gate; default off = today's shared-snapshot copy path).
+    """
+    config = load_config()
+
+    if list_flag:
+        recs = list_provisioned_logins()
+        if not recs:
+            click.echo("No independent logins provisioned yet.")
+            click.echo("Provision one with: cus login-mount <slot> <account>")
+            return
+        click.echo("Independent logins (GH #109):")
+        for rec in recs:
+            click.echo(_login_mount_status_line(rec, config))
+        return
+
+    if not slot or not account:
+        raise click.UsageError("login-mount needs a SLOT and an ACCOUNT (e.g. `cus login-mount slot-3 rayi1`), "
+                               "or use --list.")
+
+    # Validate the slot name shape. We allow a slot dir that doesn't exist yet:
+    # a login can be provisioned ahead of the slot being created (lazy).
+    if not (slot.startswith(SLOT_PREFIX) and slot.removeprefix(SLOT_PREFIX).isdigit()):
+        raise click.UsageError(f"Bad slot '{slot}' — expected 'slot-<n>' (e.g. slot-3).")
+
+    # Validate the account is one we know about (has a canonical snapshot dir).
+    account_dir = ACCOUNTS_DIR / f"account-{account}"
+    if not account_dir.exists():
+        raise click.ClickException(
+            f"Unknown account '{account}' — no {account_dir}. Run `cus list` to see accounts, "
+            f"or `cus add {account}` first.")
+
+    if from_existing:
+        # Bootstrap: copy the account's on-disk snapshot into the store. No
+        # login. NOT independent from the snapshot — safe only as the sole mount.
+        snap_creds = account_creds_path(account)
+        try:
+            snap_ok = _credential_refresh_token(read_json(snap_creds)) is not None
+        except (json.JSONDecodeError, OSError):
+            snap_ok = False
+        if not snap_ok:
+            raise click.ClickException(
+                f"{account}'s snapshot ({snap_creds}) has no usable credentials to bootstrap from. "
+                f"Log in normally instead: `cus login-mount {slot} {account}`.")
+        scaffold_login_store_dir(account, slot)
+        # Copy creds + identity so the store entry mirrors the snapshot exactly.
+        atomic_copy(snap_creds, login_store_creds_path(account, slot), mode=0o600)
+        snap_cj = account_dir / ".claude.json"
+        if snap_cj.exists():
+            atomic_copy(snap_cj, login_store_cj_path(account, slot), mode=0o600)
+        email = account_canonical_identity(account).get("emailAddress")
+        prov = write_login_provenance(account, slot, email, bootstrapped=True)
+        click.echo(click.style(f"✓ Bootstrapped ({slot}, {account}) from the on-disk snapshot.", fg="green"))
+        click.echo(f"  identity: {email or 'unknown'}   fingerprint: {prov['refresh_fp']}   (bootstrapped copy)")
+        # Warn if this now duplicates a family already on another mount.
+        dups = [d for d in duplicate_login_families() if prov["refresh_fp"] == d["refresh_fp"]]
+        if dups:
+            click.echo(click.style(
+                f"  ⚠ this family is now on multiple mounts: {dups[0]['pairs']}. Two mounts on ONE "
+                f"family clobber on rotation — the 2nd+ mount must be a real login "
+                f"(`cus login-mount <slot> {account}`), not --from-existing.", fg="yellow"))
+        return
+
+    if finish_flag:
+        creds_path = login_store_creds_path(account, slot)
+        if not has_independent_login(account, slot):
+            raise click.ClickException(
+                f"No usable login at {creds_path}. Did the /login complete? "
+                f"Re-run the login command (without --finish) and log in as '{account}' first.")
+
+        # Duplicate-identity guard (2026-07-01 incident): the store dir's
+        # .claude.json carries whatever account the operator actually logged
+        # into. If that isn't the account this pair is FOR, recording it would
+        # seed a swap with the wrong account's tokens — refuse unless --force.
+        logged = login_store_identity(account, slot)
+        canonical = account_canonical_identity(account)
+        match = _identities_match(logged, canonical)
+        logged_email = logged.get("emailAddress") or "unknown"
+        canon_email = canonical.get("emailAddress") or "unknown"
+        if match is False and not force:
+            raise click.ClickException(
+                f"Login identity mismatch: you logged in as '{logged_email}' but slot/account "
+                f"'{account}' is '{canon_email}'. This is the wrong-account trap (2026-07-01). "
+                f"Re-login as '{account}', or pass --force if you are certain the identities are "
+                f"the same account under different emails.")
+        if match is None:
+            click.echo(click.style(
+                f"  (could not verify identity — no comparable oauthAccount fields on "
+                f"'{account}'s snapshot; recording anyway)", fg="yellow"))
+
+        prov = write_login_provenance(account, slot, logged_email)
+        click.echo(click.style(f"✓ Recorded independent login for ({slot}, {account}).", fg="green"))
+        click.echo(f"  identity: {logged_email}   fingerprint: {prov['refresh_fp']}")
+        click.echo(f"  stored at: {login_store_dir(account, slot)}")
+        missing = _slots_missing_logins(load_state() if STATE_JSON.exists() else {})
+        if missing:
+            click.echo()
+            click.echo("Still needing an independent login (for the accounts their slots currently hold):")
+            for m_slot, m_acct in missing:
+                click.echo(f"  cus login-mount {m_slot} {m_acct}")
+        if not config.get("independent_logins", {}).get("use_independent_logins", False):
+            click.echo()
+            click.echo("Note: the swap path still copies the shared snapshot until you enable Phase 2 "
+                       "(independent_logins.use_independent_logins: true in config.yaml).")
+        return
+
+    # --- provision (print/exec) mode ---
+    dst = scaffold_login_store_dir(account, slot)
+    login_cmd = f"CLAUDE_CONFIG_DIR={dst}/ claude"
+    click.echo(f"Provisioning an independent login for ({slot}, {account}).")
+    click.echo(f"Store dir: {dst}")
+    click.echo()
+    click.echo(f"1. Run this and log in AS '{account}' (the same Anthropic account this slot will host):")
+    click.echo(f"     {login_cmd}")
+    click.echo("2. After the login completes and you /exit, record it:")
+    click.echo(f"     python3 ~/repos/claude-usage-swap/cus.py login-mount {slot} {account} --finish")
+    click.echo()
+    click.echo("Logging in as a DIFFERENT account than '" + account + "' will be refused at --finish "
+               "(wrong-account trap, 2026-07-01).")
+
+    if exec_flag:
+        click.echo()
+        click.echo("Launching claude now (log in, then /exit and run --finish)...")
+        env = os.environ.copy()
+        env["CLAUDE_CONFIG_DIR"] = str(dst)
+        os.execvpe("claude", ["claude"], env)
+
+
 def _describe_creds_backup(path: Path) -> str:
     """One human-readable line about a backup generation: timestamp, age,
     and whether the payload still looks restorable (has a refresh token)."""
@@ -9902,7 +10593,8 @@ def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
 
 
 def _launch_prepare(account: str | None, state: dict, config: dict,
-                    pool: str | None = None, force: bool = False) -> tuple[str, Path, str]:
+                    pool: str | None = None, force: bool = False,
+                    lane: str | None = None) -> tuple[str, Path, str]:
     """Everything `cus launch` does BEFORE the exec: pick account, acquire +
     heal + sync a slot, install the account's credentials into it.
 
@@ -9932,6 +10624,36 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     elif account not in state.get("accounts", {}):
         raise click.ClickException(f"unknown account '{account}'. Known: {sorted(state.get('accounts', {}))}")
 
+    # Lane sharing (GH #109 lanes): if the chosen account is already live on a
+    # slot lane, JOIN that lane (share its config dir) rather than refusing
+    # (#104) or minting a second mount. Multiple sessions on one lane share one
+    # login and swap together — the no-extra-login path. The lane already holds
+    # the account, so there is NO swap and NO clobber (same dir, same family).
+    # We only join a SLOT lane, never the global mount (a slot on the global
+    # active would be a genuine second mount of that account → falls through to
+    # the #104 guard / independent-login hatch below).
+    if lane is None and config.get("per_session", {}).get("lane_sharing", False):
+        occ = occupied_slot_accounts(state)  # account -> [live slot names]
+        lanes = sorted(occ.get(account, []),
+                       key=lambda n: int(n.removeprefix(SLOT_PREFIX)) if n.removeprefix(SLOT_PREFIX).isdigit() else 1 << 30)
+        if lanes:
+            lane = lanes[0]
+            lane_dir = slot_path(lane)
+            click.echo(f"launch: joining lane {lane} already on '{account}' (lane sharing — shared login, swap together)")
+            # Heal the lane's layout, but DON'T sync .claude.json: it has a live
+            # writer (the sessions already on this lane), so a sync would race
+            # their writes (same rule as the daemon's periodic save-back).
+            for f in doctor_mount(lane_dir, fix=True):
+                click.echo(f"launch: doctor healed {lane}/{f['entry']} ({f['problem']})")
+            state = load_state()
+            entry = state.setdefault("slots", {}).setdefault(lane, {"account": account, "created_ts": now_iso()})
+            entry["last_launch_ts"] = now_iso()
+            save_state(state)
+            return lane, lane_dir, account
+
+    if lane is not None and not (lane.startswith(SLOT_PREFIX) and lane.removeprefix(SLOT_PREFIX).isdigit()):
+        raise click.ClickException(f"bad --lane '{lane}' — expected slot-<n> (e.g. slot-8).")
+
     # Duplicate-mount guard (GH #104): refuse to launch onto an account already
     # live on another mount (another slot, or the shared mount with live bare
     # sessions) — the two would rotate each other's single-use refresh token
@@ -9940,28 +10662,56 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     if state.get("active") and mount_in_use(CLAUDE_DIR):
         live_mount_accts.add(state["active"])
     if account in live_mount_accts and not force:
-        raise click.ClickException(
-            f"'{account}' is already running on a live mount. Launching a second session on it would rotate "
-            f"its login token and sign one of them out (GH #104). Pick another account (or `cus launch auto`), "
-            f"or pass --force if you really want two sessions sharing '{account}'.")
+        # Phase 3b (#109) escape hatch: a SECOND live mount on one account is
+        # safe only if it uses its OWN independent login family. Allow it when
+        # the gate is on AND the operator named an explicit --lane that already
+        # has an independent login provisioned for this account — the install
+        # below then uses that family (swap_install_source), not a clobbering
+        # copy. Everything else still refuses (lane sharing SHARES a mount, this
+        # hatch adds a distinct one). --force still overrides, but that IS the
+        # clobber.
+        independent_ok = (lane is not None and independent_logins_enabled(config)
+                          and has_independent_login(account, lane))
+        if not independent_ok:
+            raise click.ClickException(
+                f"'{account}' is already running on a live mount. A second session on it would rotate "
+                f"its login token and sign one out (GH #104). Options: pick another account "
+                f"(`cus launch auto`); turn on per_session.lane_sharing to SHARE its lane; or give it a "
+                f"second INDEPENDENT lane — enable independent_logins, run "
+                f"`cus login-mount <free-slot> {account}`, then `cus launch {account} --lane <free-slot>`. "
+                f"(`--force` overrides, but that reintroduces the clobber.)")
+        click.echo(f"launch: '{account}' gets a 2nd independent lane {lane} (its own login — GH #109)")
 
     acct_state = state.get("accounts", {}).get(account, {})
     if acct_state.get("token_expired"):
         click.echo(click.style(f"warning: '{account}' is flagged token_expired — the session may demand /login "
                                f"(fix first: `cus relogin {account}`)", fg="yellow"))
 
-    # acquire_slot persists the reservation itself (under the swap lock), so a
-    # concurrent launch / the daemon's gc already see this slot as claimed —
-    # no save_state here (it would re-write our possibly-staler `state` over
-    # acquire's fresh persist).
-    slot_name, slot_dir = acquire_slot(state, prefer_account=account)
+    if lane is not None:
+        # Explicit lane (Phase 3b escape hatch, or just pinning a launch to a
+        # known slot). Use it as-is instead of auto-picking. Refuse if it's live
+        # on a DIFFERENT account (that would collide); a free or same-account
+        # lane is fine.
+        cur = state.get("slots", {}).get(lane, {}).get("account")
+        slot_dir = slot_path(lane)
+        if slot_dir.exists() and mount_in_use(slot_dir) and cur not in (None, account):
+            raise click.ClickException(f"--lane {lane} is live on '{cur}', not '{account}'. Pick a free lane.")
+        scaffold_mount_dir(slot_dir)  # idempotent
+        slot_name = lane
+    else:
+        # acquire_slot persists the reservation itself (under the swap lock), so
+        # a concurrent launch / the daemon's gc already see this slot as claimed
+        # — no save_state here (it would re-write our possibly-staler `state`
+        # over acquire's fresh persist).
+        slot_name, slot_dir = acquire_slot(state, prefer_account=account)
 
     # Pre-flight: heal the slot's layout quietly (a launch should never come
     # up bare-hooked because a symlink rotted), then align its .claude.json
-    # with the canonical (the slot is free — no live-writer race).
+    # with the canonical — UNLESS the mount has a live writer (an explicit --lane
+    # onto an already-live same-account lane), where a sync would race it.
     for f in doctor_mount(slot_dir, fix=True):
         click.echo(f"launch: doctor healed {slot_name}/{f['entry']} ({f['problem']})")
-    if CLAUDE_JSON.exists():
+    if CLAUDE_JSON.exists() and not mount_in_use(slot_dir):
         try:
             sync_mount_claude_json(slot_dir, read_json(CLAUDE_JSON))
         except (json.JSONDecodeError, OSError) as e:
@@ -9986,8 +10736,9 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
 @click.option("--pool", type=click.Choice(list(VALID_POOLS)), default=None,
               help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
 @click.option("--force", is_flag=True, help="Launch even onto an account already live on another mount (GH #104: normally refused — two live mounts on one account sign one out).")
+@click.option("--lane", default=None, help="Launch into a specific slot (e.g. slot-8) instead of auto-picking. With independent_logins on + an independent login provisioned for (lane, account), this is how you give one account a 2nd independently-swappable lane (GH #109).")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
-def launch_cmd(account: str | None, pool: str | None, force: bool, claude_args: tuple[str, ...]) -> None:
+def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | None, claude_args: tuple[str, ...]) -> None:
     """Launch claude in its own slot, pinned to an account (per_session).
 
     ACCOUNT is an account name, or omitted/'auto' to pick the best by the
@@ -9997,17 +10748,22 @@ def launch_cmd(account: str | None, pool: str | None, force: bool, claude_args: 
         cus launch                       # auto-pick, plain session
         cus launch rayi1 -- --resume X   # explicit account + claude args
         cus launch --pool standard auto  # standard-pool slot (see `cus pool`)
+        cus launch rayi1 --lane slot-8   # pin to slot-8 (see below)
 
     The session keeps its slot (and its pool) for life; the daemon moves
     ACCOUNTS through slots (in-place, no restart), never sessions. Optional
     alias to make every launch slotted:  alias claude='cus launch auto --'
 
     An account already live on another mount is refused (GH #104) — it would
-    sign one of the two out; use `--force` to override, or `auto` to spread.
+    sign one of the two out. Three ways past it: `--force` (accepts the
+    clobber); turn on per_session.lane_sharing to SHARE the existing lane; or,
+    for a second INDEPENDENTLY-swappable lane, enable independent_logins, run
+    `cus login-mount <free-slot> <account>`, then `cus launch <account> --lane
+    <free-slot>` (GH #109).
     """
     state = load_state()
     config = load_config()
-    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force)
+    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force, lane=lane)
     click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(slot_dir)

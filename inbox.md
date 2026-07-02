@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-02 — decision — Built #109 Phase 1 (per-(slot,account) independent-login store + `cus login-mount`) + Phase 0 harness on a fresh branch off main; swap path untouched (gate off)](#2026-07-02-decision-built-109-phase-1-per-slot-account-independent-login-store-cus-login-mount-phase-0-harness-on-a-fresh-branch-off-main-swap-path-untouched-gate-off)
 - [2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted](#2026-07-02-decision-built-pr-93-plan-per-session-slots-same-day-on-the-plan-s-own-branch-production-untouched-three-plan-deviations-noted)
 - [2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed](#2026-07-02-flag-gym-record-loop-unavailable-for-pr-86-review-pr-88-merge-cus-is-not-gym-initialized-hook-99-v2-guidance-needed)
 - [2026-07-02 — decision — GH #77 freshness guard: active-account relogin = bare `claude /login` (not storage-dir + sync); guard covers the "expected" verdict too; --finish allows incomparable timestamps](#2026-07-02-decision-gh-77-freshness-guard-active-account-relogin-bare-claude-login-not-storage-dir-sync-guard-covers-the-expected-verdict-too-finish-allows-incomparable-timestamps)
@@ -22,6 +23,31 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-02 — decision — Built #109 Phase 1 (per-(slot,account) independent-login store + `cus login-mount`) + Phase 0 harness on a fresh branch off main; swap path untouched (gate off)
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #gh-109 #independent-logins #slots #login-mount #phase-1 #clobber
+
+**Context.** Executing the handoff `docs/plans/2026-07-02-seamless-swap-independent-logins.md`. The "mounts" of that handoff are the existing per_session **slots**; today a slot's live `.credentials.json` is a COPY of one account snapshot, so two slots on one account share a single OAuth refresh-token family and clobber on rotation (#104/#103/#3). #109 proved independent `/login` flows for the same account yield independent families that don't invalidate each other.
+
+**What I decided / did (autonomous):**
+1. **Wrong base → rebased the worktree.** The worktree was on the stale `poll-throttle-and-per-model` branch — 39 commits behind main, 0 ahead (its work already merged), and missing EVERY touchpoint the handoff builds on (slots/launch/mode/pools, the #104 refusal, the newer `classify_live_creds_owner`). Created `feature/seamless-swap-independent-logins-20260702` off `origin/main` in this same worktree (user chose "rebase this worktree onto main"). Untracked plan doc carried over.
+2. **Built Phase 1 only** (additive, non-breaking): per-(slot,account) store at `~/claude-accounts/logins/<account>/<slot>/` (creds + provenance.json + identity), `cus login-mount` (lazy two-step provisioning), status/sos surfacing, config block `independent_logins` with the Phase 2 gate `use_independent_logins:false`. Left a **seam comment** at the swap install site in `_execute_swap_locked` — the swap path is bit-for-bit unchanged.
+3. **Design calls worth review:** (a) the interactive `/login` writes DIRECTLY into the store dir, so there's no separate capture/copy step to drift; (b) `--finish` **refuses a wrong-account login** by comparing the store's `oauthAccount` to the account's canonical `.claude.json` (the 2026-07-01 duplicate-identity guard), `--force` overrides; (c) SOS/status stay **silent until the feature is in use** (no nag for default-config users) — the "missing login" SOS only fires when the gate is ON; (d) `refresh_token_ttl_days:30` is an explicit UNCONFIRMED assumption driving only a soft nudge (Phase 0 owes the real number).
+4. **Phase 0 harness scaffolded** (`experiments/109-phase0/`) but the experiments are **not yet run** — they need interactive `/login` flows. Automated: `multi` (>2-login independence), `ledger` (idle-expiry), `files` (filesystem-severing demo); printed procedures for read-cadence + drift-writeback.
+
+**Verification.** New suite `tests/test_independent_logins.py` (17 tests); full suite **235 passing**; `cus.py` ruff at baseline (32 pre-existing F541s, +0 mine); harness ruff-clean. Nothing installed/committed to production — the live daemon runs the main checkout, not this worktree, and the gate is off.
+
+### Walk-back path
+1. To drop the whole feature: it lives only on branch `feature/seamless-swap-independent-logins-20260702` (unmerged). Delete the branch, or `git checkout main`.
+2. To drop just the code but keep the plan/harness: revert the single implementation commit on the branch (the `cus.py` + `tests/` diff); the plan-doc annotation and `experiments/109-phase0/` are separate.
+3. Nothing to undo on the machine: no swap-path change (gate `use_independent_logins` defaults false), no store populated, no install/systemd change — the running daemon uses `/home/rayi/repos/claude-usage-swap/cus.py` (main), not this worktree.
+4. If Phase 2 later proves the store design wrong: the store is purely additive on disk (`~/claude-accounts/logins/`); `rm -rf ~/claude-accounts/logins` removes it with zero effect on accounts/slots/state.
+
+---
+
 
 ## 2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted
 
