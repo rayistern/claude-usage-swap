@@ -220,6 +220,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # holds the right account), so eager reaping costs more than it saves;
         # the risk being bounded is dead mounts accumulating real credentials.
         "slot_gc_idle_hours": 72,
+        # Rotation-set (pool) a slot joins when it doesn't declare one at launch
+        # (GH #99). Two emergent pools segment slots by the work they do:
+        #   - "premium": the per-model weekly gate applies — the slot swaps OFF
+        #     an account (and won't swap back onto it) once a tracked model's
+        #     week reaches per_model_weekly.cap_pct. For sessions doing premium-
+        #     model work (e.g. Fable) where a model-exhausted account is useless.
+        #   - "standard": the per-model gate is IGNORED — only aggregate 5h/7d +
+        #     hard_7d_cap apply. A model-exhausted account still has aggregate
+        #     headroom that serves standard-model work, so standard slots keep
+        #     using it instead of stranding that headroom.
+        # Pools are NOT static account lists — an account is "in" whichever pool
+        # a given slot's rules let it serve, decided live from usage. Only
+        # meaningful in per_session mode (global mode has one active account for
+        # every session, nothing to segment). Set per slot via
+        # `cus launch --pool <p>` or `cus pool <slot> <p>`.
+        "default_pool": "premium",
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -4069,48 +4085,96 @@ def _locked_slots(config: dict) -> set[str]:
     return {str(s) for s in (config.get("session_locks", {}).get("locked_slots") or [])}
 
 
+# Rotation-set pools (GH #99). A slot's pool decides whether the per-model
+# weekly gate applies to that slot's swap decisions. Emergent, not static:
+# an account is "in" whichever pool a slot's rules let it serve.
+VALID_POOLS = ("premium", "standard")
+
+
+def _slot_pool(state: dict, slot_name: str, config: dict) -> str:
+    """Rotation-set pool a slot belongs to: state.slots[name].pool, falling
+    back to per_session.default_pool. Unknown/missing values fall back too, so
+    slots created before pools existed read as the default (premium)."""
+    default = config.get("per_session", {}).get("default_pool", "premium")
+    p = (state.get("slots", {}).get(slot_name, {}) or {}).get("pool") or default
+    return p if p in VALID_POOLS else default
+
+
+def _config_for_pool(config: dict, pool: str) -> dict:
+    """Config view used for a pool's swap decision (GH #99).
+
+    Standard-pool slots IGNORE the per-model weekly gate — a model-exhausted
+    account still has aggregate headroom that serves standard-model work, so a
+    standard slot should keep using it rather than evacuate like a premium slot
+    does. We express that by shallow-copying the config with
+    per_model_weekly.gate_enabled forced False, which turns the model gate into
+    a no-op everywhere it's consulted (hard-cap force-swap AND target filter)
+    with zero new branches in decide_swap / pick_swap_target. Premium slots use
+    the config unchanged. No-op (returns the original object) when the gate is
+    already off, so non-gated installs pay nothing.
+    """
+    if pool == "standard" and config.get("per_model_weekly", {}).get("gate_enabled"):
+        view = dict(config)
+        pmw = dict(config.get("per_model_weekly", {}))
+        pmw["gate_enabled"] = False
+        view["per_model_weekly"] = pmw
+        return view
+    return config
+
+
 def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "AccountUsage"],
                       traces: dict | None = None) -> list[dict]:
     """Per-slot swap decisions for one cycle (Phase 3.1).
 
     Returns a list of move dicts: {"slot", "from", "to", "gate", "tier",
-    "deferrable", "reason"}. Multiple slots on the same hot account FAN OUT
-    to distinct targets (best-headroom-first — each pick excludes targets
-    already taken this round) rather than piling onto one; when the pool
-    runs out of distinct targets, remaining slots share the last pick
-    (doubling up beats staying on a tripped account).
+    "deferrable", "reason", "pool"}. Multiple slots on the same hot account
+    FAN OUT to distinct targets (best-headroom-first — each pick excludes
+    targets already taken this round) rather than piling onto one; when the
+    account pool runs out of distinct targets, remaining slots share the last
+    pick (doubling up beats staying on a tripped account).
 
-    `traces` (optional): account → decide_swap trace dict, for decision logs.
+    Slots are grouped by (account, pool): slots on the same account but in
+    different rotation-set pools get DIFFERENT decisions — a premium slot
+    honors the per-model weekly gate (swaps off a model-exhausted account) while
+    a standard slot ignores it (keeps using that account's aggregate headroom) —
+    so they can't share one decide_swap. See `_config_for_pool` / GH #99.
+
+    `traces` (optional): "account:pool" → decide_swap trace dict, for logs.
     """
     moves: list[dict] = []
     taken: set[str] = set()
     locked = _locked_slots(config)
     occupied = occupied_slot_accounts(state)
-    for acct_name, slots in sorted(occupied.items()):
-        # Locked slots are frozen — drop them before running the account's
-        # swap decision so an account whose only slots are locked doesn't
-        # burn a decide_swap (and so fan-out never counts them).
-        movable = [s for s in sorted(slots) if s not in locked]
-        for s in sorted(set(slots) - set(movable)):
-            click.echo(f"  skip {s}: locked (session_locks.locked_slots)")
-        if not movable:
-            continue
+    # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
+    # — dropped here so a group whose slots are all locked never burns a
+    # decide_swap and fan-out never counts them.
+    groups: dict[tuple[str, str], list[str]] = {}
+    for acct_name, slots in occupied.items():
+        for s in slots:
+            if s in locked:
+                click.echo(f"  skip {s}: locked (session_locks.locked_slots)")
+                continue
+            groups.setdefault((acct_name, _slot_pool(state, s, config)), []).append(s)
+    for (acct_name, pool), slots in sorted(groups.items()):
+        cfg_view = _config_for_pool(config, pool)
         shim = dict(state)
         shim["active"] = acct_name
         trace: dict = {}
-        decision = decide_swap(shim, config, usage_by_account, trace)
+        decision = decide_swap(shim, cfg_view, usage_by_account, trace)
         if traces is not None:
-            traces[acct_name] = trace
+            traces[f"{acct_name}:{pool}"] = trace
         if decision is None:
             continue
-        for slot_name in movable:
+        for slot_name in sorted(slots):
             target = decision.target
             if target in taken:
                 # Fan-out: re-pick with this round's taken targets excluded
-                # (the hot account stays excluded as the shim's active).
+                # (the hot account stays excluded as the shim's active). Use the
+                # SAME pool-adjusted config so a standard slot's re-pick also
+                # ignores the model gate.
                 shim2 = dict(shim)
                 shim2["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
-                retry = pick_swap_target(shim2, config)
+                retry = pick_swap_target(shim2, cfg_view)
                 if retry is not None:
                     target = retry.name
                 # else: pool exhausted — double up on the original target.
@@ -4119,6 +4183,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                 "slot": slot_name, "from": acct_name, "to": target,
                 "gate": decision.gate, "tier": decision.tier,
                 "deferrable": decision.deferrable, "reason": decision.reason,
+                "pool": pool,
             })
     return moves
 
@@ -4178,7 +4243,11 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dic
         shim = dict(state)
         shim["active"] = acct
         shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
-        target = pick_swap_target(shim, config)
+        # Pick the escape target under the offending slot's pool rules (GH #99):
+        # a standard slot's 429 escape may land on a model-exhausted account,
+        # a premium slot's may not.
+        pool = _slot_pool(state, slot_name, config)
+        target = pick_swap_target(shim, _config_for_pool(config, pool))
         if target is None:
             continue  # nowhere safe to go; SOS handles the all-full case
         taken.add(target.name)
@@ -4186,6 +4255,7 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict) -> list[dic
             "slot": slot_name, "from": acct, "to": target.name,
             "gate": "reactive_429", "tier": 3, "deferrable": False,
             "reason": f"user-facing 429 on the '{acct}' session in {slot_name}; {target.reason}",
+            "pool": pool,
         })
     return moves
 
@@ -7070,8 +7140,12 @@ def status() -> None:
             pids = mount_pids(d)
             live_col = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
             lock_col = click.style("  🔒locked", fg="yellow") if d.name in locked_slot_names else ""
+            # Only surface the pool when it's the non-default (standard) — a
+            # premium/default slot line stays uncluttered.
+            pool = _slot_pool(state, d.name, config)
+            pool_col = click.style(f"  [{pool}]", fg="cyan") if pool != config.get("per_session", {}).get("default_pool", "premium") else ""
             orphan = "" if d.name in slots_state else click.style("  [orphan — not in state]", fg="yellow")
-            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{orphan}")
+            click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{pool_col}{orphan}")
         for name in sorted(set(slots_state) - seen):
             click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
         click.echo()
@@ -7968,7 +8042,7 @@ def hooks_list_cmd() -> None:
 
 CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "mode": "Live-mount topology (docs/plans/2026-07-02-per-session-accounts.md). `global` (default): one live mount (~/.claude/), the daemon swaps it in place, every session follows the active account. `per_session`: each session launched via `cus launch` gets its own slot dir (~/claude-accounts/slot-N/) holding one account; the daemon swaps individual slots in place (sessions never restart) and NEVER writes ~/.claude/ (bare launches are observed, not swapped). Switch with `cus mode per-session` / `cus mode global` — never edit this key by hand mid-flight.",
-    "per_session": "per_session-mode tuning. `slot_gc_idle_hours: 72`: how long a slot may sit with no live session before the daemon reaps it (credentials save back to the owning account dir first). Long default because a free slot is a reuse candidate for the next `cus launch` (no swap needed when it already holds the right account).",
+    "per_session": "per_session-mode tuning. `slot_gc_idle_hours: 72`: how long a slot may sit with no live session before the daemon reaps it (credentials save back to the owning account dir first). Long default because a free slot is a reuse candidate for the next `cus launch` (no swap needed when it already holds the right account). `default_pool: premium`: rotation-set a slot joins when it doesn't declare one at launch (GH #99). `premium` slots honor the per-model weekly gate (swap off an account once a tracked model's week hits per_model_weekly.cap_pct, never swap back); `standard` slots ignore it (keep using that account's aggregate headroom for standard-model work). Set per slot via `cus launch --pool <p>` / `cus pool <slot> <p>`. Only meaningful in per_session mode.",
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
     "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
     "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
@@ -8141,6 +8215,38 @@ def unlock(slot_name: str) -> None:
         click.echo(f"Unlocked {name}")
     else:
         click.echo(f"{name} was not locked")
+
+
+@cli.command(name="pool")
+@click.argument("slot_name")
+@click.argument("new_pool", required=False, type=click.Choice(list(VALID_POOLS)))
+def pool_cmd(slot_name: str, new_pool: str | None) -> None:
+    """Show or set a slot's rotation-set pool (GH #99, per_session mode).
+
+    `cus pool slot-1`            → show slot-1's current pool
+    `cus pool slot-1 standard`   → retag slot-1 to the standard pool
+
+    premium slots honor the per-model weekly gate (swap off an account once a
+    tracked model's week hits per_model_weekly.cap_pct, and never swap back);
+    standard slots ignore it (keep using that account's aggregate headroom for
+    standard-model work). The pool lives on the slot's state entry, so it
+    survives the daemon moving accounts through the slot. Takes effect on the
+    daemon's next cycle — no restart needed (the daemon re-reads state).
+    """
+    state = load_state()
+    name = _normalize_slot_name(slot_name)
+    config = load_config()
+    entry = state.get("slots", {}).get(name)
+    if entry is None:
+        click.echo(f"{name} has no state entry — launch it first (`cus launch --pool <p>`) or check `cus status`.")
+        sys.exit(1)
+    if new_pool is None:
+        click.echo(f"{name}: pool={_slot_pool(state, name, config)}"
+                   + ("" if entry.get("pool") else "  (default; not explicitly set)"))
+        return
+    entry["pool"] = new_pool
+    save_state(state)
+    click.echo(f"{name} → pool={new_pool} (effective next daemon cycle)")
 
 
 def _pct_is_unknown(acct: dict, key: str | None = None) -> bool:
@@ -9554,7 +9660,8 @@ def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
         click.echo(f"  {d.name}: {'updated ' + str(len(result['keys_updated'])) + ' keys' if result['changed'] else 'already in sync'}")
 
 
-def _launch_prepare(account: str | None, state: dict, config: dict) -> tuple[str, Path, str]:
+def _launch_prepare(account: str | None, state: dict, config: dict,
+                    pool: str | None = None) -> tuple[str, Path, str]:
     """Everything `cus launch` does BEFORE the exec: pick account, acquire +
     heal + sync a slot, install the account's credentials into it.
 
@@ -9562,9 +9669,18 @@ def _launch_prepare(account: str | None, state: dict, config: dict) -> tuple[str
     exec itself is untestable in-process). Returns (slot_name, slot_dir,
     account). Raises click.ClickException with an operator-readable message
     on every refusal.
+
+    `pool` (GH #99): rotation-set the new slot joins ("premium"/"standard");
+    None falls back to per_session.default_pool. A standard-pool launch that
+    auto-picks its account ignores the per-model weekly gate, so it may pick a
+    model-exhausted account (that's the point — standard work drains stranded
+    aggregate headroom).
     """
+    pool = pool or config.get("per_session", {}).get("default_pool", "premium")
+    if pool not in VALID_POOLS:
+        raise click.ClickException(f"unknown pool '{pool}'. Valid: {list(VALID_POOLS)}")
     if account in (None, "auto"):
-        target = pick_launch_account(state, config)
+        target = pick_launch_account(state, _config_for_pool(config, pool))
         if target is None:
             raise click.ClickException("no launchable account (all expired/saturated?) — see `cus status` / `cus sos`")
         account = target.name
@@ -9603,14 +9719,17 @@ def _launch_prepare(account: str | None, state: dict, config: dict) -> tuple[str
     state = load_state()
     entry = state.setdefault("slots", {}).setdefault(slot_name, {"account": account, "created_ts": now_iso()})
     entry["last_launch_ts"] = now_iso()
+    entry["pool"] = pool  # GH #99: bind the slot to its rotation-set for its life
     save_state(state)
     return slot_name, slot_dir, account
 
 
 @cli.command(name="launch", context_settings={"ignore_unknown_options": True})
 @click.argument("account", required=False)
+@click.option("--pool", type=click.Choice(list(VALID_POOLS)), default=None,
+              help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
-def launch_cmd(account: str | None, claude_args: tuple[str, ...]) -> None:
+def launch_cmd(account: str | None, pool: str | None, claude_args: tuple[str, ...]) -> None:
     """Launch claude in its own slot, pinned to an account (per_session).
 
     ACCOUNT is an account name, or omitted/'auto' to pick the best by the
@@ -9619,14 +9738,15 @@ def launch_cmd(account: str | None, claude_args: tuple[str, ...]) -> None:
 
         cus launch                       # auto-pick, plain session
         cus launch rayi1 -- --resume X   # explicit account + claude args
+        cus launch --pool standard auto  # standard-pool slot (see `cus pool`)
 
-    The session keeps its slot for life; the daemon moves ACCOUNTS through
-    slots (in-place, no restart), never sessions. Optional alias to make
-    every launch slotted:  alias claude='cus launch auto --'
+    The session keeps its slot (and its pool) for life; the daemon moves
+    ACCOUNTS through slots (in-place, no restart), never sessions. Optional
+    alias to make every launch slotted:  alias claude='cus launch auto --'
     """
     state = load_state()
     config = load_config()
-    slot_name, slot_dir, account = _launch_prepare(account, state, config)
+    slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool)
     click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
