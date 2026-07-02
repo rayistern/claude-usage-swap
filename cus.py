@@ -1173,13 +1173,17 @@ def scaffold_login_store_dir(account: str, slot: str) -> Path:
     return dst
 
 
-def write_login_provenance(account: str, slot: str, source_email: str | None) -> dict:
-    """Record provenance for a freshly provisioned login and return it.
+def write_login_provenance(account: str, slot: str, source_email: str | None,
+                           bootstrapped: bool = False) -> dict:
+    """Record provenance for a provisioned login and return it.
 
-    Called by `cus login-mount --finish` after verifying the store dir holds a
-    valid, right-account login. Fingerprints the refresh token so later reads
-    can confirm the family is still the one we minted (and distinct from other
-    slots' families) without re-storing the secret."""
+    Called by `cus login-mount --finish` (after verifying a valid, right-account
+    interactive login) and by `--from-existing` (bootstrap from the snapshot).
+    Fingerprints the refresh token so later reads can tell families apart
+    without re-storing the secret. `bootstrapped=True` marks an entry that is a
+    COPY of the account's snapshot family (not an independent login) — only
+    clobber-safe as the SOLE live mount for that account; a second mount of the
+    same account must be a real `/login`."""
     creds = read_json(login_store_creds_path(account, slot))
     rt = _credential_refresh_token(creds)
     prov = {
@@ -1188,9 +1192,29 @@ def write_login_provenance(account: str, slot: str, source_email: str | None) ->
         "minted_ts": now_iso(),
         "source_email": source_email or "unknown",
         "refresh_fp": _refresh_fingerprint(rt) if rt else None,
+        "bootstrapped": bootstrapped,
     }
     write_json(login_store_provenance_path(account, slot), prov)
     return prov
+
+
+def duplicate_login_families() -> list[dict]:
+    """Store entries whose refresh-token fingerprint is shared by MORE THAN ONE
+    (account, slot) pair — i.e. the SAME token family installed on two mounts.
+
+    This is the precise failure this whole feature exists to prevent: two live
+    mounts sharing one refresh-token family clobber on rotation. It happens if
+    an account is bootstrapped (`--from-existing`) onto two slots, or a store
+    entry is hand-copied. Returns one dict per offending fingerprint:
+    {refresh_fp, pairs: ["slot->account", ...]}."""
+    by_fp: dict[str, list[str]] = {}
+    for rec in list_provisioned_logins():
+        prov = rec.get("provenance") or {}
+        fp = prov.get("refresh_fp")
+        if fp:
+            by_fp.setdefault(fp, []).append(f"{rec['slot']}->{rec['account']}")
+    return [{"refresh_fp": fp, "pairs": sorted(pairs)}
+            for fp, pairs in by_fp.items() if len(pairs) > 1]
 
 
 def login_age_days(account: str, slot: str) -> float | None:
@@ -1283,6 +1307,58 @@ def _slots_missing_logins(state: dict) -> list[tuple[str, str]]:
         except ValueError:
             return 1 << 30
     return sorted(out, key=_idx)
+
+
+def independent_logins_enabled(config: dict | None = None) -> bool:
+    """Whether the Phase 2 gate is on (independent_logins.use_independent_logins).
+
+    OFF by default → the swap path is bit-for-bit today's shared-snapshot copy."""
+    cfg = config if config is not None else load_config()
+    return bool(cfg.get("independent_logins", {}).get("use_independent_logins", False))
+
+
+def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path,
+                        config: dict | None = None) -> tuple[Path, bool]:
+    """Which creds file to install into a live mount when swapping to target_name.
+
+    Returns (path, used_independent). Phase 2 (#109): a SLOT swap, with the gate
+    on and an independent login provisioned for (target, slot), installs THAT
+    login's own token family — so two live mounts on one account never share a
+    refresh-token family to clobber (#104/#103/#3). Every other case (gate off,
+    no slot, no provisioned login) returns the shared per-account snapshot, i.e.
+    today's copy path. Lazy fallback is deliberate: an un-provisioned pair still
+    works (as a copy), it just isn't clobber-safe until `cus login-mount` runs."""
+    if slot is not None and independent_logins_enabled(config) and has_independent_login(target_name, slot):
+        return (login_store_creds_path(target_name, slot), True)
+    return (snapshot_creds, False)
+
+
+def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_bytes: bytes) -> str:
+    """Save a slot's live creds back into its (account, slot) independent-login
+    store entry, instead of the shared account snapshot (Phase 3a, #109).
+
+    WHY this must NOT go through classify_live_creds_owner: an independent login
+    deliberately carries a refresh token that matches NO account snapshot, so the
+    snapshot-matcher would verdict "unknown" and write the independent family
+    over the shared snapshot — reconciling the two families and re-introducing
+    the exact clobber this design removes (handoff §5.5). The mount has exactly
+    one writer session in per_session mode, so the live file provably belongs to
+    this (account, slot) family; we save it straight back to the store.
+
+    Carries the GH #77 freshness guard (never overwrite a newer stored login,
+    e.g. one just re-provisioned) and the GH #79 backup. Returns a status word."""
+    store_path = login_store_creds_path(account, slot)
+    live_exp = _creds_expires_at(live_creds)
+    if store_path.exists() and live_exp is not None:
+        try:
+            store_exp = _creds_expires_at(read_json(store_path))
+        except (json.JSONDecodeError, OSError):
+            store_exp = None  # unreadable store entry can't claim freshness
+        if store_exp is not None and store_exp > live_exp:
+            return "skipped-stale"
+    backup_credentials_file(store_path)
+    atomic_write_bytes(store_path, live_bytes, mode=0o600)
+    return "saved"
 
 
 def _pid_config_dir(pid: int) -> str | None:
@@ -3194,6 +3270,10 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # finished has already persisted its state.json, so `current` below is
     # never a stale pre-lock snapshot (the #76 interleaving scenario).
     state = load_state()
+    # Loaded once up front (not just for the ladder below): the #109 gate decides
+    # both the creds save-back destination and the install source, both earlier
+    # than the ladder block that historically owned this load.
+    config = load_config()
     if target_name not in state["accounts"]:
         raise ValueError(f"Unknown account '{target_name}'. Known: {sorted(state['accounts'].keys())}")
     if slot is None:
@@ -3232,16 +3312,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     if current_dir is not None:
         migrate_account_dir(current_dir)
 
-    # PHASE 2 SEAM (GH #109): `target_creds` is the shared per-account snapshot
-    # that gets copied into the live mount below (the `atomic_copy(target_creds,
-    # live_creds_path)` further down). When two live mounts hold the same
-    # account, both copies share one refresh-token family and clobber on rotation
-    # (#104/#103/#3). Phase 2 flips this, gated behind
-    # independent_logins.use_independent_logins: when ON and slot is not None,
-    # prefer login_store_creds_path(target_name, slot) if has_independent_login()
-    # — giving this mount its own login family — and fall back to this snapshot
-    # only when no independent login is provisioned. Phase 1 leaves the copy path
-    # untouched (the store is populated but not yet consumed here).
+    # GH #109: `target_creds` is the shared per-account snapshot. It is the
+    # DEFAULT install source below (the `atomic_copy(install_src, ...)`), but
+    # when the Phase 2 gate is on and a slot swap has an independent login for
+    # (target, slot), swap_install_source substitutes that login's own family so
+    # two live mounts on one account don't clobber on rotation (#104/#103/#3).
+    # Gate off (default) => install_src == target_creds, i.e. today's copy path.
     target_creds = target_dir / ".credentials.json"
     target_cj = target_dir / ".claude.json"
     if not target_creds.exists():
@@ -3325,7 +3401,22 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             live_creds = None
             click.echo(f"creds-save-back: SKIPPED — live {live_creds_path} unparseable ({e}); "
                        f"keeping '{current}' snapshot as-is")
-    if live_creds is not None:
+    # Phase 3a (#109): if this mount runs a per-(current, slot) INDEPENDENT
+    # login family (gate on + a login provisioned for the OUTGOING account on
+    # THIS slot), its live refresh token matches no account snapshot by design.
+    # Route the save-back to its own store entry so classify_live_creds_owner
+    # below never sees it, verdicts "unknown", and clobbers current's shared
+    # snapshot with the independent family (handoff §5.5). Gated: with the gate
+    # off this branch is never taken and behavior is unchanged.
+    if (live_creds is not None and slot is not None and current is not None
+            and independent_logins_enabled(config) and has_independent_login(current, slot)):
+        status_word = saveback_to_login_store(current, slot, live_creds, live_creds_bytes)
+        if status_word == "skipped-stale":
+            click.echo(f"creds-save-back: SKIPPED — stored login for ({slot}, {current}) is newer "
+                       f"than the live file; kept the store entry (GH #77-style guard)")
+        else:
+            click.echo(f"creds-save-back: saved ({slot}, {current}) independent login back to its store entry (GH #109)")
+    elif live_creds is not None:
         verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
         if verdict in ("expected", "unknown"):
             # "expected": provably current's tokens — the normal save-back.
@@ -3437,7 +3528,13 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # backup of the live file itself makes the install step independently
     # recoverable.
     backup_credentials_file(live_creds_path)
-    atomic_copy(target_creds, live_creds_path, mode=0o600)
+    # Phase 2 (#109): pick the install source — the (target, slot) independent
+    # login when the gate is on and one is provisioned, else the shared snapshot
+    # (today's copy path). See swap_install_source for the full rationale.
+    install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    atomic_copy(install_src, live_creds_path, mode=0o600)
+    if used_independent:
+        click.echo(f"creds-install: installed independent login for ({slot}, {target_name}) — GH #109")
 
     # Update state with progressive-threshold bookkeeping
     ts = now_iso()
@@ -3456,7 +3553,7 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # account's shared ladder exactly ONCE, not once per slot, else a single
     # 50% trip could jump straight to 90% (review finding 2026-07-02).)
     if current is not None and bump_ladder:
-        config = load_config()
+        # config was already loaded at the top of this function (reused here).
         cfg_steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
         ladder = list(cfg_steps) + [100]  # 100 = force sentinel
         current_acct = state["accounts"].get(current)
@@ -5425,6 +5522,20 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             severity="warning",
             summary=f"Independent login(s) expiring soon (assumed): {', '.join(expiring)}",
             action="Re-provision before they lapse: `cus login-mount <slot> <account>` then `--finish`.",
+            affected="system",
+        ))
+    # The precise clobber invariant: no two store entries may share ONE refresh
+    # family. Violated by bootstrapping (`--from-existing`) an account onto two
+    # slots, or hand-copying an entry. These two mounts WILL clobber on rotation
+    # — exactly what independent logins exist to prevent. Critical regardless of
+    # the gate, because the operator has provisioned them expecting safety.
+    for dup in duplicate_login_families():
+        out.append(SOSCondition(
+            severity="critical",
+            summary=f"Independent-login families collide across mounts: {', '.join(dup['pairs'])} share one token family",
+            action=("Two live mounts on one refresh-token family clobber on rotation. Give the extra "
+                    "mount(s) their OWN login: `cus login-mount <slot> <account>` (a real /login, "
+                    "NOT --from-existing — only the browser flow mints a distinct family)."),
             affected="system",
         ))
 
@@ -9781,8 +9892,11 @@ def _login_mount_status_line(rec: dict, config: dict) -> str:
               help="List every provisioned independent login and exit.")
 @click.option("--force", is_flag=True,
               help="With --finish: record provenance even if the login's identity does not match the account.")
+@click.option("--from-existing", "from_existing", is_flag=True,
+              help="Seed the store from the account's on-disk snapshot instead of an interactive /login. "
+                   "No browser needed, but only clobber-safe as the SOLE live mount for that account.")
 def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
-                    finish_flag: bool, list_flag: bool, force: bool) -> None:
+                    finish_flag: bool, list_flag: bool, force: bool, from_existing: bool) -> None:
     """Provision an INDEPENDENT `/login` for an account into one slot (GH #109).
 
     Today a slot's live credentials are a COPY of one account snapshot; two
@@ -9800,12 +9914,18 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
          rayi1 (not a wrong account — see the 2026-07-01 duplicate-identity
          incident) and records provenance.
 
+    BOOTSTRAP (no login): `cus login-mount slot-3 rayi1 --from-existing` seeds the
+    store from rayi1's on-disk snapshot. Use this for an account that backs just
+    ONE live mount — it costs no browser login. It is NOT independent from the
+    snapshot, so a SECOND simultaneous mount of the same account still needs a
+    real `/login` (only the browser flow mints a distinct refresh-token family).
+    `cus sos` flags any two mounts that end up sharing one family.
+
     Provisioning is LAZY: mint a login the first time a mount needs to host an
     account. `cus login-mount --list` (or `cus status`) shows what exists.
 
-    NOTE (Phase 1): this only POPULATES the store. The swap path still copies the
-    shared snapshot until `independent_logins.use_independent_logins` is turned on
-    (Phase 2). Provisioning logins now is safe and does nothing until then.
+    The swap path consumes these only when independent_logins.use_independent_logins
+    is on (Phase 2 gate; default off = today's shared-snapshot copy path).
     """
     config = load_config()
 
@@ -9835,6 +9955,37 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
         raise click.ClickException(
             f"Unknown account '{account}' — no {account_dir}. Run `cus list` to see accounts, "
             f"or `cus add {account}` first.")
+
+    if from_existing:
+        # Bootstrap: copy the account's on-disk snapshot into the store. No
+        # login. NOT independent from the snapshot — safe only as the sole mount.
+        snap_creds = account_creds_path(account)
+        try:
+            snap_ok = _credential_refresh_token(read_json(snap_creds)) is not None
+        except (json.JSONDecodeError, OSError):
+            snap_ok = False
+        if not snap_ok:
+            raise click.ClickException(
+                f"{account}'s snapshot ({snap_creds}) has no usable credentials to bootstrap from. "
+                f"Log in normally instead: `cus login-mount {slot} {account}`.")
+        scaffold_login_store_dir(account, slot)
+        # Copy creds + identity so the store entry mirrors the snapshot exactly.
+        atomic_copy(snap_creds, login_store_creds_path(account, slot), mode=0o600)
+        snap_cj = account_dir / ".claude.json"
+        if snap_cj.exists():
+            atomic_copy(snap_cj, login_store_cj_path(account, slot), mode=0o600)
+        email = account_canonical_identity(account).get("emailAddress")
+        prov = write_login_provenance(account, slot, email, bootstrapped=True)
+        click.echo(click.style(f"✓ Bootstrapped ({slot}, {account}) from the on-disk snapshot.", fg="green"))
+        click.echo(f"  identity: {email or 'unknown'}   fingerprint: {prov['refresh_fp']}   (bootstrapped copy)")
+        # Warn if this now duplicates a family already on another mount.
+        dups = [d for d in duplicate_login_families() if prov["refresh_fp"] == d["refresh_fp"]]
+        if dups:
+            click.echo(click.style(
+                f"  ⚠ this family is now on multiple mounts: {dups[0]['pairs']}. Two mounts on ONE "
+                f"family clobber on rotation — the 2nd+ mount must be a real login "
+                f"(`cus login-mount <slot> {account}`), not --from-existing.", fg="yellow"))
+        return
 
     if finish_flag:
         creds_path = login_store_creds_path(account, slot)

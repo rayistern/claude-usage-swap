@@ -345,6 +345,130 @@ def test_gate_off_by_default_swap_path_untouched():
         env.restore()
 
 
+# --------------------------------------------------------------------------
+# Phase 2 (install source) + Phase 3a (store-aware save-back)
+# --------------------------------------------------------------------------
+
+def test_swap_install_source_gate_off_uses_snapshot():
+    env = _Env()
+    try:
+        snap = env.accounts_dir / "account-alpha" / ".credentials.json"
+        env.plant_login("alpha", "slot-1", "rt-indep", "alpha@x")
+        # Gate off (default): snapshot even when a login exists.
+        path, used = cus.swap_install_source("alpha", "slot-1", snap, {"independent_logins": {"use_independent_logins": False}})
+        assert path == snap and used is False
+    finally:
+        env.restore()
+
+
+def test_swap_install_source_gate_on_prefers_login_then_falls_back():
+    env = _Env()
+    try:
+        snap = env.accounts_dir / "account-alpha" / ".credentials.json"
+        cfg = {"independent_logins": {"use_independent_logins": True}}
+        # No login provisioned → snapshot fallback.
+        path, used = cus.swap_install_source("alpha", "slot-1", snap, cfg)
+        assert path == snap and used is False
+        # Login provisioned → its store creds.
+        env.plant_login("alpha", "slot-1", "rt-indep", "alpha@x")
+        path, used = cus.swap_install_source("alpha", "slot-1", snap, cfg)
+        assert path == cus.login_store_creds_path("alpha", "slot-1") and used is True
+        # No slot (global mount) → always snapshot, never a store login.
+        path, used = cus.swap_install_source("alpha", None, snap, cfg)
+        assert path == snap and used is False
+    finally:
+        env.restore()
+
+
+def test_saveback_to_login_store_writes_store_and_guards_freshness():
+    env = _Env()
+    try:
+        env.plant_login("alpha", "slot-1", "rt-indep", "alpha@x")
+        fresh = _creds("rt-indep-rotated", expires_at=3_000_000_000_000)
+        r = cus.saveback_to_login_store("alpha", "slot-1", fresh, json.dumps(fresh).encode())
+        assert r == "saved"
+        assert cus._credential_refresh_token(cus.read_json(cus.login_store_creds_path("alpha", "slot-1"))) == "rt-indep-rotated"
+        # A staler live file must NOT overwrite the newer store entry.
+        stale = _creds("rt-indep-old", expires_at=1_000_000_000_000)
+        r2 = cus.saveback_to_login_store("alpha", "slot-1", stale, json.dumps(stale).encode())
+        assert r2 == "skipped-stale"
+        assert cus._credential_refresh_token(cus.read_json(cus.login_store_creds_path("alpha", "slot-1"))) == "rt-indep-rotated"
+    finally:
+        env.restore()
+
+
+def test_gate_on_swap_installs_independent_login_and_saveback_protects_snapshot():
+    """End-to-end: with the gate on, a slot swap installs the independent login,
+    and swapping out saves the rotated family to the STORE — the account snapshot
+    is never clobbered (the whole point of #109)."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        state = cus.load_state()
+        state["slots"] = {}  # start clean so create_slot picks slot-1 fresh
+        cus.save_state(state)
+        state = cus.load_state()
+        name, d = cus.create_slot(state)
+        cus.save_state(state)
+
+        # Independent login for (alpha, slot) with a DISTINCT refresh family.
+        env.plant_login("alpha", name, "rt-indep-alpha", "alpha@x")
+        cus.execute_swap("alpha", trigger="launch", slot=name)
+        # The mount got the independent creds, NOT the snapshot copy (rt-alpha).
+        assert cus._credential_refresh_token(cus.read_json(d / ".credentials.json")) == "rt-indep-alpha"
+
+        # Session rotates the independent family in the mount, then we swap out.
+        rotated = _creds("rt-indep-alpha-rotated", expires_at=3_000_000_000_000)
+        (d / ".credentials.json").write_text(json.dumps(rotated))
+        cus.execute_swap("beta", trigger="threshold", slot=name)
+
+        # Rotated family saved back to the STORE, not the account snapshot.
+        store_rt = cus._credential_refresh_token(cus.read_json(cus.login_store_creds_path("alpha", name)))
+        assert store_rt == "rt-indep-alpha-rotated"
+        # alpha's account snapshot is UNTOUCHED (still its own family).
+        snap_rt = cus._credential_refresh_token(cus.read_json(env.accounts_dir / "account-alpha" / ".credentials.json"))
+        assert snap_rt == "rt-alpha", "account snapshot must NOT be clobbered by the independent family"
+        # beta has no independent login → snapshot copy installed (fallback).
+        assert cus._credential_refresh_token(cus.read_json(d / ".credentials.json")) == "rt-beta"
+    finally:
+        env.restore()
+
+
+# --------------------------------------------------------------------------
+# --from-existing bootstrap + duplicate-family detection
+# --------------------------------------------------------------------------
+
+def test_from_existing_bootstrap_seeds_from_snapshot():
+    env = _Env()
+    try:
+        r = CliRunner().invoke(cus.cli, ["login-mount", "slot-1", "alpha", "--from-existing"])
+        assert r.exit_code == 0, r.output
+        assert "Bootstrapped" in r.output
+        # Store creds match the snapshot family; provenance marked bootstrapped.
+        assert cus._credential_refresh_token(cus.read_json(cus.login_store_creds_path("alpha", "slot-1"))) == "rt-alpha"
+        prov = cus.read_login_provenance("alpha", "slot-1")
+        assert prov["bootstrapped"] is True
+        assert prov["refresh_fp"] == cus._refresh_fingerprint("rt-alpha")
+    finally:
+        env.restore()
+
+
+def test_duplicate_family_detected_and_warned_and_sos():
+    env = _Env()
+    try:
+        # Bootstrap alpha onto TWO slots → same family on two mounts (the clobber).
+        CliRunner().invoke(cus.cli, ["login-mount", "slot-1", "alpha", "--from-existing"])
+        r = CliRunner().invoke(cus.cli, ["login-mount", "slot-2", "alpha", "--from-existing"])
+        assert r.exit_code == 0
+        assert "multiple mounts" in r.output  # command warns at provision time
+        dups = cus.duplicate_login_families()
+        assert dups and sorted(dups[0]["pairs"]) == ["slot-1->alpha", "slot-2->alpha"]
+        conds = cus.diagnose(cus.load_state(), cus.load_config())
+        assert any("collide across mounts" in c.summary and c.severity == "critical" for c in conds)
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
