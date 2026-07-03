@@ -199,6 +199,21 @@ USAGE_API_BETA = os.environ.get("CUS_USAGE_BETA", "oauth-2025-04-20")
 USAGE_API_TIMEOUT_SECONDS = 10
 USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 
+# OAuth token endpoint + Claude Code's public client id, for the claim-time
+# refresh-token liveness probe (#127). Same well-known pair the ecosystem
+# (cux, opencode, ...) uses for the refresh grant Claude Code itself performs.
+# Verified live 2026-07-03 against a known-dead branch: platform.claude.com
+# (and api.anthropic.com) answer 400 {"error":"invalid_grant"}; the old
+# console.anthropic.com path 404s, and urllib's default User-Agent is
+# Cloudflare-blocked (403 code 1010) — hence OAUTH_USER_AGENT below.
+# Env-overridable like the usage endpoint above, for future shifts. A wrong
+# endpoint degrades to fail-open (probe verdict "unknown" → claim proceeds
+# unverified, i.e. pre-#127 behavior) — never to a blocked claim.
+OAUTH_TOKEN_URL = os.environ.get("CUS_OAUTH_TOKEN_ENDPOINT", "https://platform.claude.com/v1/oauth/token")
+OAUTH_CLIENT_ID = os.environ.get("CUS_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+OAUTH_USER_AGENT = os.environ.get("CUS_OAUTH_USER_AGENT", "claude-cli/2.0.0 (external)")
+OAUTH_TOKEN_TIMEOUT_SECONDS = 15
+
 
 # --------------------------------------------------------------------------
 # Defaults — everything overridable via config.yaml
@@ -288,6 +303,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # sos warns this many days before a provisioned login's assumed expiry
         # so the operator can re-login before a swap would fall back to a copy.
         "warn_expiry_within_days": 5,
+        # Claim-time liveness (#127, 2026-07-03): before installing a pooled
+        # family, prove its refresh token is still ALIVE via a refresh-token
+        # grant (the ONLY definitive check — expired access tokens look
+        # identical on dead and live branches; rayi1/family-1 vs family-2
+        # incident). Dead stores are retired + the next family is tried;
+        # network/endpoint trouble FAILS OPEN to today's install-as-is.
+        # False ⇒ bit-for-bit pre-#127 claim behavior.
+        "verify_family_on_claim": True,
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -1252,8 +1275,116 @@ def free_login_family(account: str, state: dict) -> str | None:
 def has_free_login_family(account: str, state: dict) -> bool:
     """True iff a rescue swap onto `account` could claim a distinct login family
     (so double-booking it would not clobber). The pool-model replacement for the
-    per-slot has_independent_login predicate."""
+    per-slot has_independent_login predicate.
+
+    Deliberately does NOT probe liveness (#127): this is the cheap decision-
+    layer predicate, called many times per cycle. The claim itself
+    (claim_verified_login_family, execution layer) does the definitive
+    refresh-grant probe and skips dead stores; an optimistic True here at
+    worst becomes a failed move logged by _execute_slot_moves."""
     return free_login_family(account, state) is not None
+
+
+def _oauth_refresh_grant(refresh_token: str) -> tuple[str, dict | None]:
+    """Probe a refresh token's liveness via the OAuth refresh grant (#127).
+
+    Returns ("alive", token_response) — WHICH ROTATES THE TOKEN: the caller
+    MUST persist the response's new refresh token immediately or the family
+    is lost; ("dead", None) on a definitive invalid_grant (the branch was
+    rotated away elsewhere — the poisoned-store signature); ("unknown", None)
+    on anything else (network, 5xx, endpoint drift) so callers can FAIL OPEN.
+
+    Why a rotation is the check: access-token expiry cannot distinguish dead
+    from live branches — in the 2026-07-03 incident, dead rayi1/family-1 and
+    live family-2 both sat at expired access tokens; only the grant told them
+    apart. Rotating a FREE family is safe: free ⇒ no live mount holds it, so
+    nobody else's chain is invalidated, and the claimant's session would have
+    refreshed immediately anyway."""
+    body = json.dumps({"grant_type": "refresh_token",
+                       "refresh_token": refresh_token,
+                       "client_id": OAUTH_CLIENT_ID}).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json",
+                                          # urllib's default UA is Cloudflare-blocked
+                                          # (403 code 1010) at this endpoint.
+                                          "User-Agent": OAUTH_USER_AGENT}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=OAUTH_TOKEN_TIMEOUT_SECONDS) as resp:
+            return ("alive", json.loads(resp.read(USAGE_API_RESPONSE_LIMIT_BYTES)))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read(USAGE_API_RESPONSE_LIMIT_BYTES).decode(errors="replace")
+        except OSError:
+            payload = ""
+        # Only invalid_grant is a death certificate; any other 4xx/5xx could be
+        # throttling, schema drift, or a wrong endpoint — treat as unknown.
+        if e.code in (400, 401) and "invalid_grant" in payload:
+            return ("dead", None)
+        return ("unknown", None)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return ("unknown", None)
+
+
+def claim_verified_login_family(account: str, state: dict, config: dict | None = None) -> str | None:
+    """Pick a free family to claim, PROVEN alive (#127) — the execution-layer
+    twin of free_login_family.
+
+    Walks free families lowest-first. Per family: refresh-grant probe.
+      - alive  → persist the rotated tokens into the store (the old refresh
+                 token is invalid the moment the grant succeeds), return it.
+      - dead   → retire the store (rename creds to .dead-<date>, so
+                 list_login_families stops offering it and SOS/doctor can
+                 count retirements), try the next family. This is how the
+                 2026-07-03 poisoned stores (pre-PR#126 save-back bug) get
+                 swept out lazily instead of logging out a live session.
+      - unknown→ FAIL OPEN: return the family unverified (pre-#127 behavior).
+                 A network blip must not turn a working pool into a refused
+                 claim; worst case is exactly the old behavior.
+
+    Config gate independent_logins.verify_family_on_claim (default True);
+    False short-circuits to plain free_login_family."""
+    cfg = config if config is not None else load_config()
+    if not cfg.get("independent_logins", {}).get("verify_family_on_claim", True):
+        return free_login_family(account, state)
+    leased = leased_families(account, state)
+    for fam in list_login_families(account):  # lowest-first
+        if fam in leased:
+            continue
+        path = login_family_creds_path(account, fam)
+        try:
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue  # unusable store; next
+        rt = _credential_refresh_token(creds)
+        if not rt:
+            continue
+        verdict, tok = _oauth_refresh_grant(rt)
+        if verdict == "dead":
+            dead_name = f"{path.name}.dead-{datetime.now(timezone.utc):%Y%m%d}"
+            path.rename(path.with_name(dead_name))
+            click.echo(f"claim-verify: {account}/{fam} refresh token DEAD (invalid_grant) — "
+                       f"retired store to {dead_name}; trying next family (#127)")
+            continue
+        if verdict == "alive":
+            # Persist the rotation BEFORE returning — after the grant, the
+            # store's old refresh token is a dead branch by definition.
+            oauth = dict(creds.get("claudeAiOauth") or {})
+            oauth["accessToken"] = tok.get("access_token") or oauth.get("accessToken")
+            oauth["refreshToken"] = tok.get("refresh_token") or rt
+            if tok.get("expires_in"):
+                oauth["expiresAt"] = int((time.time() + float(tok["expires_in"])) * 1000)
+            creds = dict(creds)
+            creds["claudeAiOauth"] = oauth
+            backup_credentials_file(path)
+            atomic_write_bytes(path, json.dumps(creds, indent=2).encode(), mode=0o600)
+            click.echo(f"claim-verify: {account}/{fam} proven alive (refresh grant OK; "
+                       f"store updated with rotated tokens — #127)")
+            return fam
+        click.echo(f"claim-verify: {account}/{fam} unverifiable (network/endpoint) — "
+                   f"claiming unverified, fail-open (#127)")
+        return fam
+    return None
 
 
 def login_family_provenance_path(account: str, family_id: str) -> Path:
@@ -3982,7 +4113,10 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     used_independent = False
     if (slot is not None and independent_logins_enabled(config)
             and _account_held_by_other_live_mount(state, target_name, slot)):
-        claimed_family = free_login_family(target_name, state)
+        # #127: liveness-verified claim — probes each free family's refresh
+        # token, retires dead stores (the pre-PR#126 poisoning landmines), and
+        # persists the rotation into the store this install copies from.
+        claimed_family = claim_verified_login_family(target_name, state, config)
         if claimed_family is not None:
             install_src = login_family_creds_path(target_name, claimed_family)
             used_independent = True

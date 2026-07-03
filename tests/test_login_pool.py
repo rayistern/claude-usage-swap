@@ -66,6 +66,13 @@ class _Env:
         cus.mount_pids = lambda mount: [1] if Path(mount).name in self.live_slots else []
         cus._OCCUPIED_SLOTS_CACHE.clear()
 
+        # #127: never let a test hit the real OAuth endpoint. Default verdict
+        # "unknown" = fail-open, which is byte-identical to pre-#127 claim
+        # behavior, so pre-existing claim tests are unaffected. Tests that
+        # exercise the probe itself layer a _Probe on top of this.
+        self._saved_probe = cus._oauth_refresh_grant
+        cus._oauth_refresh_grant = lambda rt: ("unknown", None)
+
     def set_config(self, cfg: dict) -> None:
         cus.write_yaml(cus.CONFIG_YAML, cfg)
 
@@ -263,6 +270,120 @@ def test_second_same_cycle_move_refuses_when_no_family():
         assert raised, "second same-cycle landing without a family must refuse, not clobber"
         assert cus.load_state()["slots"][s2]["account"] == "alpha"
     finally:
+        env.restore()
+
+
+class _Probe:
+    """Swap out the network refresh-grant with a scripted per-token verdict.
+    verdicts: {refresh_token: ("alive", resp) | ("dead", None) | ("unknown", None)}.
+    Records calls so tests can assert the probe ran (or didn't)."""
+
+    def __init__(self, verdicts):
+        self.verdicts, self.calls = verdicts, []
+        self._orig = cus._oauth_refresh_grant
+        cus._oauth_refresh_grant = self
+
+    def __call__(self, rt):
+        self.calls.append(rt)
+        return self.verdicts.get(rt, ("unknown", None))
+
+    def restore(self):
+        cus._oauth_refresh_grant = self._orig
+
+
+def test_claim_skips_dead_family_and_claims_next_alive():
+    """#127 regression (2026-07-03 second logout): rayi1/family-1's store held a
+    dead branch (poisoned by the pre-PR#126 save-back bug); the claim installed
+    it and the live session logged out. A claim must PROBE each free family:
+    dead → retire store + try next; alive → persist the rotated tokens and
+    install THOSE."""
+    env = _Env()
+    probe = _Probe({"rt-beta-fam1": ("dead", None),
+                    "rt-beta-fam2": ("alive", {"access_token": "at-rotated",
+                                               "refresh_token": "rt-beta-fam2-rotated",
+                                               "expires_in": 28800})})
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)  # beta held → claim path
+        env.plant_family("beta", "family-1", "rt-beta-fam1")   # dead branch
+        env.plant_family("beta", "family-2", "rt-beta-fam2")   # alive
+        cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        # family-1 retired: creds renamed away, no longer listed as usable.
+        assert not cus.login_family_creds_path("beta", "family-1").exists()
+        assert cus.list_login_families("beta") == ["family-2"]
+        # family-2 claimed, with the ROTATED token both in store and on mount.
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-2"
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta-fam2-rotated", live_rt
+        store_rt = cus._credential_refresh_token(cus.read_json(cus.login_family_creds_path("beta", "family-2")))
+        assert store_rt == "rt-beta-fam2-rotated", store_rt
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_claim_fail_open_when_probe_unverifiable():
+    """Network/endpoint trouble must NOT block a claim — verdict 'unknown'
+    claims the family unverified, byte-identical to pre-#127 behavior."""
+    env = _Env()
+    probe = _Probe({})  # everything → unknown
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        assert probe.calls == ["rt-beta-fam1"]
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta-fam1"  # unrotated store install, as before
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-1"
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_claim_all_dead_refuses_like_pool_exhausted():
+    """Every free family dead ⇒ the claim comes back empty and execute_swap
+    refuses (failed move; slot holds) — a dead pool must never fall through to
+    the clobbering snapshot copy."""
+    env = _Env()
+    probe = _Probe({"rt-beta-fam1": ("dead", None), "rt-beta-fam2": ("dead", None)})
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        env.plant_family("beta", "family-2", "rt-beta-fam2")
+        raised = False
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        except RuntimeError as e:
+            raised = "pool exhausted" in str(e)
+        assert raised, "all-dead pool must refuse, not clobber"
+        assert cus.load_state()["slots"][mover]["account"] == "alpha"
+        assert cus.list_login_families("beta") == []  # both retired
+    finally:
+        probe.restore()
+        env.restore()
+
+
+def test_claim_verify_gate_off_skips_probe():
+    """verify_family_on_claim: false ⇒ plain free_login_family, no probe call —
+    the pre-#127 escape hatch."""
+    env = _Env()
+    probe = _Probe({})
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True,
+                                               "verify_family_on_claim": False}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cus.execute_swap("beta", trigger="auto-ladder", slot=mover)
+        assert probe.calls == [], "gate off must not probe"
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-1"
+    finally:
+        probe.restore()
         env.restore()
 
 
