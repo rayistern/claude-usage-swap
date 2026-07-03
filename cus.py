@@ -1821,12 +1821,18 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         except Exception:
             return None
 
+    # Operator-disabled accounts are out of rotation for launches too — and
+    # these two raw fallbacks below BYPASS pick_swap_target's universal
+    # filters, so they need the exclusion explicitly (2026-07-03).
+    disabled = _disabled_accounts(config)
+
     # First: spread across all mounts. Fallback: allow reusing idle-slot
     # accounts, but still never a live-mount account.
     target = _try(spread_occupied) or _try(live_occupied)
     if target is None:
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
-                 if not a.get("token_expired") and not a.get("poll_error") and n not in live_occupied]
+                 if not a.get("token_expired") and not a.get("poll_error")
+                 and n not in live_occupied and n not in disabled]
         if cands:
             n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
@@ -1837,7 +1843,8 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     # whenever slots saturated the pool, even with a 4%-used account joinable.
     if target is None and config.get("per_session", {}).get("lane_sharing", False):
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
-                 if not a.get("token_expired") and not a.get("poll_error") and n in live_occupied]
+                 if not a.get("token_expired") and not a.get("poll_error")
+                 and n in live_occupied and n not in disabled]
         if cands:
             n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
@@ -2799,6 +2806,21 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
 
 
+def _disabled_accounts(config: dict) -> set:
+    """Accounts the operator marked `disabled: true` in config.yaml's accounts
+    list — a hard out-of-rotation switch (2026-07-03, user request: `default`
+    depleted its Fable weekly while the polled per-model number still read 87%,
+    under the 97% gate — the operator knows things the poll doesn't).
+
+    Semantics: NEVER a swap/launch target, no degraded-pool fallback (an
+    operator mandate outranks "swap somewhere rather than sit on a hot
+    active"). Polling continues (so the operator can see when its windows
+    reset) and a lane already ON the account keeps running — the flag only
+    stops NEW placements. Re-enable by deleting the key or setting false."""
+    return {a.get("name") for a in config.get("accounts", [])
+            if isinstance(a, dict) and a.get("disabled")}
+
+
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     """Pick which account to swap to, based on configured strategy.
 
@@ -2814,6 +2836,8 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
     Universal filters applied across ALL strategies (GH #17 — strategy audit
     2026-05-24):
+      0. operator-disabled (`disabled: true` in config accounts) always
+         excluded, no fallback — see _disabled_accounts (2026-07-03).
       1. token_expired / poll_error always excluded.
       2. rate_limited excluded unless smart_strategy.allow_rate_limited_targets.
       3. hard_7d_cap: never pick an account at/above the user-stated 80%
@@ -2827,10 +2851,14 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         return None
 
     # Hard filter: never pick an account with no working tokens / can't poll
-    # at all. token_expired and poll_error always exclude.
+    # at all. token_expired and poll_error always exclude, as does an
+    # operator `disabled: true` (out-of-rotation mandate — no fallback tier
+    # below ever re-admits these, unlike the cap/headroom soft filters).
+    disabled = _disabled_accounts(config)
     candidates: list[tuple[str, dict]] = [
         (name, acct) for name, acct in accounts.items()
         if name != current
+        and name not in disabled
         and not acct.get("token_expired", False)
         and not acct.get("poll_error")
     ]
@@ -8399,10 +8427,15 @@ def status() -> None:
     click.echo()
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 104)
+    disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
         marker = " *" if name == state["active"] else ""
         last = a.get("last_swap_ts") or "never"
         flags = []
+        # Operator out-of-rotation flag (config, not polled state) — surfaced
+        # here so nobody wonders why the picker never chooses this account.
+        if name in disabled:
+            flags.append("DISABLED")
         if a.get("token_expired"):
             flags.append("TOKEN_EXPIRED")
         if a.get("rate_limited"):
