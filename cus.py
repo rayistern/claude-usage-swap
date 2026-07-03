@@ -9596,18 +9596,26 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     # can always tell render-time staleness regardless of which branch hit.
     render_stamp = _fmt_render_stamp_eastern()
 
-    # SOS takes priority — if human action is needed, surface it loudly
+    # SOS surfacing (2026-07-03): a human-action-needed condition is emitted as
+    # its OWN first line, but we NO LONGER early-return — the normal account /
+    # percentage line still renders below it. Before this, an SOS/warning
+    # REPLACED the usage numbers entirely (early return), so once the lanes
+    # target-starvation warning (diagnose Condition 2b) started firing every
+    # cycle the operator lost sight of their percentages behind the alert.
+    # User request 2026-07-03: "the SOS shouldn't block me from seeing the
+    # percentages — can it be a new line." So the most-severe condition prints
+    # on line 1 (loud), and the usage line always follows on line 2. Only the
+    # top condition is shown here to keep the alert one line; `cus sos` lists
+    # the full set.
     conditions = diagnose(state, config)
     urgent = [c for c in conditions if c.severity == "urgent"]
+    warning = [c for c in conditions if c.severity == "warning"]
     if urgent:
         msg = f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md · {render_stamp}"
         click.echo(click.style(msg, fg="red", bold=True) if color_on else msg, color=color_on)
-        return
-    warning = [c for c in conditions if c.severity == "warning"]
-    if warning:
+    elif warning:
         msg = f"⚠ cus: {warning[0].summary} · {render_stamp}"
         click.echo(click.style(msg, fg="yellow", bold=True) if color_on else msg, color=color_on)
-        return
 
     # Determine THIS session's account (the one this pane's claude actually
     # loaded tokens for) vs machine-wide active.
