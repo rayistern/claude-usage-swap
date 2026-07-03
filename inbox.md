@@ -6,6 +6,10 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-125-merge-same-cause-as-123-124-entries)
+- [2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-124-merge-same-cause-as-123-entry)
+- [2026-07-03 — flag — Gym record loop for PR #123 merge blocked: repo not gym-initialized](#2026-07-03-flag-gym-record-loop-for-pr-123-merge-blocked-repo-not-gym-initialized)
+- [2026-07-03 — flag — gym record loop for PR #114 merge blocked: repo has no initialized gym DB](#2026-07-03-flag-gym-record-loop-for-pr-114-merge-blocked-repo-has-no-initialized-gym-db)
 - [2026-07-02 — decision — Built #109 Phase 1 (per-(slot,account) independent-login store + `cus login-mount`) + Phase 0 harness on a fresh branch off main; swap path untouched (gate off)](#2026-07-02-decision-built-109-phase-1-per-slot-account-independent-login-store-cus-login-mount-phase-0-harness-on-a-fresh-branch-off-main-swap-path-untouched-gate-off)
 - [2026-07-02 — decision — Built PR #93 plan (per_session slots) same-day on the plan's own branch; production untouched; three plan deviations noted](#2026-07-02-decision-built-pr-93-plan-per-session-slots-same-day-on-the-plan-s-own-branch-production-untouched-three-plan-deviations-noted)
 - [2026-07-02 — flag — Gym record loop unavailable for PR #86 review / PR #88 merge — cus is not gym-initialized; hook #99 v2 guidance needed](#2026-07-02-flag-gym-record-loop-unavailable-for-pr-86-review-pr-88-merge-cus-is-not-gym-initialized-hook-99-v2-guidance-needed)
@@ -23,6 +27,71 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr-125
+
+**What happened:** PR #125 (per-account `disabled: true` out-of-rotation flag, for the Fable-depleted `default` account) merged as `154daa4`. The MCP-discipline hook (#99 v2) again requires the gym record loop; still blocked — claude-usage-swap has no initialized gym database. Third occurrence today; the open question from the PR #123 flag (gym-init this repo vs exempt non-gym repos in the hook) covers all three merges: `b315334`, `15dc7a9`, `154daa4`.
+
+### Walk-back path
+1. Same as the PR #123 flag: `gym init` here, then record all three merges retroactively; or accept the audit-gap report + these flags as the exemption record.
+
+---
+
+
+## 2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr-124 #pool #clobber
+
+**What happened:** PR #124 (clobber guard read stale 5s-TTL occupancy cache → slot-2/slot-7 double-landed on rayi3's snapshot family at 16:10Z, slot-2 logged out) merged as `15dc7a9`; daemon restarted on the fixed code at 16:18Z. The MCP-discipline hook (#99 v2) again requires the gym record loop, and it is blocked by the same condition flagged earlier today: claude-usage-swap has no initialized gym database (`gym_session_start` refuses — no `alembic_version` table at `gym.db`).
+
+**Open question (unchanged, from the PR #123 flag):** gym-init this repo so coding-fleet merges get gym records, or exempt non-gym repos in the discipline hook? Until answered, merges `b315334` (#123) and `15dc7a9` (#124) have inbox flags as their provenance trail, per the hook's cannot-complete instruction.
+
+### Walk-back path
+1. Same as the PR #123 flag: if gym is wanted here, run `gym init` in /home/rayi/repos/claude-usage-swap, then record both merges retroactively (gym_session_start → gym_design cluster=AVC_RUN → gym_drill → gym_run with SHAs b315334 and 15dc7a9).
+2. If not, the `python scripts/mcp_discipline_audit.py --days 1` gap report plus these two flags document the exemption case.
+
+---
+
+
+## 2026-07-03 — flag — Gym record loop for PR #123 merge blocked: repo not gym-initialized
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr-123 #pool
+
+**What happened:** The MCP-discipline hook (#99 v2) requires the gym record loop (gym_design → gym_drill → gym_run with merge SHA) after merging a PR via gh CLI. PR #123 (fix for the 08:57Z slot-2 → rayi3@99% rate-limit incident: pool-rescued pick died at the taken-veto in `decide_slot_swaps`) was merged as `b315334` and the daemon restarted on the fixed code.
+
+**Blocker:** `gym_session_start` fails: `database_path '/home/rayi/repos/claude-usage-swap/gym.db' has no 'alembic_version' table — this is not an initialized gym database.` claude-usage-swap has never been gym-initialized; per cross-repo CLAUDE.md, gym is scoped to research/ML/gym-using repos, which this is not.
+
+**Question for the user:** Should claude-usage-swap be gym-initialized (`gym init`) so coding-fleet PR merges here get gym records, or should the discipline hook exempt non-gym repos? Until decided, the PR #123 merge has no gym record — this entry is the provenance trail. Per the hook's instruction, this is posted instead of skip-and-annotate.
+
+### Walk-back path
+1. If gym records are wanted here: run `gym init` in /home/rayi/repos/claude-usage-swap, then re-run the loop for merge b315334 (gym_session_start → gym_design cluster=AVC_RUN experiment_id=pool-rescue-taken-veto-fix-20260703 → gym_drill → gym_run).
+2. If not wanted: no action; this flag documents the gap for the #99 v2 audit (`python scripts/mcp_discipline_audit.py --days 1` will surface it).
+
+---
+
+
+## 2026-07-03 — flag — gym record loop for PR #114 merge blocked: repo has no initialized gym DB
+
+- **Status:** open
+- **Type:** flag
+- **Tags:** #gym #discipline-hook #pr114
+
+The MCP-discipline hook (#99 v2) requires gym_design → gym_drill → gym_run after a `gh pr merge` (PR #114, merge commit 1eec16c). The loop is blocked at the first write: `gym_session_start` fails with "Configured database_path '/home/rayi/repos/claude-usage-swap/gym.db' has no 'alembic_version' table — the path did not exist" — i.e. claude-usage-swap has never been gym-initialized.
+
+**Question for the operator:** should claude-usage-swap be gym-initialized (`gym init` here), or should the discipline hook exempt non-gym repos (top-level CLAUDE.md says non-research repos can skip gym_general.md, which suggests this repo is out of gym's intended scope)? Not initializing unilaterally — creating a new canonical experiment store for a repo is an infrastructure decision, not a session-level call.
+
+Per the hook's instruction this is posted as an inbox entry rather than skip-and-annotate (umbrella vibeCoding#197). PR #114 itself is merged and verified conventionally: 254/254 pytest, live `cus sos` / `cus status` / `pick_launch_account` checks against production state.
+
+---
+
 
 ## 2026-07-02 — decision — Built #109 Phase 1 (per-(slot,account) independent-login store + `cus login-mount`) + Phase 0 harness on a fresh branch off main; swap path untouched (gate off)
 

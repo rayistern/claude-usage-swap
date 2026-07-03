@@ -60,6 +60,26 @@ def test_disabled_only_candidate_means_no_target():
     assert t is None, t
 
 
+def test_model_weekly_target_cap_excludes_warm_model_account():
+    """Asymmetric per-model bar (2026-07-03, user): an account at Fable=87%
+    must not be PICKED as a target when target_cap_pct=80, even though 87 is
+    under the swap-away cap_pct=97 (a lane already on it may keep draining).
+    Unset target_cap_pct falls back to cap_pct — old symmetric behavior."""
+    accts = {"alpha": _a(95, 40),
+             "beta": dict(_a(0, 10), per_model_weekly_pct={"Fable": 87.0}),
+             "gamma": _a(30, 20)}
+    cfg = _cfg()
+    cfg["per_model_weekly"] = {"gate_enabled": True, "models": ["Fable"],
+                               "cap_pct": 97, "target_cap_pct": 80}
+    t = cus.pick_swap_target({"active": "alpha", "accounts": accts}, cfg)
+    assert t is not None and t.name == "gamma", t and t.name
+    # Fallback: without target_cap_pct, 87 < 97 keeps beta eligible (and it
+    # wins on headroom) — pins that the new knob is opt-in.
+    del cfg["per_model_weekly"]["target_cap_pct"]
+    t2 = cus.pick_swap_target({"active": "alpha", "accounts": accts}, cfg)
+    assert t2 is not None and t2.name == "beta", t2 and t2.name
+
+
 def test_launch_raw_fallbacks_skip_disabled(monkeypatch):
     """pick_launch_account's raw fallbacks bypass pick_swap_target — they must
     apply the exclusion themselves. Force the fallback path by making every
