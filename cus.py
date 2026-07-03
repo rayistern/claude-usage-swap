@@ -1303,8 +1303,16 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
 
     Installing a plain snapshot COPY of an account onto a SECOND live mount is
     the #104 clobber (both refresh the one shared token family). So this gates
-    whether a swap must claim a DISTINCT pooled family instead of copying."""
-    for s in occupied_slot_accounts(state).get(account, []):
+    whether a swap must claim a DISTINCT pooled family instead of copying.
+
+    max_age_seconds=0 bypasses the occupancy cache: this is a credential-safety
+    guard, and the 5s TTL is exactly one daemon cycle's fan-out window. Incident
+    2026-07-03 16:10Z: slot-2 and slot-7 moved onto rayi3 back-to-back in one
+    cycle; slot-7's guard read the cached map from before slot-2's install,
+    judged rayi3 unheld, and copied the snapshot — two live mounts on one token
+    family, and the next refresh logged slot-2 out (empty refreshToken on its
+    live creds). Ground truth costs one /proc scan per swap; swaps are rare."""
+    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
         if s != this_slot:
             return True
     # The shared mount counts too: a slot copying merkos while the shared mount
@@ -3922,6 +3930,11 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     else:
         slot_entry["account"] = target_name
         slot_entry["last_swap_ts"] = ts
+        # Occupancy just changed: drop the cached account→slots map so every
+        # same-cycle reader (the NEXT fan-out move's clobber guard, SOS checks)
+        # sees this slot on its new account. Complements the guard's own
+        # cache bypass — belt and braces after the 2026-07-03 16:10Z clobber.
+        _OCCUPIED_SLOTS_CACHE.clear()
         # Record/clear the pool lease (2026-07-03): a claimed family binds this
         # slot to (target, family) so leased_families() excludes it from other
         # slots' free set and save-back routes there. Moving onto a primary /

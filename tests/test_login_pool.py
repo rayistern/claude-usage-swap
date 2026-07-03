@@ -215,6 +215,57 @@ def test_execute_swap_refuses_when_pool_exhausted():
         env.restore()
 
 
+def test_second_same_cycle_move_onto_same_target_claims_family():
+    """Regression, 2026-07-03 16:10Z slot-2/slot-7 → rayi3 clobber: two moves in
+    ONE daemon cycle landed on the same target. The first was a legal snapshot
+    copy (target unheld at that instant), but the second move's clobber guard
+    read occupied_slot_accounts through its 5s TTL cache — still showing the
+    target unheld — so it installed a SECOND snapshot copy of the same token
+    family instead of claiming the free pooled family. The next refresh logged
+    the first mount out (slot-2's live creds were found with an empty
+    refreshToken). The guard must read ground-truth occupancy.
+
+    No cache clear between the two execute_swap calls — that's exactly the
+    daemon's same-cycle fan-out sequence (the other suites clear it in setup,
+    which is why this never showed up in tests)."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cus.execute_swap("beta", trigger="auto-ladder", slot=s1)  # primes the cache
+        cus.execute_swap("beta", trigger="auto-ladder", slot=s2)  # must see s1's move
+        rt1 = cus._credential_refresh_token(cus.read_json(cus.slot_path(s1) / ".credentials.json"))
+        rt2 = cus._credential_refresh_token(cus.read_json(cus.slot_path(s2) / ".credentials.json"))
+        assert rt1 != rt2, f"both live mounts ended on the same token family ({rt1}) — #104 clobber"
+        assert rt2 == "rt-beta-fam1", rt2
+        assert cus.load_state()["slots"][s2]["login_family"] == "beta/family-1"
+    finally:
+        env.restore()
+
+
+def test_second_same_cycle_move_refuses_when_no_family():
+    """Same-cycle double-landing with NO free family must RAISE (the daemon logs
+    a failed move and the slot holds) — never silently install the clobbering
+    second copy. Pre-fix the stale cache made this path clobber instead."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        cus.execute_swap("beta", trigger="auto-ladder", slot=s1)  # primes the cache
+        raised = False
+        try:
+            cus.execute_swap("beta", trigger="auto-ladder", slot=s2)
+        except RuntimeError as e:
+            raised = "pool exhausted" in str(e)
+        assert raised, "second same-cycle landing without a family must refuse, not clobber"
+        assert cus.load_state()["slots"][s2]["account"] == "alpha"
+    finally:
+        env.restore()
+
+
 def test_execute_swap_onto_free_account_uses_snapshot_no_lease():
     """When the target is NOT held by another mount, the swap uses the plain
     snapshot (today's path) and records no lease — the pool is only for the
