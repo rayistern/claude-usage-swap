@@ -4922,7 +4922,7 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
             result = gc_slot(name, state)
             if result["action"] == "reaped":
                 sb = result["saveback"]
-                click.echo(f"  slot-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
+                click.echo(f"  lane-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
 
 
 def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute: bool) -> None:
@@ -4947,10 +4947,10 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"]},
             ))
             continue
-        click.echo(f"  slot move: {label} ({move['gate']})")
+        click.echo(f"  lane move: {label} ({move['gate']})")
         click.echo(f"    reason: {move['reason']}")
         if no_execute:
-            click.echo("    (--no-execute) skipping slot move")
+            click.echo("    (--no-execute) skipping lane move")
             _log_decision(_build_decision_record(
                 state, config, action="would_swap", gate=move["gate"], reason=move["reason"],
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
@@ -4966,7 +4966,7 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
             ))
         except (RuntimeError, FileNotFoundError, ValueError) as e:
-            click.echo(f"    slot move FAILED: {type(e).__name__}: {e}", err=True)
+            click.echo(f"    lane move FAILED: {type(e).__name__}: {e}", err=True)
             _log_decision(_build_decision_record(
                 state, config, action="error", gate=move["gate"],
                 reason=f"{move['reason']} — FAILED: {e}",
@@ -5052,7 +5052,7 @@ def _execute_global_mount_swap(decision: "SwapDecision", state: dict, config: di
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
     else:
         execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
-        click.echo(f"    swapped shared mount (bare sessions follow; slots unaffected)")
+        click.echo(f"    swapped shared mount (bare sessions follow; lanes unaffected)")
     _log_decision(_build_decision_record(
         state, config, action="swap", gate=decision.gate,
         reason=decision.reason, target=decision.target, tier=decision.tier,
@@ -7947,7 +7947,7 @@ def status() -> None:
     if per_session:
         click.echo(f"Mode: per_session (global mount observe-only). Bare-launch account: {state['active']}")
     elif mode == "hybrid":
-        click.echo(f"Mode: hybrid (slots + shared mount both managed). Shared-mount account: {state['active']}")
+        click.echo(f"Mode: hybrid (lanes + shared mount both managed). Shared-mount account: {state['active']}")
     else:
         click.echo(f"Active account: {state['active']}")
     click.echo()
@@ -7987,11 +7987,15 @@ def status() -> None:
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
-    # Slots (per_session): slot → account → live pids, with any orphan dirs.
+    # Lanes (per_session): lane → account → live pids, with any orphan dirs.
+    # "Lane" is the operator-facing name (GH #109 Phase 4); the slot-N
+    # identifiers underneath stay — they're on-disk dir names and live
+    # sessions' CLAUDE_CONFIG_DIR paths, so renaming THEM is a breaking
+    # migration (tracked separately), not a display fix.
     slots_state = state.get("slots", {}) or {}
     slot_dirs_on_disk = list_slot_dirs()
     if slots_state or slot_dirs_on_disk:
-        click.echo("Slots:")
+        click.echo("Lanes:")
         seen = set()
         locked_slot_names = _locked_slots(config)
         # GH #109 independent-login annotation. Stay invisible until the feature
