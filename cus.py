@@ -4752,6 +4752,25 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # Drop cross-mount-excluded accounts from the candidate pool for THIS
         # group's decision (keep the group's own account — it's being left).
         drop = exclude - {acct_name}
+        # Independent-login RESCUE (GH #109 Phase 2, 2026-07-03): an excluded
+        # account is only excluded because a COPY of its snapshot onto a second
+        # live mount would clobber the shared refresh-token family (#104). A
+        # slot that owns an INDEPENDENT login for that account swaps onto a
+        # DISTINCT token family, so no clobber — it is a legal target. Without
+        # this relaxation a hot lane whose only headroom sits behind held
+        # accounts had NO target and held forever (the "no swaps since lanes"
+        # symptom): decide_swap returned None before the per-slot fan-out loop
+        # (which already knows how to double-book via a login, line ~4780) was
+        # ever reached. So un-drop any excluded account at least one of this
+        # group's slots can independently host; the per-(slot, target) login
+        # re-check below still gates the actual double-book, and a genuinely
+        # free account is still preferred (the fan-out re-pick tries it first).
+        # Gated on use_independent_logins — OFF (default) keeps today's copy
+        # path bit-for-bit, so this is inert until logins are provisioned.
+        if drop and independent_logins_enabled(config):
+            rescuable = {x for x in drop
+                         if any(has_independent_login(x, s) for s in slots)}
+            drop = drop - rescuable
         if drop:
             shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
         trace: dict = {}

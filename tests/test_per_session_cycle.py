@@ -690,6 +690,101 @@ def test_double_booked_live_accounts_both_phases():
         env.restore()
 
 
+def _plant_login(account: str, slot: str, refresh: str) -> None:
+    """Write an INDEPENDENT login (distinct refresh family) into the store for
+    (account, slot) — the on-disk precondition the Phase 2 rescue consumes."""
+    d = cus.login_store_dir(account, slot)
+    d.mkdir(parents=True, exist_ok=True)
+    cus.login_store_creds_path(account, slot).write_text(json.dumps(_creds(refresh)))
+    assert cus.has_independent_login(account, slot)
+
+
+def test_rescue_gate_off_hot_lane_holds_when_only_headroom_is_excluded():
+    """Baseline / regression: with the gate OFF (default), a hot lane whose only
+    swap targets are all cross-mount-excluded (held by other live mounts) has no
+    target and HOLDS — even if an independent login happens to sit in the store.
+    This is exactly the pre-fix behavior and must be bit-for-bit preserved."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 90.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(90.0, 20.0), "beta": _usage(10.0, 10.0)}
+        # A login exists, but the gate is off — it must be ignored.
+        _plant_login("beta", s1, "rt-beta-indep")
+        excl = {"beta", "gamma", "delta"}  # every other account held elsewhere
+        moves = cus.decide_slot_swaps(state, _config(), usage, exclude_accounts=excl)
+        assert moves == [], f"gate-off must hold, got {moves}"
+    finally:
+        env.restore()
+
+
+def test_rescue_gate_on_hot_lane_swaps_onto_held_account_via_login():
+    """With the gate ON and an independent login provisioned for (beta, slot),
+    the hot lane on alpha rescues onto beta's headroom even though beta is
+    cross-mount-excluded — the swap will install beta's distinct login family,
+    so no #104 clobber. This is the whole point of the extension."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 90.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(90.0, 20.0), "beta": _usage(10.0, 10.0)}
+        _plant_login("beta", s1, "rt-beta-indep")
+        cfg = _config(independent_logins={"use_independent_logins": True})
+        excl = {"beta", "gamma", "delta"}
+        moves = cus.decide_slot_swaps(state, cfg, usage, exclude_accounts=excl)
+        assert len(moves) == 1, f"expected one rescue move, got {moves}"
+        assert moves[0]["slot"] == s1 and moves[0]["from"] == "alpha"
+        assert moves[0]["to"] == "beta", f"should rescue onto the login-backed account, got {moves[0]}"
+    finally:
+        env.restore()
+
+
+def test_rescue_gate_on_but_no_login_still_holds():
+    """Gate ON but NO login provisioned for any headroom account: the lane still
+    HOLDS. The rescue is only safe when a distinct login family exists — without
+    one, swapping onto a held account would clobber (#104), so we must not."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 90.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(90.0, 20.0), "beta": _usage(10.0, 10.0)}
+        cfg = _config(independent_logins={"use_independent_logins": True})
+        excl = {"beta", "gamma", "delta"}
+        moves = cus.decide_slot_swaps(state, cfg, usage, exclude_accounts=excl)
+        assert moves == [], f"no login ⇒ must hold (clobber-unsafe), got {moves}"
+    finally:
+        env.restore()
+
+
+def test_rescue_prefers_a_genuinely_free_account_over_login_double_book():
+    """When a free (un-held) account is available, the lane should take THAT
+    rather than double-booking a held account via a login — a distinct mount is
+    strictly safer than sharing one account's quota across two families."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 90.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 15.0, "current_7d_pct": 12.0})
+        usage = {"alpha": _usage(90.0, 20.0), "beta": _usage(10.0, 10.0), "gamma": _usage(15.0, 12.0)}
+        _plant_login("beta", s1, "rt-beta-indep")
+        cfg = _config(independent_logins={"use_independent_logins": True})
+        # gamma is NOT excluded → it's a free account; beta IS excluded but login-backed.
+        excl = {"beta", "delta"}
+        moves = cus.decide_slot_swaps(state, cfg, usage, exclude_accounts=excl)
+        assert len(moves) == 1 and moves[0]["to"] == "gamma", \
+            f"should prefer the free account gamma over a beta double-book, got {moves}"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
