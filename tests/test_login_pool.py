@@ -307,6 +307,78 @@ def test_decide_slot_swaps_pool_rescue_relaxes_exclusion():
         env.restore()
 
 
+def test_pool_double_book_beats_degraded_repick():
+    """Regression, 2026-07-03 slot-2 → rayi3@99% incident: the pool rescue
+    un-drops a held account for the PICK, but `taken` is seeded with the raw
+    exclude set — so the rescued pick died at the taken-veto and the fan-out
+    re-pick ran on degraded leftovers. pick_swap_target's headroom_fallback
+    then returned a 99%-5h account ("swap somewhere beats sitting on a hot
+    active"), which beat the 0%-usage pooled pick and rate-limited the live
+    session within a minute of the move.
+
+    Cast: alpha = the hot lane (rayi2@94%), beta = held elsewhere but 0% with
+    a free pooled family (rayi1), gamma = unheld but nearly saturated (rayi3).
+    The move must double-book beta via the pool, not land on gamma."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        mover = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 94.0, "current_7d_pct": 40.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 31.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 99.0, "current_7d_pct": 10.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage(94.0, 40.0), "beta": _usage(0.0, 31.0), "gamma": _usage(99.0, 10.0)}
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "smart",
+            "independent_logins": {"use_independent_logins": True},
+            "swap_hysteresis": {"enabled": False}, "usage_growth_gate": {"enabled": False},
+            "defer_swap_near_5h_reset": {"enabled": False}, "lazy_swap": {"enabled": False},
+        })
+        moves = cus.decide_slot_swaps(state, cfg, usage, exclude_accounts={"beta"})
+        assert len(moves) == 1 and moves[0]["slot"] == mover, moves
+        assert moves[0]["to"] == "beta", f"picked degraded leftover over pooled pick: {moves}"
+        # The logged reason must describe the EXECUTED pick (beta, 5h=0%) and
+        # flag the double-book — pre-fix it showed the vetoed pick's stats
+        # next to the re-picked target (decisions.jsonl said 5h=0% for a 99% move).
+        assert "pool double-book" in moves[0]["reason"], moves[0]["reason"]
+        assert "5h=0%" in moves[0]["reason"], moves[0]["reason"]
+    finally:
+        env.restore()
+
+
+def test_healthy_repick_still_preferred_over_pool_double_book():
+    """Fan-out semantics survive the incident fix: when the re-pick finds a
+    HEALTHY distinct account (won't re-trip its own ladder on arrival), it
+    still wins over double-booking the vetoed pick — load spreads across
+    accounts and pool families aren't consumed needlessly. And the move's
+    reason now carries the RE-PICK's stats, not the vetoed pick's."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        mover = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 94.0, "current_7d_pct": 40.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 31.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 10.0, "current_7d_pct": 12.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage(94.0, 40.0), "beta": _usage(0.0, 31.0), "gamma": _usage(10.0, 12.0)}
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {
+            "mode": "per_session", "strategy": "smart",
+            "independent_logins": {"use_independent_logins": True},
+            "swap_hysteresis": {"enabled": False}, "usage_growth_gate": {"enabled": False},
+            "defer_swap_near_5h_reset": {"enabled": False}, "lazy_swap": {"enabled": False},
+        })
+        moves = cus.decide_slot_swaps(state, cfg, usage, exclude_accounts={"beta"})
+        assert len(moves) == 1 and moves[0]["slot"] == mover, moves
+        assert moves[0]["to"] == "gamma", moves
+        assert "5h=10%" in moves[0]["reason"], moves[0]["reason"]
+    finally:
+        env.restore()
+
+
 def _usage(five_h: float, seven_d: float) -> "cus.AccountUsage":
     return cus.AccountUsage(
         five_hour=cus.UsageWindow(utilization=five_h, resets_at=None),

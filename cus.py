@@ -5051,28 +5051,59 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
             continue
         for slot_name in sorted(slots):
             target = decision.target
+            reason = decision.reason
             if target in taken:
-                # Fan-out: re-pick with this round's taken targets excluded
-                # (the hot account stays excluded as the shim's active). Use the
-                # SAME pool-adjusted config so a standard slot's re-pick also
-                # ignores the model gate.
+                # The primary pick is unavailable to THIS slot as a plain
+                # snapshot-copy: another live mount holds it (cross-mount
+                # exclusion) or an earlier slot took it this round (fan-out).
+                # Two escape hatches; healthy fan-out wins, then pool:
+                #
+                #   1. Fan-out re-pick — a DIFFERENT account with this round's
+                #      taken targets excluded (the hot account stays excluded as
+                #      the shim's active; same pool-adjusted config so a
+                #      standard slot's re-pick also ignores the model gate).
+                #      Accepted only when HEALTHY (wouldn't immediately re-trip
+                #      its own ladder), or when the pool hatch below can't take
+                #      the pick anyway (old fall-back-somewhere behavior).
+                #   2. Pool double-book — keep the pick and claim a distinct
+                #      login family for this mount (free pooled family, or a
+                #      legacy per-slot login — #109 3b). No #104 clobber:
+                #      execution does the claim and REFUSES if the pool turns
+                #      out exhausted, so an optimistic keep here is safe.
+                #
+                # Regression guard (2026-07-03, slot-2 → rayi3@99% incident):
+                # the pool rescue above un-drops held-but-poolable accounts for
+                # the PICK, but `taken` is seeded with the raw exclude set — so
+                # the rescued pick always died at this veto, and the re-pick
+                # ran on degraded leftovers: pick_swap_target's headroom_fallback
+                # happily returned a 99%-5h account ("swap somewhere beats
+                # sitting on a hot active"), which beat the 0%-usage pooled
+                # pick and rate-limited the live session within a minute.
+                # Hence "healthy" gate on the retry: a re-pick that would
+                # re-trip on arrival loses to a pooled family on the account
+                # the strategy actually scored best.
+                can_pool = (independent_logins_enabled(cfg_view)
+                            and (has_free_login_family(target, state)
+                                 or has_independent_login(target, slot_name)))
                 shim2 = dict(shim)
                 shim2["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
                 retry = pick_swap_target(shim2, cfg_view)
-                if retry is not None:
-                    target = retry.name
-                elif not (independent_logins_enabled(cfg_view)
-                          and (has_free_login_family(target, state)
-                               or has_independent_login(target, slot_name))):
+                retry_healthy = retry is not None and not _target_would_immediately_re_trip(
+                    state.get("accounts", {}).get(retry.name, {}), cfg_view)
+                if retry is not None and (retry_healthy or not can_pool):
+                    # Re-pick reasons were silently dropped pre-2026-07-03 —
+                    # decisions.jsonl showed the ORIGINAL pick's stats next to
+                    # the re-picked target (log said "5h=0%" for a 99% move).
+                    target, reason = retry.name, retry.reason
+                elif can_pool:
+                    reason = (f"{reason} (pool double-book: '{target}' backs another "
+                              f"live mount; claiming a distinct login family — #109)")
+                else:
                     # Pool exhausted. Pre-2026-07-03 this doubled up on the
                     # original target — installing one token family on two live
                     # mounts, the exact clobber #104 forbids (hit live on
                     # slot-3/slot-4, 2026-07-03: one refresh logs the other
                     # out). HOLD instead: a parked hot slot degrades gracefully.
-                    # The safe double-book is a target with a FREE pooled family
-                    # (2026-07-03 pool) or a legacy per-slot login (#109 3b) —
-                    # either gives this mount a distinct family. Execution claims
-                    # it and re-checks, so an over-optimistic pick can't clobber.
                     click.echo(f"  {slot_name}: pool exhausted — holding on '{acct_name}' "
                                f"(won't double-book '{target}' onto a second live mount — GH #104)")
                     continue
@@ -5080,7 +5111,7 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
             moves.append({
                 "slot": slot_name, "from": acct_name, "to": target,
                 "gate": decision.gate, "tier": decision.tier,
-                "deferrable": decision.deferrable, "reason": decision.reason,
+                "deferrable": decision.deferrable, "reason": reason,
                 "pool": pool,
             })
     return moves
