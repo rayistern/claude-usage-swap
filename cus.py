@@ -4264,8 +4264,16 @@ def decide_swap(
 
         target = pick_swap_target(state, config)
         if target is None:
-            _note("hard_7d_cap_no_target", "hold",
-                  f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but no valid swap target")
+            # Visibility (2026-07-03): this hold used to be SILENT — _note()
+            # only writes the trace dict, it does NOT echo to daemon.log (unlike
+            # every sibling hold gate below). In lanes/hybrid mode a hot lane
+            # whose only candidates are all excluded (GH #104 no-double-book) or
+            # saturated lands here every cycle, so the operator saw "hard 7d cap
+            # tripped" followed by silence and no swap. Echo the reason so the
+            # daemon log explains WHY it held; SOS Condition 2b surfaces it too.
+            msg = f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but no valid swap target"
+            click.echo(f"  {msg}")
+            _note("hard_7d_cap_no_target", "hold", msg)
             return None
         # If the picker had to fall back to a DEGRADED candidate (also above
         # hard_7d_cap), swapping doesn't actually help — both accounts are
@@ -4447,8 +4455,18 @@ def decide_swap(
 
     target = pick_swap_target(state, config)
     if target is None:
-        _note("no_target", "hold",
-              f"ladder tripped on {current} ({cur_pct:.1f}% >= {threshold}%) but no valid swap target")
+        # Visibility (2026-07-03): this hold used to be SILENT — _note() only
+        # writes the trace dict, it does NOT echo to daemon.log (unlike the
+        # cap_degraded_target / min_improvement gates just below). This is the
+        # exact branch that swallowed the "no swaps since lanes" symptom: with
+        # 4 live lanes + the shared mount across 5 accounts, GH #104's
+        # no-double-book exclusion leaves a hot lane at most one candidate, and
+        # when that candidate is itself saturated the picker returns None. The
+        # ladder trip was logged, then silence. Echo the reason; SOS Condition
+        # 2b raises the operator-actionable flag (add an account / free a lane).
+        msg = f"ladder tripped on {current} ({cur_pct:.1f}% >= {threshold}%) but no valid swap target"
+        click.echo(f"  {msg}")
+        _note("no_target", "hold", msg)
         return None
 
     # Anti-pingpong / cap-degraded-target gate (GH #53, 2026-05-28): refuse a
@@ -5484,6 +5502,72 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                     action="Add another Claude account (run `claude /login` with CLAUDE_CONFIG_DIR=~/.claude-newname/) or wait for cooldown. Or set `smart_strategy.allow_rate_limited_targets: true` if you have a rate-limited account that works elsewhere.",
                     affected=active,
                 ))
+
+    # Condition 2b (2026-07-03): lanes/hybrid TARGET STARVATION. Condition 2
+    # above only evaluates the SHARED-mount active account and treats "any
+    # unblocked other account exists" as "a target is available" — so it is
+    # doubly blind to the lanes failure mode: (a) it never looks at per-lane
+    # (slot) accounts at all, and (b) an unblocked-but-saturated account (e.g.
+    # rayi1 at 100%) counts as an available target. The observed symptom
+    # ("no swaps since lanes"): with as many live mounts as accounts, GH #104's
+    # no-double-book rule leaves a hot lane's only candidate(s) either excluded
+    # or saturated, so decide_swap held every cycle while `cus sos` reported
+    # all-clear and a live session kept burning on a 100% account. This check
+    # replays the EXACT exclusion + picker decide_slot_swaps uses, per live-lane
+    # account, and raises the operator-actionable flag (add an account / free a
+    # lane / wait for a window reset). State-based only — pick_swap_target reads
+    # stored current_*_pct, so no live poll is needed here.
+    if config.get("mode") in ("hybrid", "per_session"):
+        occupied = occupied_slot_accounts(state)
+        shared_active = state.get("active")
+        # Same cross-mount exclusion the cycle applies (GH #104): every live-lane
+        # account, plus the shared-mount account in hybrid mode.
+        exclude = set(occupied.keys()) | (
+            {shared_active} if (config.get("mode") == "hybrid" and shared_active) else set())
+        sat_pct = config.get("usage_growth_gate", {}).get("saturation_pct", 95)
+        thr_cfg = config.get("thresholds", {})
+        for acct_name, slots in sorted(occupied.items()):
+            acct = accounts.get(acct_name, {})
+            if not is_valid(acct):
+                continue  # blocked accounts are already covered by Conditions 1/3
+            lane_thr = acct.get("next_swap_at_pct", 50)
+            cand = []
+            if thr_cfg.get("five_hour", True):
+                cand.append(acct.get("current_5h_pct", 0))
+            if thr_cfg.get("seven_day", True):
+                cand.append(acct.get("current_7d_pct", 0))
+            lane_pct = max(cand) if cand else 0
+            if lane_pct < lane_thr:
+                continue  # lane below its ladder step — nothing to rotate
+            # Build the same shim decide_slot_swaps builds for this group:
+            # active = the lane's own account, candidate pool minus every OTHER
+            # live-mount account (the lane's own account is retained — it's the
+            # one being left). Then run the real picker.
+            drop = exclude - {acct_name}
+            shim = dict(state)
+            if drop:
+                shim["accounts"] = {n: a for n, a in accounts.items() if n not in drop}
+            shim["active"] = acct_name
+            pool = _slot_pool(state, sorted(slots)[0], config)
+            tgt = pick_swap_target(shim, _config_for_pool(config, pool))
+            starved = tgt is None or (
+                "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
+            if not starved:
+                continue
+            # Tier severity: at/above saturation the lane is effectively frozen
+            # and burning a live session → urgent; merely over the first ladder
+            # step (still has headroom) → warning, an early nudge to add capacity.
+            out.append(SOSCondition(
+                severity="urgent" if lane_pct >= sat_pct else "warning",
+                summary=f"lane {', '.join(sorted(slots))} on '{acct_name}' at {lane_pct:.0f}% "
+                        f"(≥{lane_thr}%) with no swap target",
+                action=(f"'{acct_name}' is over its ladder step but every other account is either "
+                        f"held by another live mount (GH #104 forbids double-booking — it clobbers "
+                        f"the OAuth token) or is saturated, so this lane cannot rotate. Add another "
+                        f"account (`cus add <name>`), free a live lane, or wait for another account's "
+                        f"5h/7d window to reset."),
+                affected=acct_name,
+            ))
 
     # Condition 3b (GH #9): account stuck in 429 poll-backoff for > 30 min.
     # The polling endpoint is per-IP throttled; another machine hammering it
