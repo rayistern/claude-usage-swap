@@ -1484,10 +1484,23 @@ def double_booked_live_accounts(state: dict) -> list[dict]:
         by_account.setdefault(acct, []).append((name, _refresh_fingerprint(rt) if rt else None))
     out: list[dict] = []
     for acct, ms in sorted(by_account.items()):
-        # Mounts covered by their own independent login are safe; the shared
-        # mount can't have one (logins are per-slot) and counts as unsafe.
-        unsafe = [(n, fp) for n, fp in ms
-                  if n == "shared-mount" or not has_independent_login(acct, n)]
+        # A mount is SAFE (has a distinct token family) if it holds a pooled
+        # LEASE (2026-07-03 pool model) or a legacy per-slot login; the shared
+        # mount can have neither, so it always counts as unsafe. Only 2+ UNSAFE
+        # mounts on one account are a clobber — a single uncovered mount (the
+        # primary) alongside covered families is exactly the intended pool
+        # arrangement (primary + N families). Without the lease check this
+        # false-flagged a correct pool rescue as an URGENT "diverged" clobber
+        # (slot-1 leased 03/family-1 while slot-7 held 03's primary — distinct
+        # families, no clobber, but flagged).
+        def _covered(n: str) -> bool:
+            if n == "shared-mount":
+                return False
+            if has_independent_login(acct, n):
+                return True
+            lease = slot_leased_family(state, n)
+            return lease is not None and lease[0] == acct
+        unsafe = [(n, fp) for n, fp in ms if not _covered(n)]
         if len(unsafe) < 2:
             continue
         fps = {fp for _, fp in unsafe if fp}
@@ -8412,6 +8425,11 @@ def status() -> None:
                 if _lease and _lease[0] == acct:
                     # Pool model: this lane is running a borrowed backup family.
                     login_col = click.style(f"  [pool {_lease[1]}]", fg="green")
+                elif list_login_families(acct):
+                    # Account has a pool to borrow from → covered, not "missing".
+                    # (This lane holds the primary; it can claim a family if it
+                    # ever needs to double-book.)
+                    login_col = click.style("  [pool avail]", fg="green")
                 elif has_independent_login(acct, d.name):
                     login_col = click.style("  [indep-login ✓]", fg="green")
                 elif il_flag:

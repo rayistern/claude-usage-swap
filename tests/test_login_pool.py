@@ -232,6 +232,27 @@ def test_execute_swap_onto_free_account_uses_snapshot_no_lease():
         env.restore()
 
 
+def test_double_booked_safe_when_a_mount_holds_a_pool_lease():
+    """A correct pool rescue puts two live mounts on one account with DISTINCT
+    families (one leases a pooled family, one holds the primary). That must NOT
+    be flagged as a #104 double-book — only 2+ UNCOVERED mounts are a clobber."""
+    env = _Env(accounts=("alpha",))
+    try:
+        a = env.make_slot("alpha", live=True)                        # holds primary (rt-alpha)
+        b = env.make_slot("alpha", live=True, family_id="family-1")   # leases alpha/family-1
+        (cus.slot_path(b) / ".credentials.json").write_text(json.dumps(_creds("rt-alpha-fam1")))
+        env.plant_family("alpha", "family-1", "rt-alpha-fam1")
+        state = cus.load_state()
+        assert cus.double_booked_live_accounts(state) == [], "leased mount is covered — not a clobber"
+        # Drop the lease → both mounts uncovered → genuine double-book, flagged.
+        state["slots"][b].pop("login_family")
+        cus.save_state(state)
+        flagged = cus.double_booked_live_accounts(cus.load_state())
+        assert flagged and flagged[0]["account"] == "alpha", flagged
+    finally:
+        env.restore()
+
+
 def test_saveback_routes_rotated_tokens_to_leased_family():
     """A leased slot's rotated live tokens save back to the FAMILY dir on swap-out,
     never to the account snapshot."""
