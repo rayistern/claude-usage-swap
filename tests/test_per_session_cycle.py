@@ -661,6 +661,35 @@ def test_duplicate_live_mount_families_detects_shared_family():
         env.restore()
 
 
+def test_double_booked_live_accounts_both_phases():
+    """The by-account #104 check catches both clobber phases: identical
+    families (will_clobber — refresh pending) AND diverged families
+    (already_rotated — one mount holds a dead refresh token; the same-family
+    check goes quiet the moment the first rotation lands, which is how
+    slot-3/slot-4 dodged SOS between two scans on 2026-07-03)."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)  # same snapshot copy → same family
+        state = cus.load_state()
+        dbs = cus.double_booked_live_accounts(state)
+        assert len(dbs) == 1 and dbs[0]["account"] == "alpha"
+        assert dbs[0]["phase"] == "will_clobber"
+        assert dbs[0]["mounts"] == sorted([s1, s2])
+
+        # One mount's token rotates → families diverge → still flagged.
+        (cus.slot_path(s2) / ".credentials.json").write_text(json.dumps(_creds("rt-alpha-rotated")))
+        dbs = cus.double_booked_live_accounts(state)
+        assert len(dbs) == 1 and dbs[0]["phase"] == "already_rotated"
+
+        # A single live mount per account is fine.
+        env.live_slots.discard(s2)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        assert cus.double_booked_live_accounts(state) == []
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

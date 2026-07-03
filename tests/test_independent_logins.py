@@ -317,7 +317,7 @@ def test_sos_flags_expired_and_mismatched_provisioned_logins():
         summaries = " | ".join(c.summary for c in conds)
         assert "past assumed refresh-token lifetime" in summaries
         assert "wrong account" in summaries.lower()
-        assert any(c.severity == "critical" for c in conds)
+        assert any(c.severity == "urgent" for c in conds)
     finally:
         env.restore()
 
@@ -464,7 +464,7 @@ def test_duplicate_family_detected_and_warned_and_sos():
         dups = cus.duplicate_login_families()
         assert dups and sorted(dups[0]["pairs"]) == ["slot-1->alpha", "slot-2->alpha"]
         conds = cus.diagnose(cus.load_state(), cus.load_config())
-        assert any("collide across mounts" in c.summary and c.severity == "critical" for c in conds)
+        assert any("collide across mounts" in c.summary and c.severity == "urgent" for c in conds)
     finally:
         env.restore()
 

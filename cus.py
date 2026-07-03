@@ -1251,9 +1251,61 @@ def duplicate_live_mount_families(state: dict) -> list[dict]:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             continue
         if rt:
-            by_fp.setdefault(_refresh_fingerprint(rt), []).append(f"{name} ({acct or '?'})")
-    return [{"refresh_fp": fp, "mounts": sorted(ms)}
+            by_fp.setdefault(_refresh_fingerprint(rt), []).append((f"{name} ({acct or '?'})", acct))
+    return [{"refresh_fp": fp,
+             "mounts": sorted(label for label, _ in ms),
+             "accounts": sorted({a for _, a in ms if a})}
             for fp, ms in sorted(by_fp.items()) if len(ms) > 1]
+
+
+def double_booked_live_accounts(state: dict) -> list[dict]:
+    """Accounts live on 2+ mounts without enough independent logins to make
+    the extra mounts safe — the #104 condition tracked by ACCOUNT, catching
+    both phases of the clobber that duplicate_live_mount_families (same-family)
+    only sees before the first rotation:
+
+      phase "will_clobber":   families still identical — the next token
+                              refresh on either mount logs the other out;
+      phase "already_rotated": families diverged — one mount already refreshed,
+                              so the mount(s) still on the old family hold a
+                              DEAD refresh token and fail at next refresh (the
+                              2026-07-01 duplicate-identity incident shape;
+                              seen again on slot-3/slot-4, 2026-07-03).
+
+    Lane sharing is one mount hosting many sessions, so 2+ live MOUNTS on one
+    account is never lane sharing; it's safe only when each extra mount has
+    its own independent login (distinct family, GH #109). Slots with a
+    provisioned login are subtracted before flagging.
+    Returns [{"account", "phase", "mounts": ["slot-3", ...]}]."""
+    mounts: list[tuple[str, Path, str | None]] = [
+        (d.name, d, state.get("slots", {}).get(d.name, {}).get("account"))
+        for d in list_slot_dirs()
+    ]
+    mounts.append(("shared-mount", CLAUDE_DIR, state.get("active")))
+    by_account: dict[str, list[tuple[str, str | None]]] = {}
+    for name, path, acct in mounts:
+        if not acct or not mount_in_use(path):
+            continue
+        try:
+            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            rt = None
+        by_account.setdefault(acct, []).append((name, _refresh_fingerprint(rt) if rt else None))
+    out: list[dict] = []
+    for acct, ms in sorted(by_account.items()):
+        # Mounts covered by their own independent login are safe; the shared
+        # mount can't have one (logins are per-slot) and counts as unsafe.
+        unsafe = [(n, fp) for n, fp in ms
+                  if n == "shared-mount" or not has_independent_login(acct, n)]
+        if len(unsafe) < 2:
+            continue
+        fps = {fp for _, fp in unsafe if fp}
+        out.append({
+            "account": acct,
+            "phase": "will_clobber" if len(fps) <= 1 else "already_rotated",
+            "mounts": sorted(n for n, _ in unsafe),
+        })
+    return out
 
 
 def login_age_days(account: str, slot: str) -> float | None:
@@ -5529,7 +5581,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         match = _identities_match(slot_ids, _dir_identity(acct))
         if match is False:  # None = no shared evidence — can't say, stay quiet
             out.append(SOSCondition(
-                severity="critical",
+                severity="urgent",
                 summary=f"{slot_name} identity does not match its assigned account '{acct}' (slot↔state drift, GH #2 class)",
                 action=(f"The slot's live files hold a different account than state.json claims. "
                         f"Check `python3 ~/repos/claude-usage-swap/cus.py slot list` and the slot's .claude.json oauthAccount; "
@@ -5591,7 +5643,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             expiring.append(f"{slot}->{acct}")
     if mismatched:
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"Independent login(s) stored under the wrong account: {', '.join(mismatched)}",
             action=("A stored login's identity does not match its account. Re-provision it: "
                     "`cus login-mount <slot> <account>` and log in as the correct account."),
@@ -5620,7 +5672,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # the gate, because the operator has provisioned them expecting safety.
     for dup in duplicate_login_families():
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"Independent-login families collide across mounts: {', '.join(dup['pairs'])} share one token family",
             action=("Two live mounts on one refresh-token family clobber on rotation. Give the extra "
                     "mount(s) their OWN login: `cus login-mount <slot> <account>` (a real /login, "
@@ -5633,13 +5685,35 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # was silent (slot-3/slot-4 incident: sos said all-clear while two live
     # mounts shared rayi2's family — one refresh from a forced logout).
     for dup in duplicate_live_mount_families(state):
+        if len(dup.get("accounts", [])) <= 1:
+            continue  # single-account double-book: the by-account check below reports it with phase detail
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"One login family live on {len(dup['mounts'])} mounts: {', '.join(dup['mounts'])}",
             action=("These mounts share ONE refresh token — the next rotation logs the others out. "
                     "Exit the extra session(s); relaunch joins the surviving lane (lane sharing) "
                     "or gets its own family via `cus login-mount <slot> <account>`."),
             affected="system",
+        ))
+    # By-account view of the same invariant (2026-07-03): catches the
+    # POST-rotation phase too — once a doubled-up account's token rotates on
+    # one mount, the families diverge (so the same-family check above goes
+    # quiet) but the other mount now holds a dead refresh token and fails at
+    # its next refresh (2026-07-01 duplicate-identity incident shape).
+    for db in double_booked_live_accounts(state):
+        if db["phase"] == "will_clobber":
+            detail = "families still identical — the next token refresh logs the other(s) out"
+        else:
+            detail = ("families already DIVERGED — the mount(s) on the old family hold a dead "
+                      "refresh token and will fail their next refresh")
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=f"'{db['account']}' is live on {len(db['mounts'])} mounts without independent logins "
+                    f"({', '.join(db['mounts'])}): {detail}",
+            action=("Exit the extra session(s) — relaunching then JOINS the surviving lane (lane sharing) "
+                    "instead of copying. For deliberate multi-lane use of one account, provision "
+                    "independent logins: `cus login-mount <slot> <account>`."),
+            affected=db["account"],
         ))
 
     # Condition 11: Phase 2 gate is ON but some occupied slots have no
