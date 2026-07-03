@@ -206,6 +206,52 @@ cus daemon --once --no-execute         # decide but don't actually swap (dry-run
 
 The daemon writes its logs to `~/claude-accounts/daemon.log` either way.
 
+## Independent-login pools — swap onto a held account without a clobber
+
+**The problem it solves.** When you run as many live lanes as you have accounts, a hot lane can have *nowhere to swap*: every other account is already held by another live mount, and cus refuses to double-book one (two live mounts copied from one account's snapshot share a single OAuth refresh token and clobber each other on rotation — the #104 failure). `cus sos` reports this as `lane … with no swap target`.
+
+**The fix.** Give each account a small **pool** of *independent* login families (each a separate `/login` of the same Anthropic account → a distinct refresh-token family). A hot lane then borrows a free family from the target account's pool: distinct family, no clobber. Log in a few times per account **once** at onboarding; no per-lane setup.
+
+This does **not** add quota — families of one account share that account's 5h/7d limits. It unlocks headroom that's *trapped* behind a held account; for genuine capacity, add more accounts (`cus add`).
+
+### Onboarding: build the pools
+
+For each account you want to be borrowable (start with the ones that carry the most concurrent load), run this `pool_size` times (default 3):
+
+```bash
+cus login-mount merkos            # scaffolds the next family, prints a CLAUDE_CONFIG_DIR=… claude command
+# → run that command in a fresh terminal and /login AS merkos (a new independent session of the SAME account)
+cus login-mount merkos --finish   # verifies the login landed on merkos, records it
+# repeat for family-2, family-3 …
+```
+
+- `cus login-mount --list` — show each account's pool depth and per-family freshness; flags pools below `pool_size`.
+- `cus login-mount merkos --from-existing` — seed *family-1* from the on-disk snapshot with **no** browser login. Clobber-safe only as the account's primary mount; a second simultaneous mount still needs a real `/login`.
+- `cus status` grows a **Login pools** section (accounts, family count, how many are free) once any pool exists.
+
+### Turn it on
+
+The whole feature is gated off by default. After provisioning:
+
+```yaml
+# ~/claude-accounts/config.yaml
+independent_logins:
+  use_independent_logins: true    # off (default) = swaps always copy the snapshot; on = borrow a free family when the target is held
+  pool_size: 3                    # onboarding target + the "provision more" nudge; not a hard cap
+```
+
+```bash
+systemctl --user restart cus.service   # pick up the config AND the pool code
+```
+
+### What happens after
+
+- A hot (or 429'd) lane whose only headroom is a held account now **claims a free family** from that account's pool, records the lease on its slot, and swaps in place — the `cus status` lane line shows `[pool family-N]`.
+- If a lane needs to rescue but the pool is **exhausted** (every family already leased to a live lane), cus **refuses to swap** rather than clobber, and `cus sos` says so — provision another family (`cus login-mount <account>`) or add an account.
+- `N` backup families ⇒ up to `N+1` live mounts can safely share one account's quota (its primary snapshot + the N families).
+
+Rotated tokens for a borrowed family are saved back to that family's store dir on swap-out (never to the account snapshot), so families and the canonical snapshot never reconcile into one clobbering token line.
+
 ## Tuning thresholds + strategy
 
 Edit `~/claude-accounts/config.yaml`. Common changes:

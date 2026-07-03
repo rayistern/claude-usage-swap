@@ -8375,7 +8375,8 @@ def status() -> None:
         # login has been provisioned — so users not using it see no new column.
         il_cfg = config.get("independent_logins", {})
         il_flag = il_cfg.get("use_independent_logins", False)
-        il_visible = il_flag or bool(list_provisioned_logins())
+        il_visible = (il_flag or bool(list_provisioned_logins())
+                      or any(list_login_families(a) for a in state["accounts"]))
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
@@ -8390,7 +8391,11 @@ def status() -> None:
             login_col = ""
             if il_visible and entry.get("account"):
                 acct = entry["account"]
-                if has_independent_login(acct, d.name):
+                _lease = slot_leased_family(state, d.name)
+                if _lease and _lease[0] == acct:
+                    # Pool model: this lane is running a borrowed backup family.
+                    login_col = click.style(f"  [pool {_lease[1]}]", fg="green")
+                elif has_independent_login(acct, d.name):
                     login_col = click.style("  [indep-login ✓]", fg="green")
                 elif il_flag:
                     # Gate is ON but no login provisioned → this swap will fall
@@ -8401,6 +8406,22 @@ def status() -> None:
             click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{pool_col}{login_col}{orphan}")
         for name in sorted(set(slots_state) - seen):
             click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
+        click.echo()
+
+    # Login pools (GH #109 pool model): per-account backup-family depth + how
+    # many are currently free (not leased to a live lane). Stays invisible until
+    # a pool exists, so users not using the feature see nothing new.
+    pool_rows = [(n, list_login_families(n)) for n in sorted(state["accounts"])]
+    pool_rows = [(n, fams) for n, fams in pool_rows if fams]
+    if pool_rows:
+        want = config.get("independent_logins", {}).get("pool_size", 3)
+        gate_note = "" if config.get("independent_logins", {}).get("use_independent_logins", False) \
+            else click.style("  (gate OFF — swaps still copy; set use_independent_logins: true)", fg="yellow")
+        click.echo(f"Login pools (independent backup families):{gate_note}")
+        for n, fams in pool_rows:
+            free = [f for f in fams if f not in leased_families(n, state)]
+            short = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
+            click.echo(f"  {n:<12} {len(fams)} family(ies), {len(free)} free{short}")
         click.echo()
 
     # Locks

@@ -398,6 +398,20 @@ def test_login_mount_from_existing_seeds_family_1_only():
         env.restore()
 
 
+def test_status_shows_login_pool_section():
+    env = _Env()
+    try:
+        env.plant_family("alpha", "family-1", "rt-a1")
+        env.plant_family("alpha", "family-2", "rt-a2")
+        r = CliRunner().invoke(cus.cli, ["status"])
+        assert r.exit_code == 0, r.output
+        assert "Login pools" in r.output
+        assert "alpha" in r.output and "2 family(ies), 2 free" in r.output
+        assert "gate OFF" in r.output  # gate off by default → nudge shown
+    finally:
+        env.restore()
+
+
 def test_login_mount_list_shows_pool_depth():
     env = _Env()
     try:
