@@ -325,13 +325,14 @@ def test_sos_flags_expired_and_mismatched_provisioned_logins():
 def test_sos_missing_condition_only_when_gate_on():
     env = _Env()
     try:
-        # Gate OFF (default): no "missing login" nag even though slots lack logins.
+        # Gate OFF (default): no coverage nag even though accounts lack pools.
         conds_off = cus.diagnose(cus.load_state(), cus.load_config())
-        assert not any("lack a login" in c.summary for c in conds_off)
-        # Gate ON: the occupied-but-unprovisioned slots are flagged.
+        assert not any("no login pool" in c.summary for c in conds_off)
+        # Gate ON: accounts backing live lanes without a pool are flagged
+        # (2026-07-03 pool model reworded this from the per-slot "lack a login").
         env.set_config({"independent_logins": {"use_independent_logins": True}})
         conds_on = cus.diagnose(cus.load_state(), cus.load_config())
-        assert any("lack a login" in c.summary for c in conds_on)
+        assert any("no login pool" in c.summary for c in conds_on)
     finally:
         env.restore()
 

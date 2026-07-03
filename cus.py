@@ -1569,18 +1569,21 @@ def list_provisioned_logins() -> list[dict]:
 
 
 def _slots_missing_logins(state: dict) -> list[tuple[str, str]]:
-    """(slot, account) pairs where the slot currently holds an account but has
-    NO independent login provisioned — the lazy-provisioning to-do list.
+    """(slot, account) pairs whose account has NO login coverage — neither a
+    pooled family (2026-07-03 pool model) nor a legacy per-(slot,account) login.
 
-    Under the Phase 2 gate, each such pair would fall back to the shared-snapshot
-    copy (the clobber path) on its next swap, so these are exactly the pairs an
-    operator should `cus login-mount`. Ordered by slot index."""
+    Coverage means the account can back a second live mount without a clobber:
+    a slot on such an account can borrow a free family at swap time. An account
+    with a pool is covered for ALL its slots, so we key the "missing" test on the
+    account's pool first, then the legacy per-slot login. Ordered by slot index."""
     slots = state.get("slots", {}) if isinstance(state, dict) else {}
     out: list[tuple[str, str]] = []
     for slot_name, entry in slots.items():
         account = entry.get("account") if isinstance(entry, dict) else None
         if not account:
             continue  # empty slot — nothing to host yet
+        if list_login_families(account):
+            continue  # account has a pool → this slot can borrow; no per-slot login needed
         if not has_independent_login(account, slot_name):
             out.append((slot_name, account))
     def _idx(pair: tuple[str, str]) -> int:
@@ -6098,19 +6101,23 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             affected=db["account"],
         ))
 
-    # Condition 11: Phase 2 gate is ON but some occupied slots have no
-    # independent login — their next swap falls back to the shared-snapshot copy
-    # (the #104/#103/#3 clobber path this feature exists to remove). Only
-    # actionable, hence only raised, when the gate is on.
-    if config.get("independent_logins", {}).get("use_independent_logins", False):
-        missing = _slots_missing_logins(state)
-        if missing:
-            pairs = ", ".join(f"{s}->{a}" for s, a in missing)
+    # Condition 11 (2026-07-03, pool model): the gate is ON but some accounts
+    # backing live lanes have NO login pool, so a lane can't rescue onto them (or
+    # safely double-book them) — a swap onto such an account while it's held just
+    # HOLDS/refuses. Not a clobber (the pre-pool "copy-fallback" framing is gone:
+    # execution claims a pooled family or refuses), so this is an informational
+    # nudge to widen coverage, not an alarm. Only raised when the gate is on.
+    if independent_logins_enabled(config):
+        missing_accts = sorted({a for _, a in _slots_missing_logins(state)})
+        if missing_accts:
             out.append(SOSCondition(
                 severity="warning",
-                summary=f"independent_logins is ON but these slots lack a login (swap will copy-fallback): {pairs}",
-                action=("Provision each: `cus login-mount <slot> <account>` then `--finish`. "
-                        "Until then, swaps into these slots use the shared-snapshot copy."),
+                summary=f"independent_logins is ON but these accounts backing live lanes have no login pool: "
+                        f"{', '.join(missing_accts)}",
+                action=("A lane can only rescue onto (or safely double-book) an account that has a login pool. "
+                        "Provision one per account you want borrowable: `cus login-mount <account>` "
+                        "(run pool_size times, then `--finish` each). Accounts without a pool still work as "
+                        "today — they just can't be a rescue target."),
                 affected="system",
             ))
 
