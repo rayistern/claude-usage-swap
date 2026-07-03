@@ -3193,11 +3193,22 @@ def _clear_swap_journal() -> None:
 
 
 def _identity_fields(cj: Any) -> dict:
-    """Extract the comparable identity facets of a .claude.json payload.
+    """Extract the comparable ACCOUNT-identity facets of a .claude.json payload.
 
-    Used by crash recovery to determine which account the live files belong
-    to. Only non-empty fields participate, so a sparse file still matches on
-    whatever evidence it has.
+    Used by crash recovery, doctor, SOS, and login-mount verification to decide
+    which Anthropic ACCOUNT a set of live files belongs to. Only non-empty
+    fields participate, so a sparse file still matches on whatever evidence it
+    has.
+
+    Correction 2026-07-03: `userID` (top-level) was REMOVED from the facets.
+    It is a per-LOGIN-SESSION / per-config-dir client id, NOT a per-account id —
+    two independent `/login`s of the SAME account carry different `userID`s
+    (proven live: account 'rayi3' snapshot and its pooled family-1 login shared
+    accountUuid `b9c92e39…` + email `rayi3@trisso.com` but differed on `userID`
+    `93e1fc34…` vs `5d3df3e8…`). Comparing it made `_identities_match` FALSE-
+    reject a correct same-account login (the independent-login-pool onboarding
+    error). The authoritative account identity is `oauthAccount.accountUuid`
+    (globally unique per account) plus `emailAddress`; those are what we compare.
     """
     if not isinstance(cj, dict):
         return {}
@@ -3205,8 +3216,7 @@ def _identity_fields(cj: Any) -> dict:
     oa = oa if isinstance(oa, dict) else {}
     out: dict = {}
     for key, val in (("accountUuid", oa.get("accountUuid")),
-                     ("emailAddress", oa.get("emailAddress")),
-                     ("userID", cj.get("userID"))):
+                     ("emailAddress", oa.get("emailAddress"))):
         if val:
             out[key] = val
     return out

@@ -369,6 +369,31 @@ def test_login_mount_finish_records_family_provenance():
         env.restore()
 
 
+def test_login_mount_finish_accepts_same_account_different_userid():
+    """Regression (2026-07-03): a fresh independent /login of the SAME account has
+    a different top-level userID than the account snapshot. Identity verification
+    must key on oauthAccount (accountUuid + email), NOT userID — else --finish
+    false-rejects a correct login (the rayi3 onboarding error)."""
+    env = _Env()
+    try:
+        # Give the account snapshot a full oauthAccount identity + a userID.
+        (env.accounts_dir / "account-alpha" / ".claude.json").write_text(json.dumps(
+            {"userID": "uid-SNAPSHOT",
+             "oauthAccount": {"emailAddress": "alpha@x", "accountUuid": "uuid-alpha"}}))
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])  # scaffold family-1
+        env.plant_family("alpha", "family-1", "rt-a-fam1")
+        # The family login: SAME account (uuid+email) but a DIFFERENT userID.
+        (cus.login_family_dir("alpha", "family-1") / ".claude.json").write_text(json.dumps(
+            {"userID": "uid-FRESH-LOGIN",
+             "oauthAccount": {"emailAddress": "alpha@x", "accountUuid": "uuid-alpha"}}))
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish"])
+        assert r.exit_code == 0, r.output
+        assert "mismatch" not in r.output.lower(), r.output
+        assert cus.read_json(cus.login_family_provenance_path("alpha", "family-1"))["account"] == "alpha"
+    finally:
+        env.restore()
+
+
 def test_login_mount_finish_refuses_wrong_account():
     env = _Env()
     try:
