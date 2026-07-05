@@ -310,6 +310,37 @@ def test_decide_swap_forces_off_active_when_model_week_exhausted():
     assert cus.decide_swap(st, cfg_off, usage) is None
 
 
+def test_decide_swap_forces_off_from_persisted_model_when_no_fresh_poll():
+    # Regression (2026-07-05): an account that backs a live lane but is NOT the
+    # freshly-polled active mount has no usage_by_account entry this cycle (it
+    # polls on the slow inactive cadence). Before the fix, decide_swap bailed at
+    # the `cur_usage is None` guard BEFORE Trigger 1, so the lane sat at Fable
+    # 100% until its next poll. The per-model hard cap must fire from the
+    # PERSISTED per_model_weekly_pct — symmetric with target selection, which
+    # already reads persisted per-model via _max_model_weekly_from_acct.
+    accounts = {
+        "a": {"current_5h_pct": 7.0, "current_7d_pct": 62.0, "next_swap_at_pct": 90,
+              "per_model_weekly_pct": {"Fable": 100.0}},
+        "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 50},
+    }
+    st = _state(active="a", accounts=accounts)
+    cfg_on = dict(GATE_ON, strategy="smart",
+                  smart_strategy={"hard_7d_cap_pct": 80},
+                  swap_hysteresis={"enabled": False})
+    cfg_off = dict(GATE_OFF, strategy="smart",
+                   smart_strategy={"hard_7d_cap_pct": 80},
+                   swap_hysteresis={"enabled": False})
+    # EMPTY usage_by_account = account 'a' was not polled this cycle.
+    decision = cus.decide_swap(st, cfg_on, {})
+    assert decision is not None and decision.gate == "hard_7d_cap" and decision.target == "b"
+    assert "persisted" in decision.reason
+    # Gate off: no per-model enforcement + no fresh usage → hold (unchanged).
+    assert cus.decide_swap(st, cfg_off, {}) is None
+    # Persisted model BELOW cap → still hold with the gate on (no false swap).
+    accounts["a"]["per_model_weekly_pct"] = {"Fable": 50.0}
+    assert cus.decide_swap(_state(active="a", accounts=accounts), cfg_on, {}) is None
+
+
 # --------------------------------------------------------------------------
 # update_state_with_usage — persistence semantics
 # --------------------------------------------------------------------------
