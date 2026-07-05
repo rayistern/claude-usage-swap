@@ -120,3 +120,53 @@ To dismiss a session's native rate-limit menu after its window has reset, `tmux 
 - **Background work survives a logout.** Sessions whose actual work runs in background agents / containers keep progressing even while the parent session is logged out — so "logged out" ≠ "work lost." Weigh escalation accordingly.
 - **Pane ids drift; session names are steadier.** If a protected pane dies and the human relaunches, it comes back as a *new* pane id. Track by session name when you can, and re-resolve on death.
 - **Reference docs:** `docs/RUNBOOK.md`, `docs/DIAGNOSTICS.md`, `docs/TROUBLESHOOTING.md` in this repo cover the swap ladder, the per-session diagnostics view, and the drift/clobber recovery procedures in depth.
+
+---
+
+## Update 2026-07-05 — new failure modes, tooling, and the pool lesson
+
+A full weekday watch surfaced these; fold them into the routine above.
+
+### New recoverable failure: blanked LIVE shared mount (logs out ALL bare sessions at once)
+
+Distinct from `token_stale` and from a lane double-mount: the live shared-mount creds file `~/.claude/.credentials.json` can end up **fully blank** — empty `accessToken`, `expiresAt: 0` — after a shared-mount swap. Every **bare** session on the shared mount then shows "not logged in" simultaneously (arrives as a "the main account got logged out" report). `cus sos` now detects it explicitly ("live shared mount … has no valid token").
+
+Auto-heal each interval:
+
+```bash
+# is the live mount blank?
+python3 -c "import json,os;o=(lambda d:d.get('claudeAiOauth',d))(json.load(open(os.path.expanduser('~/.claude/.credentials.json'))));print('BLANK' if (not o.get('accessToken') or (o.get('expiresAt') or 0)<=0) else 'OK')"
+# if BLANK, restore the ACTIVE account's creds into the live file:
+active=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/claude-accounts/state.json')))['active'])")
+cus restore-creds "$active" --live
+```
+
+Caveats learned the hard way:
+- **Restore the currently-active account, not the one you assume.** The shared mount may have swapped under you (seen: merkos→03) — `restore-creds --live` refuses any account that isn't `state.json.active`. Read active first.
+- **It's best-effort.** If the newest backup's refresh token was already server-rotated, `cus poll` still shows `TOKEN_EXPIRED` after the restore → that account genuinely needs an interactive `cus relogin <acct>` (escalate). Seen on an account whose 0.6h-old backup was already dead.
+- A **daemon-side auto-heal** for this is landing (prevents a swap from blanking the mount *and* auto-restores it each cycle). Once deployed, this manual step is redundant — check whether the daemon already recovered it before intervening.
+
+### The pool lesson: premium crowding is the #1 cause of recurring 429s
+
+`premium`-pool lanes honor the per-model weekly (Fable) gate, which restricts them to the 3–4 Fable-clean accounts. Run several premium lanes and they all crowd those few accounts and burn their **5-hour** windows, while your Fable-capped-but-5h-healthy accounts sit unused — a perpetual 429 loop even with 7 accounts. The new early-warning SOS fires this *before* the 429: **"N premium lane(s) live, 0 valid swap targets."**
+
+Autonomous fix (do it — reversible): unless a lane genuinely runs Fable-model work, make it `standard` so it rotates across ALL accounts by 5h headroom:
+
+```bash
+cus pool <slot> standard        # per lane
+# and set the launch default so new panes don't re-crowd:  per_session.default_pool: standard
+```
+
+Keep `premium` only for the specific lanes pointed at Fable work. If even the standard pool is exhausted, that's genuine capacity shortage → escalate add-accounts, don't churn.
+
+### New tool: in-place lane moves — `cus slot move <slot> <account>`
+
+Moves a live lane onto a target account **in place, session uninterrupted** (claims a distinct login family if the target is already live — including the shared-mount account — or REFUSES rather than clobber). Always `--dry-run` first: verdict `CLAIM` (safe, claims a family) vs `REFUSE` (no free family — don't force) vs `SNAPSHOT` (plain install). Replaces the old `/exit` + `cus launch` dance for "put pane X on account Y"; undo is the reverse move. (Its shared-mount double-book detection was a bug that a dry-run caught — trust the dry-run verdict.)
+
+### Smaller field notes
+
+- **`token_stale` is now auto-refreshed** by the daemon (a `refresh_token` grant, no usage cost). Even more benign than before — do nothing.
+- **Stale poll:** an idle account's `5h%` can read a stale `100%` when it has actually reset. `cus force-poll <acct>` for ground truth before acting on a "capped" reading — do not escalate a capped-looking idle account without a fresh poll.
+- **72-hour weekly reset:** the `seven_day` cap actually resets ~every 72h (fixed ~04:50–05:00 UTC anchor), *not* every 7 days; `seven_day.resets_at` from the API is misleading. cus now projects the real 72h reset, so "resets in Xh" reflects reality.
+- **Autonomy:** for reversible fixes (restore, retag, slot move, config tweak) just do them and log a walk-back — don't escalate a question that a reversible command resolves.
+- **New reference:** `docs/DIAGNOSTICS.md` now covers mount topology, the two-dimensional (5h vs per-model-weekly) exhaustion model, the premium/standard split, the blank-mount signature, and the stale-poll gotcha.
