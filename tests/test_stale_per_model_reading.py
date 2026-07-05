@@ -230,8 +230,16 @@ def test_swap_away_force_reads_fresh_usage_not_cached_dict():
 
 def test_pick_swap_target_not_refused_on_stale_per_model():
     """A stale-Fable=100% spare is NOT refused as a target on the stale reading
-    (pick returns it cleanly), while a FRESH Fable=100% spare IS marked degraded
-    (over the model cap). Isolates Bug 2's target-selection error."""
+    (pick returns it cleanly). Isolates Bug 2's target-selection error.
+
+    Annotation 2026-07-05 (supersedes the fresh-case expectation, fix "premium
+    lane placed on Fable-capped account via degraded fan-out fallback — should
+    HOLD"): pre-fix, a FRESH Fable=100% spare was returned as a DEGRADED
+    fallback. The per-model gate is now a HARD filter for a gated config, so when
+    the ONLY candidate is a FRESH over-cap account the picker HOLDS (returns
+    None) rather than degrading a premium lane onto it. The stale case is the
+    load-bearing half of this test (a stale reading must NOT exclude a target)
+    and is unchanged; the fresh case now asserts the HARD HOLD."""
     cfg = _gate_config()
 
     def _state_with_spare(spare_acct: dict) -> dict:
@@ -250,11 +258,12 @@ def test_pick_swap_target_not_refused_on_stale_per_model():
     assert tgt is not None and tgt.name == "spare", tgt
     assert "DEGRADED" not in tgt.reason, tgt.reason  # not refused on the stale %
 
+    # Fresh over-cap sole candidate → HARD HOLD (fix 2026-07-05), not a degraded
+    # pick. A premium lane never lands on a Fable-dead account.
     fresh_spare = {"current_5h_pct": 5.0, "current_7d_pct": 5.0, "next_swap_at_pct": 90,
                    "per_model_weekly_pct": {"Fable": 100.0}}
     tgt2 = cus.pick_swap_target(_state_with_spare(fresh_spare), cfg)
-    assert tgt2 is not None and tgt2.name == "spare", tgt2
-    assert "DEGRADED" in tgt2.reason, tgt2.reason  # fresh over-cap IS flagged
+    assert tgt2 is None, f"expected HOLD (fresh over-cap sole target), got {tgt2}"
 
 
 # ==========================================================================
