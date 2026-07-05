@@ -12615,6 +12615,186 @@ def slot_gc_cmd(slot_name_opt: str | None, force: bool) -> None:
     save_state(state)
 
 
+def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> dict:
+    """Pure planning preview for `cus slot move` — decides, WITHOUT any side
+    effect, what execute_swap would do for the move (slot_name -> target).
+
+    This mirrors the install-source decision inside _execute_swap_locked so that
+    both `--dry-run` and the command's pre-flight double-book guard agree with
+    what the real swap would actually do. Factored out as a pure helper (no
+    execute_swap, no disk writes) precisely so it is unit-testable on its own —
+    the swap primitive itself is awkward to drive through in every branch.
+
+    Verdicts:
+      - "noop"     target is already the slot's account (nothing to move).
+      - "snapshot" target is NOT live on any OTHER mount, so a plain snapshot
+                   copy installs cleanly — no login family needed (today's copy
+                   path; the gate-off default).
+      - "claim"    target IS live on another mount, but the login pool can back
+                   a DISTINCT token family (gate on + a free pooled family, or a
+                   legacy per-slot independent login). execute_swap claims that
+                   family — two live mounts, two token families, no clobber
+                   (GH #109).
+      - "refuse"   target IS live on another mount and there is NO distinct
+                   family to claim. Installing a plain copy would put two live
+                   mounts on ONE OAuth refresh-token family; the next rotation
+                   invalidates the other mount's token and logs that session out
+                   (GH #104). The move is refused rather than clobber.
+
+    Returns {current, target, plan, held_by, gate, detail}. `held_by` is a
+    human-readable list of the OTHER live mounts already on `target` (live slots
+    plus the shared ~/.claude mount), for the operator-facing message.
+    """
+    current = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
+    # Ground-truth occupancy (max_age_seconds=0 bypasses the cache) — the same
+    # source the real clobber guard reads, so preview and reality can't diverge.
+    held_by = [s for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(target, []) if s != slot_name]
+    if state.get("active") == target and mount_in_use(CLAUDE_DIR):
+        held_by = held_by + ["~/.claude (shared mount)"]
+    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name)
+    gate = independent_logins_enabled(config)
+    if target == current:
+        plan, detail = "noop", f"{slot_name} is already on '{target}'"
+    elif not held_elsewhere:
+        plan, detail = "snapshot", (
+            f"'{target}' is not live on any other mount — a plain snapshot install, no login family needed")
+    elif gate and (has_free_login_family(target, state) or has_independent_login(target, slot_name)):
+        plan, detail = "claim", (
+            f"'{target}' is live on {held_by} — execute_swap will claim a free login family "
+            f"(distinct token, no clobber; GH #109)")
+    else:
+        plan, detail = "refuse", (
+            f"'{target}' is live on {held_by} and has no free login family to claim — installing a copy "
+            f"would clobber the shared token family and log a session out (GH #104). "
+            f"Provision another family with `cus login-mount {target}`"
+            + ("" if gate else " (and enable the login pool: independent_logins.use_independent_logins)"))
+    return {"current": current, "target": target, "plan": plan, "held_by": held_by, "gate": gate, "detail": detail}
+
+
+@slot.command("move")
+@click.argument("slot_name")
+@click.argument("account")
+@click.option("--dry-run", is_flag=True,
+              help="Print the plan (old account, target, whether a login family would be claimed or the move would refuse) WITHOUT moving anything.")
+@click.option("--force", is_flag=True,
+              help="Bypass cus's pre-flight refusals: move a LOCKED slot (see `cus lock`) and skip the double-book guard. "
+                   "Does NOT override the GH #104 pool-exhaustion safety inside execute_swap — with the login pool on, a "
+                   "genuinely exhausted target still refuses rather than clobber a live token family. Mirrors `cus switch --force`.")
+def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> None:
+    """Move a slot's credential mount onto ACCOUNT, IN PLACE.
+
+    The manual counterpart to the daemon's per-lane rotation. The daemon already
+    moves a live slot's account under a running session without restarting it
+    (decide_slot_swaps -> execute_swap(..., slot=...)); this command exposes that
+    exact primitive for a human who wants to say "put slot-5 on merkos" NOW.
+    Because the swap is in place, the session on top of the slot is never
+    interrupted — it keeps its loaded tokens until the next refresh, then reads
+    the new account's mount. (Contrast a relaunch, which loses the session.)
+
+    Reuses `execute_swap(account, trigger="manual-slot-move", slot=<slot>)` — the
+    same primitive `cus launch` and the daemon call — so the credential-safety is
+    INHERITED, not reinvented:
+
+      * GH #104 double-book: if ACCOUNT is already live on another mount (a live
+        slot or the shared ~/.claude mount), a plain snapshot copy would put two
+        live mounts on ONE OAuth refresh-token family; the next rotation logs one
+        session out. When the login pool is on, execute_swap instead CLAIMS a
+        free, distinct login family (GH #109) so both mounts stay logged in. If
+        the pool is exhausted (no free family), execute_swap REFUSES rather than
+        clobber — this command surfaces that refusal verbatim and points at
+        `cus login-mount ACCOUNT` to provision another family.
+
+    This command adds only the operator ergonomics around that primitive:
+    slot/account validation, bare-number slot normalization (`5` == `slot-5`),
+    the `cus lock` guard, an already-on-target short-circuit, a `--dry-run`
+    preview, and a printed walk-back line. `--force` bypasses the local
+    pre-flight refusals (lock + double-book) exactly as `cus switch --force`
+    does; it can NOT force a pool-exhausted clobber, because execute_swap itself
+    refuses that with no force path (and inventing one would defeat GH #104).
+
+    Walk-back: the move is undone by moving the slot back — `cus slot move
+    <slot> <old-account>`.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+
+    name = _normalize_slot_name(slot_name)
+    state = load_state()
+    config = load_config()
+
+    # Validate account (mirror `switch`'s known-accounts error).
+    if account not in state.get("accounts", {}):
+        click.echo(f"Unknown account '{account}'. Known: {sorted(state.get('accounts', {}).keys())}")
+        sys.exit(1)
+    # Validate slot: a state entry OR an on-disk dir is enough to move it (an
+    # unregistered-but-present dir is a real, movable mount; `cus slot list`
+    # flags the registration gap separately).
+    if name not in (state.get("slots") or {}) and not slot_path(name).exists():
+        known = sorted((state.get("slots") or {}).keys())
+        click.echo(f"Unknown slot '{name}'. Known: {known or '(none)'}. `cus slot list` to see slots.")
+        sys.exit(1)
+
+    current = (state.get("slots", {}).get(name, {}) or {}).get("account")
+
+    # Already on the target — nothing to do (say so, don't error).
+    if account == current:
+        click.echo(f"{name} is already on '{account}', nothing to do.")
+        return
+
+    # Lock guard: a locked slot is frozen for the daemon AND for this command
+    # (locks are user intent — "this slot stays put"). --force overrides once.
+    if name in _locked_slots(config) and not force:
+        click.echo(click.style(
+            f"refusing: {name} is locked (`cus lock`) — the daemon won't move it and neither will this command. "
+            f"`cus unlock {name}` to release it, or pass --force to move it once anyway.", fg="red"))
+        sys.exit(1)
+
+    plan = _slot_move_plan(state, config, name, account)
+
+    if dry_run:
+        # Preview only — reuse the same planning helper the guard uses, and make
+        # ZERO state changes (no execute_swap call).
+        click.echo(f"(dry-run) plan for `cus slot move {name} {account}`:")
+        click.echo(f"  current account: {current or '(empty slot)'}")
+        click.echo(f"  target account:  {account}")
+        click.echo(f"  login pool gate: {'on' if plan['gate'] else 'off'}")
+        click.echo(f"  verdict: {plan['plan'].upper()} — {plan['detail']}")
+        if plan["plan"] == "refuse":
+            click.echo("  (this move would be refused as-is; nothing has changed)")
+        return
+
+    # Pre-flight double-book guard (mirrors `cus switch`): refuse a move that
+    # execute_swap could only satisfy by clobbering a live token family. --force
+    # bypasses THIS local check exactly like switch; the pool safety inside
+    # execute_swap is still absolute when the gate is on (it raises below and we
+    # surface it).
+    if plan["plan"] == "refuse" and not force:
+        click.echo(click.style(f"refusing: {plan['detail']}", fg="red"))
+        click.echo("Pass --force to bypass this pre-flight check (with the login pool on, execute_swap still refuses a pool-exhausted clobber).")
+        sys.exit(1)
+
+    try:
+        execute_swap(account, trigger="manual-slot-move", slot=name)
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        # execute_swap's OWN GH #104 pool-exhaustion refusal lands here as a
+        # RuntimeError ("pool exhausted for '<acct>': ...") — surface its
+        # operator-readable guidance verbatim rather than reformatting it.
+        click.echo(click.style(f"ERROR: {e}", fg="red"))
+        sys.exit(1)
+
+    # Report result. Re-read state to see the lease execute_swap recorded if it
+    # claimed a distinct login family (state.slots[name].login_family).
+    new_state = load_state()
+    lease = (new_state.get("slots", {}).get(name, {}) or {}).get("login_family")
+    click.echo(click.style(
+        f"moved {name}: {current or '(empty)'} -> {account} (in place; session continues uninterrupted)", fg="green"))
+    if lease:
+        click.echo(f"  claimed login family: {lease} (distinct token family — no clobber, GH #109)")
+    if current:
+        click.echo(f"  undo: cus slot move {name} {current}")
+
+
 @cli.command(name="doctor")
 @click.option("--fix-dirs", is_flag=True, help="Heal findings (create/repoint symlinks, fold settings stubs, merge stray dirs).")
 def doctor_cmd(fix_dirs: bool) -> None:

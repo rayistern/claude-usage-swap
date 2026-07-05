@@ -916,6 +916,185 @@ def test_login_mount_list_shows_pool_depth():
         env.restore()
 
 
+# ---------------------------------------------------------------------------
+# `cus slot move <slot> <account>` — manual in-place lane move (2026-07-05).
+#
+# The command is a thin operator wrapper around execute_swap(..., slot=...), so
+# these tests target the wrapper's own logic (validation, normalization, the
+# lock guard, the dry-run preview, and the pre-flight double-book guard) plus a
+# few end-to-end paths through the real execute_swap to confirm the inherited
+# GH #104 clobber-safety is actually surfaced.
+# ---------------------------------------------------------------------------
+
+def _slot_account(name: str) -> str | None:
+    return (cus.load_state().get("slots", {}).get(name, {}) or {}).get("account")
+
+
+def test_slot_move_to_unheld_account_succeeds():
+    """(a) Move onto an account NOT live anywhere → plain snapshot install."""
+    env = _Env()
+    try:
+        mover = env.make_slot("alpha", live=True)   # slot on alpha
+        # beta is not held by any live mount → a clean snapshot copy.
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta"])
+        assert r.exit_code == 0, r.output
+        assert f"moved {mover}: alpha -> beta" in r.output
+        assert f"undo: cus slot move {mover} alpha" in r.output
+        assert _slot_account(mover) == "beta"
+        # Snapshot copy → live creds are beta's own snapshot token (no lease).
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta", live_rt
+        assert "login_family" not in cus.load_state()["slots"][mover]
+    finally:
+        env.restore()
+
+
+def test_slot_move_onto_held_account_with_free_family_claims_it():
+    """(b) Move onto an account a live mount already holds, WITH a free login
+    family → execute_swap claims the family (distinct token, no clobber)."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)                 # beta already held
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta"])
+        assert r.exit_code == 0, r.output
+        assert "claimed login family: beta/family-1" in r.output
+        assert _slot_account(mover) == "beta"
+        assert cus.load_state()["slots"][mover]["login_family"] == "beta/family-1"
+        # Distinct token family installed — NOT a clobbering snapshot copy.
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta-fam1", live_rt
+    finally:
+        env.restore()
+
+
+def test_slot_move_onto_held_account_without_family_refuses_no_clobber():
+    """(c) Move onto a held account with NO free family → refused; no move, no
+    clobber. --force bypasses the pre-flight guard but execute_swap's own pool
+    safety STILL refuses (it has no force path) rather than clobber."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)                 # beta held, NO family planted
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta"])
+        assert r.exit_code != 0, r.output
+        assert "refusing" in r.output and "GH #104" in r.output
+        assert _slot_account(mover) == "alpha", "mover must not have moved"
+        # --force skips the pre-flight, but execute_swap raises "pool exhausted"
+        # (no force path inside it) — still no clobber.
+        r2 = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta", "--force"])
+        assert r2.exit_code != 0, r2.output
+        assert "pool exhausted" in r2.output
+        assert _slot_account(mover) == "alpha", "mover must not have moved even under --force"
+    finally:
+        env.restore()
+
+
+def test_slot_move_refuses_locked_slot_unless_force():
+    """(d) A locked slot is refused; --force overrides the lock (and, target
+    being unheld, the move then succeeds)."""
+    env = _Env()
+    try:
+        mover = env.make_slot("alpha", live=True)
+        env.set_config({"session_locks": {"locked_slots": [mover]}})
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta"])
+        assert r.exit_code != 0, r.output
+        assert "locked" in r.output
+        assert _slot_account(mover) == "alpha"
+        # --force overrides the lock; beta is unheld so it moves cleanly.
+        r2 = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta", "--force"])
+        assert r2.exit_code == 0, r2.output
+        assert _slot_account(mover) == "beta"
+    finally:
+        env.restore()
+
+
+def test_slot_move_accepts_bare_slot_number():
+    """(e) Bare `1` normalizes to `slot-1` — same move as the full name."""
+    env = _Env()
+    try:
+        mover = env.make_slot("alpha", live=True)        # "slot-1"
+        assert mover == "slot-1"
+        r = CliRunner().invoke(cus.cli, ["slot", "move", "1", "beta"])
+        assert r.exit_code == 0, r.output
+        assert _slot_account("slot-1") == "beta"
+    finally:
+        env.restore()
+
+
+def test_slot_move_dry_run_makes_no_state_change():
+    """(f) --dry-run prints the plan and touches nothing."""
+    env = _Env()
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        before = json.dumps(cus.load_state(), sort_keys=True)
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "beta", "--dry-run"])
+        assert r.exit_code == 0, r.output
+        assert "(dry-run)" in r.output and "CLAIM" in r.output
+        after = json.dumps(cus.load_state(), sort_keys=True)
+        assert before == after, "dry-run must not change state"
+        # Live creds untouched (still alpha's snapshot copy).
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-alpha", live_rt
+    finally:
+        env.restore()
+
+
+def test_slot_move_already_on_target_is_noop():
+    env = _Env()
+    try:
+        mover = env.make_slot("alpha", live=True)
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "alpha"])
+        assert r.exit_code == 0, r.output
+        assert "already on 'alpha'" in r.output
+    finally:
+        env.restore()
+
+
+def test_slot_move_validates_unknown_slot_and_account():
+    env = _Env()
+    try:
+        env.make_slot("alpha", live=True)
+        r = CliRunner().invoke(cus.cli, ["slot", "move", "slot-1", "nosuch"])
+        assert r.exit_code != 0 and "Unknown account 'nosuch'" in r.output, r.output
+        r2 = CliRunner().invoke(cus.cli, ["slot", "move", "99", "beta"])
+        assert r2.exit_code != 0 and "Unknown slot 'slot-99'" in r2.output, r2.output
+    finally:
+        env.restore()
+
+
+def test_slot_move_plan_verdicts():
+    """Pure preview helper: the four verdicts, driven directly (no execute_swap)."""
+    env = _Env()
+    try:
+        cfg_on = {"independent_logins": {"use_independent_logins": True}}
+        mover = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        # noop: target == current.
+        assert cus._slot_move_plan(state, cfg_on, mover, "alpha")["plan"] == "noop"
+        # snapshot: beta unheld.
+        assert cus._slot_move_plan(state, cfg_on, mover, "beta")["plan"] == "snapshot"
+        # Make beta held by a second live slot.
+        env.make_slot("beta", live=True)
+        state = cus.load_state()
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        # refuse: held + gate on + no family.
+        assert cus._slot_move_plan(state, cfg_on, mover, "beta")["plan"] == "refuse"
+        # claim: held + gate on + a free family.
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        assert cus._slot_move_plan(state, cfg_on, mover, "beta")["plan"] == "claim"
+        # Gate off: held with a family present is still "refuse" (no pool to use).
+        assert cus._slot_move_plan(state, {}, mover, "beta")["plan"] == "refuse"
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
