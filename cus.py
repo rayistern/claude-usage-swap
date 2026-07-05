@@ -3812,6 +3812,36 @@ def _creds_expires_at(creds: Any) -> int | float | None:
     return exp if isinstance(exp, (int, float)) else None
 
 
+def _live_mount_creds_invalid(creds: Any) -> bool:
+    """True when a credentials payload carries no usable OAuth token.
+
+    This is the detector for the 2026-07-05 blanked-live-mount incident: the
+    live ~/.claude/.credentials.json was found with `expiresAt: 0` and an empty
+    `accessToken` while the active account's snapshot stayed healthy, so a bare
+    session on the shared mount showed "not logged in" and nothing else in
+    diagnose() noticed. A file is "invalid" when it is unreadable / not a dict,
+    or its OAuth block has an empty/missing accessToken OR a missing / <= 0
+    expiresAt (the epoch/blank signature).
+
+    Shape tolerance: the token block is usually nested under `claudeAiOauth`
+    (the shape every other reader in this file assumes), but we fall back to a
+    flat top-level shape so a differently-serialized file isn't misread as
+    valid. `bool` is excluded from the numeric expiresAt check because it is an
+    `int` subclass — a stray `expiresAt: true` must not read as a positive
+    epoch.
+    """
+    if not isinstance(creds, dict):
+        return True  # missing / corrupt / non-dict → unusable
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        oauth = creds  # tolerate a flat top-level OAuth shape
+    token = oauth.get("accessToken")
+    exp = oauth.get("expiresAt")
+    token_ok = isinstance(token, str) and token.strip() != ""
+    exp_ok = isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0
+    return not (token_ok and exp_ok)
+
+
 def _snapshot_fresher_than_live(account_name: str) -> bool:
     """True when the account's storage snapshot holds strictly NEWER tokens
     (by claudeAiOauth.expiresAt) than the live ~/.claude/.credentials.json.
@@ -6240,6 +6270,85 @@ def finish_active_relogin(account_name: str) -> None:
             write_json(CLAUDE_JSON, live_cj)
 
 
+def _diagnose_live_mount_creds(
+    creds: Any,
+    mode: str,
+    active_account: str | None,
+    live_identity: dict | None = None,
+    active_identity: dict | None = None,
+) -> SOSCondition | None:
+    """Pure predicate for the blanked/invalid live shared-mount check (2026-07-05).
+
+    In `global` and `hybrid` mode the live ~/.claude/.credentials.json is what
+    BARE sessions on the shared mount read. When it gets blanked (the observed
+    signature: `expiresAt: 0` + empty `accessToken`) those sessions show "not
+    logged in" while the active account's own snapshot stays healthy — so
+    nothing else in diagnose() notices and `cus sos` reported all-clear during
+    the incident (GH #141). In `per_session` mode the shared mount is
+    observe-only / authless by design (bare launches are observed, not swapped),
+    so a blank there is expected and MUST NOT fire.
+
+    Factored out of diagnose() as a pure function — takes an already-parsed
+    creds dict (None / non-dict = unreadable → invalid), the mode, the active
+    account name, and optionally the live-mount vs active-account identity dicts
+    — so it can be unit-tested without touching real files.
+
+    Primary signal: token blank/invalid (`_live_mount_creds_invalid`). Secondary
+    signal (only when both identity dicts are supplied): the live mount's
+    identity disagrees with the active account's expected identity — a live file
+    that is technically token-valid but belongs to the WRONG account, the
+    2026-07-01 duplicate-identity shape. Returns one SOSCondition or None.
+    """
+    # Only the shared-mount-serving modes care about the live file's validity.
+    if mode not in ("global", "hybrid"):
+        return None
+
+    # Name the concrete remedy account; fall back to a placeholder if state has
+    # no active account recorded (can't happen in a served mode in practice, but
+    # keeps the message well-formed rather than emitting "None").
+    account = active_account or "<active-account>"
+    remedy = (
+        f"      cus restore-creds {account} --live\n"
+        f"    (restores the newest good credential backup into the live file; the "
+        f"account must be active, which it is). If there is no usable backup, "
+        f"re-login instead:\n"
+        f"      cus relogin {account}   # then: cus poll")
+
+    if _live_mount_creds_invalid(creds):
+        return SOSCondition(
+            severity="urgent",
+            summary=("live shared mount ~/.claude/.credentials.json has no valid token — "
+                     "bare sessions on the shared mount will show 'not logged in'"),
+            action=(
+                "The live shared-mount credentials file has been blanked/invalidated "
+                "(empty accessToken or expiresAt <= 0), the 2026-07-05 signature (GH #141). "
+                f"Any BARE session on the shared mount is locked out even though '{account}'s "
+                "own snapshot may be healthy. Reinstall a good token into the live file:\n"
+                + remedy),
+            affected=active_account or "system",
+        )
+
+    # Secondary: token is present+valid but points at the wrong account. Only
+    # evaluated when both identities are known — _identities_match returns None
+    # on no shared evidence, and we treat only an explicit False as a mismatch.
+    if (live_identity and active_identity
+            and _identities_match(live_identity, active_identity) is False):
+        live_email = live_identity.get("emailAddress") or "?"
+        want_email = active_identity.get("emailAddress") or "?"
+        return SOSCondition(
+            severity="urgent",
+            summary=("live shared mount ~/.claude/.credentials.json belongs to the wrong "
+                     "account — bare sessions on the shared mount are on the wrong identity"),
+            action=(
+                f"The live mount identity ('{live_email}') disagrees with the active account "
+                f"'{account}' ('{want_email}') — the 2026-07-01 duplicate-identity shape. "
+                "Reinstall the active account's own credentials into the live file:\n"
+                + remedy),
+            affected=active_account or "system",
+        )
+    return None
+
+
 def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
     """Scan state + system for conditions requiring human intervention.
 
@@ -6260,6 +6369,33 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         config = load_config()
     out: list[SOSCondition] = []
     accounts = state.get("accounts", {})
+
+    # Condition 0 (2026-07-05, GH #141): the LIVE shared mount itself is unusable.
+    # Every other condition here trusts state.json + per-account snapshots; none
+    # inspect the live ~/.claude/.credentials.json that BARE sessions on the
+    # shared mount actually read. In the 2026-07-05 incident that file was blanked
+    # (expiresAt 0 + empty accessToken) while the active account's snapshot stayed
+    # healthy — a bare session showed "not logged in" but `cus sos` said all-clear.
+    # Only meaningful where the shared mount serves sessions (global/hybrid); in
+    # per_session the shared mount is observe-only/authless by design, so the pure
+    # predicate skips it. Read the files here (impure) and hand the parsed payloads
+    # + identities to the pure, unit-tested predicate.
+    live_mode = config.get("mode", "global")
+    if live_mode in ("global", "hybrid"):
+        try:
+            live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+        except (json.JSONDecodeError, OSError):
+            live_creds = None  # unreadable == unusable from a session's point of view
+        try:
+            live_ident = _identity_fields(read_json(CLAUDE_JSON)) if CLAUDE_JSON.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            live_ident = {}
+        live_active = state.get("active")
+        active_ident = account_canonical_identity(live_active) if live_active else {}
+        live_cond = _diagnose_live_mount_creds(
+            live_creds, live_mode, live_active, live_ident, active_ident)
+        if live_cond is not None:
+            out.append(live_cond)
 
     # Condition 1: token expired anywhere
     for name, acct in accounts.items():
