@@ -2668,6 +2668,28 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     except (ValueError, AttributeError):
         return True, "unparseable last_poll_ts"
     role = "active" if _account_on_fast_cadence(state, config, account_name) else "inactive"
+    # token_stale fast-track (2026-07-05 incident): a token_stale account
+    # (stored access token aged out, refresh token still valid) must be
+    # re-polled PROMPTLY, not left sitting on a stale cached % for hours.
+    # poll_account_usage()'s self-refresh preflight (_refresh_account_token)
+    # can only mint a fresh token and re-fetch REAL usage when the account is
+    # actually polled — but Branch 0 restamps last_poll_ts every stale cycle,
+    # so an INACTIVE spare then waits the full slow inactive_interval before
+    # the next attempt, leaving its cached value looking authoritative. Force
+    # such accounts onto the FAST (active) cadence so a valid refresh token
+    # clears token_stale within one active interval instead of a whole slow
+    # cycle. Graceful-degrade preserved: a genuinely dead refresh token stays
+    # token_stale and simply retries at the fast (NOT every-cycle) cadence — no
+    # crash, no busy-loop, and the 429 poll-backoff gate still runs first in
+    # the daemon loop. Only ever SHORTENS the interval (min()), so a stale
+    # account already on the fast cadence is unaffected.
+    if acct.get("token_stale"):
+        polling_cfg = config.get("polling", {})
+        flat = config.get("poll_interval_seconds", 300)
+        fast_interval = polling_cfg.get("active_interval_seconds") or flat
+        if fast_interval < interval:
+            interval = fast_interval
+            role = f"{role}/token_stale-fast"
     # GH #59 composition: a 5h window that reset AFTER our last poll means the
     # stored usage is pre-reset garbage — poll now regardless of cadence class,
     # so the adaptive early wake actually refreshes the account it woke for.
@@ -3092,10 +3114,37 @@ def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
 def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
     per_model_weekly_pct from state.json. Used to fold per-model weekly caps
-    into swap-target selection (_account_effective_pct)."""
+    into swap-target selection (_account_effective_pct).
+
+    Stale-guard (2026-07-05 incident): a token_stale (or otherwise un-observable
+    — rate_limited / token_expired / poll_error) account's cached
+    per_model_weekly_pct is last-known-good, possibly HOURS old or even
+    post-rollover — it is NOT a current reading. Treat it as UNKNOWN (return
+    0.0), never as a hard cap. Per-model weekly is a 7-day-window concept, so it
+    shares current_7d_pct's staleness fate (`_pct_is_unknown`).
+
+    Why this direction is the safe one: returning 0.0 for a stale account means
+    a STALE per-model % neither (a) EXCLUDES the account from swap-target
+    selection via pick_swap_target's `_max_model_weekly_from_acct(a) < model_cap`
+    filter (the "refused a target on a stale reading" error), nor (b) makes the
+    hard-cap anti-pingpong guard treat a chosen target as "still capped" on a
+    number we couldn't reconfirm. The incident: an operator+agent trusted a
+    token_stale account's cached `Fable=100%` as authoritative and moved a live
+    Fable session off it — but the account actually had Fable headroom.
+
+    The swap-AWAY force (decide_swap Trigger 1) is already safe WITHOUT this
+    guard: it reads FRESH usage via `_max_model_weekly_from_usage`, which is 0.0
+    for a token_stale account (its AccountUsage this cycle is empty), so a stale
+    per-model can never force a live lane OFF an account. This guard only closes
+    the CACHED-dict path used by target selection / the pingpong guard.
+    """
     enabled, allow = _per_model_weekly_gate(config)
     pm = acct.get("per_model_weekly_pct") or {}
     if not enabled or not pm:
+        return 0.0
+    # Per-model shares the 7d window's staleness: if we can't trust current_7d
+    # for this account, we can't trust its per-model weekly numbers either.
+    if _pct_is_unknown(acct, "current_7d_pct"):
         return 0.0
     vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
     return max(vals) if vals else 0.0
@@ -9923,7 +9972,12 @@ def status() -> None:
         # 5h is intentionally absent — the API has no per-model 5h window.
         pm = a.get("per_model_weekly_pct") or {}
         if pm:
-            parts = "  ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+            # Mark per-model numbers stale (dim + trailing '~') for any account
+            # we couldn't freshly observe — a token_stale account's cached
+            # `Fable=100%` printed bare read as an authoritative current value
+            # and drove a wrong swap (2026-07-05 incident). See _fmt_model_pct.
+            parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
+                              for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
@@ -10121,7 +10175,15 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     pm = acct.get("per_model_weekly_pct") or {}
     top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
     model_cap = _model_weekly_cap_for_config(config)
-    if gate_enabled and top_model is not None and top_pct >= model_cap:
+    # A token_stale account passes the blocker-flag checks above (token_stale is
+    # NOT among them — its 5h is still last-known-good), so it reaches here with
+    # a cached per_model_weekly_pct that may be hours old. Never let a STALE
+    # per-model % drive a hard "premium gate" block: that is exactly the verdict
+    # that moved a live Fable session off an account which actually had Fable
+    # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
+    # surface the number marked '~' in the headroom line below instead.
+    model_stale = _model_pct_is_stale(acct)
+    if gate_enabled and not model_stale and top_model is not None and top_pct >= model_cap:
         if pool == "standard":
             # Surface the number but make clear it does NOT bind this lane.
             return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
@@ -10137,9 +10199,16 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # Headroom on every enforced axis.
     txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
     if pm:
-        txt += f", {top_model} {top_pct:.0f}%"
+        # _fmt_model_pct marks the number '~' when it's stale (token_stale et
+        # al.) so it never reads as an authoritative current value (2026-07-05).
+        txt += f", {top_model} {_fmt_model_pct(acct, top_pct)}"
         if gate_enabled and pool == "standard":
             txt += " [std: model gate off]"
+        elif model_stale:
+            # Stale per-model was skipped by the gate above — say so, so the
+            # operator repolls before trusting it rather than reading "ok" as
+            # "Fable confirmed clear".
+            txt += " [stale — repoll to confirm]"
     txt += ")"
     return ("ok", txt)
 
@@ -11524,6 +11593,43 @@ def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool
         padded = f"{raw:>{width}}"
         return click.style(padded, dim=True) if color_on else padded
     return f"{val:>{width}.{prec}f}"
+
+
+def _model_pct_is_stale(acct: dict) -> bool:
+    """True when an account's per-model WEEKLY numbers can't be trusted as a
+    CURRENT reading (2026-07-05 incident).
+
+    Per-model weekly values are 7-day-window numbers, so they share the 7d
+    window's staleness fate: whenever we can't freshly observe the account
+    (token_stale / rate_limited / token_expired / poll_error — exactly the
+    `_pct_is_unknown(acct, "current_7d_pct")` set) the cached
+    per_model_weekly_pct is last-known-good and may be hours old, or even
+    post-rollover — never an authoritative current number.
+
+    The incident: an operator (and an agent) trusted a token_stale account's
+    cached `Fable=100%` as current and moved a live Fable session off it — but
+    the account actually had Fable headroom; the 100% was a STALE cached value.
+    Bug 1 (this helper) is the DISPLAY half of the fix — mark such numbers stale
+    everywhere they're shown so they can never look current. The DECISION half
+    lives in `_max_model_weekly_from_acct`, which returns 0.0 under the same
+    condition so a stale reading never forces or refuses a swap.
+    """
+    return _pct_is_unknown(acct, "current_7d_pct")
+
+
+def _fmt_model_pct(acct: dict, val: float, color_on: bool = False) -> str:
+    """Render a per-model weekly % with the SAME staleness treatment the
+    aggregate 7d line uses (see `_fmt_pct`): a bare `NN%` only when freshly
+    observed, a dim trailing `~` (`NN%~`) when it's last-known-but-unreconfirmed
+    under token_stale et al. The `~` carries the "not reconfirmed" meaning even
+    with NO_COLOR / a non-color terminal — mirrors `_sl_mark_stale`. Mirroring
+    `_fmt_pct` guarantees a per-model number can never look more current than
+    the aggregate 7d it derives from."""
+    txt = f"{val:.0f}%"
+    if _model_pct_is_stale(acct):
+        marked = f"{txt}~"
+        return click.style(marked, dim=True) if color_on else marked
+    return txt
 
 
 def _fmt_duration(seconds: float) -> str:
