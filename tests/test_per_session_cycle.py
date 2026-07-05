@@ -191,13 +191,20 @@ def test_reactive_429_attributes_to_slot_account():
         _orig_scs = cus.session_current_slot
         cus.session_current_slot = lambda sid: {"sA": s1}.get(sid)
         try:
-            moves = cus.check_rate_limit_reactive_per_session(state, _config())
+            # exclude_accounts = the accounts every OTHER live slot holds, exactly
+            # as _per_session_cycle now supplies (fix 2026-07-05, GH #104): beta is
+            # live on slot-2, so the 429 escape must avoid it (moving onto a live
+            # account double-books its single-use refresh token). Pre-fix the cycle
+            # passed nothing and the escape could clobber beta; now it lands on a
+            # free account (gamma/delta).
+            moves = cus.check_rate_limit_reactive_per_session(state, _config(), exclude_accounts={"beta"})
             assert len(moves) == 1
             assert moves[0]["slot"] == s1 and moves[0]["from"] == "alpha"
+            assert moves[0]["to"] != "beta", f"must not escape onto live beta (GH #104): {moves}"
             assert moves[0]["deferrable"] is False and moves[0]["gate"] == "reactive_429"
 
             # Watermark advanced → same entries don't re-trigger.
-            assert cus.check_rate_limit_reactive_per_session(state, _config()) == []
+            assert cus.check_rate_limit_reactive_per_session(state, _config(), exclude_accounts={"beta"}) == []
         finally:
             cus.session_current_slot = _orig_scs
     finally:
