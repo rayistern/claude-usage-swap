@@ -420,10 +420,21 @@ def test_decide_swap_model_cap_pct_trips_independently_of_hard_cap():
 
 def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
     # Sole candidate 'b' has Fable at 85% (aggregate 10%). Under a 90% model
-    # cap it is a SAFE pick (no degraded fallback); once the model cap drops
-    # to 80% it is filtered and only survives via the degraded "no targets
-    # below cap" fallback. Ladder steps parked at [95] so the would-re-trip
-    # filter stays out of the way — this isolates the cap filter itself.
+    # cap it is a SAFE pick (no degraded fallback); under an 80% model cap it is
+    # filtered out.
+    #
+    # Annotation 2026-07-05 (supersedes the prior degraded-fallback expectation,
+    # fix "premium lane placed on Fable-capped account via degraded fan-out
+    # fallback — should HOLD"): the per-model weekly gate is now a HARD filter
+    # for a gated (premium) config — no soft fallback. Pre-fix, once the model
+    # cap dropped to 80% 'b' (Fable 85 >= 80) was filtered from the primary pick
+    # but RE-ADMITTED via the aggregate "no targets below 7d cap" cap_fallback,
+    # so the picker returned it degraded. That is exactly the mis-placement the
+    # fix closes: when the gate is on and EVERY candidate is at/over the model
+    # cap the picker now HOLDS (returns None) instead of degrading a premium lane
+    # onto a Fable-dead account. So the tight case now expects None, not a
+    # degraded 'b'. The loose case (cap 90, Fable 85 < 90) is unchanged — 'b' is
+    # genuinely below the model cap and returned cleanly.
     accounts = {
         "a": {"current_5h_pct": 90.0, "current_7d_pct": 50.0, "next_swap_at_pct": 95},
         "b": {"current_5h_pct": 5.0, "current_7d_pct": 10.0, "next_swap_at_pct": 95,
@@ -435,7 +446,8 @@ def test_pick_swap_target_filters_on_model_cap_not_hard_cap():
     picked_loose = cus.pick_swap_target(st, loose)
     picked_tight = cus.pick_swap_target(st, tight)
     assert picked_loose.name == "b" and "[DEGRADED:" not in picked_loose.reason
-    assert picked_tight.name == "b" and "no targets below 7d cap" in picked_tight.reason
+    # Every candidate over the per-model cap → HARD HOLD (fix 2026-07-05).
+    assert picked_tight is None, f"expected HOLD (all targets over model cap), got {picked_tight}"
 
 
 def test_per_model_does_not_ladder_below_its_cap():
