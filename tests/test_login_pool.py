@@ -586,6 +586,180 @@ def _usage(five_h: float, seven_d: float) -> "cus.AccountUsage":
 
 
 # --------------------------------------------------------------------------
+# Reactive-429 over-subscribe guard (2026-07-05 rayi1 pile-up, GH #104)
+#
+# Incident: the daemon piled 6 lanes onto one low-usage account with only 2
+# independent-login families, so several live mounts shared one family's
+# single-use OAuth refresh token; the next rotation diverged/clobbered the
+# losers. Root cause: the reactive-429 path committed a move whenever the picker
+# returned a target, with NO accounting of the target's DISTINCT login families —
+# it relied on the execution layer to refuse pool exhaustion. These pin the
+# decision-layer invariant: a reactive-429 move must never put more concurrent
+# live mounts on an account than it has distinct families to cover them; when it
+# can't, the lane HOLDS.
+# --------------------------------------------------------------------------
+
+def _reactive_cfg(gate: bool) -> dict:
+    """per_session config for the reactive picker with the timing/growth gates
+    off (so the decision is driven by the picker + family accounting, not
+    wall-clock state), independent-logins pool `gate` on/off."""
+    return cus.deep_merge(cus.DEFAULT_CONFIG, {
+        "mode": "per_session", "strategy": "lowest_usage",
+        "swap_hysteresis": {"enabled": False}, "usage_growth_gate": {"enabled": False},
+        "defer_swap_near_5h_reset": {"enabled": False}, "lazy_swap": {"enabled": False},
+        "independent_logins": {"use_independent_logins": gate},
+    })
+
+
+def _reactive(env, state, cfg, sid_to_slot: dict, exclude: set):
+    """Drive check_rate_limit_reactive_per_session with injected 429 entries,
+    resolving each session id to a slot via a stubbed session_current_slot
+    (there are no real panes/processes in-test). `exclude` mirrors the live-slot
+    accounts _per_session_cycle now passes (GH #104)."""
+    orig = cus.session_current_slot
+    cus.session_current_slot = lambda sid: sid_to_slot.get(sid)
+    try:
+        entries = [{"session_id": sid} for sid in sid_to_slot]
+        return cus.check_rate_limit_reactive_per_session(
+            state, cfg, entries=entries, exclude_accounts=exclude)
+    finally:
+        cus.session_current_slot = orig
+
+
+def test_reactive_429_holds_when_target_family_exhausted():
+    """The incident in miniature: alpha's lane hits a 429, and the only account
+    with headroom (beta) is ALREADY live on another mount and has NO free login
+    family. The reactive path must HOLD — never install a clobbering second copy
+    of beta's token family — even though beta looks like a great target."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        s1 = env.make_slot("alpha", live=True)   # the 429'd lane
+        env.make_slot("beta", live=True)          # beta held elsewhere, NO family
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 30.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        # exclude = every live-slot account (what _per_session_cycle supplies).
+        moves = _reactive(env, state, _reactive_cfg(True), {"sA": s1}, {"beta"})
+        assert moves == [], f"must HOLD, not double-book family-exhausted beta: {moves}"
+    finally:
+        env.restore()
+
+
+def test_reactive_429_rescues_onto_pooled_family():
+    """The graceful other side: give beta a FREE pooled family and the same 429
+    escape is allowed — it claims a DISTINCT family (no clobber). Proves the guard
+    only blocks the exhausted case, it doesn't over-block a legal pool rescue."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        s1 = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)
+        env.plant_family("beta", "family-1", "rt-beta-fam1")   # one distinct family
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 30.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        moves = _reactive(env, state, _reactive_cfg(True), {"sA": s1}, {"beta"})
+        assert len(moves) == 1 and moves[0]["slot"] == s1 and moves[0]["to"] == "beta", moves
+        assert moves[0]["gate"] == "reactive_429", moves
+    finally:
+        env.restore()
+
+
+def test_reactive_429_same_cycle_second_lane_holds_on_single_family():
+    """Same-cycle capacity accounting: two lanes 429 in ONE cycle and the only
+    headroom (beta, held elsewhere) has exactly ONE free family. The first lane
+    rescues onto that family; the SECOND must HOLD, not commit a second move onto
+    beta's now-consumed family. Pre-fix both saw the single free family in the
+    static snapshot and both committed → the #104 clobber."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        s1 = env.make_slot("alpha", live=True)   # 429'd lane #1
+        env.make_slot("beta", live=True)          # beta held, ONE family
+        s3 = env.make_slot("gamma", live=True)    # 429'd lane #2
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 30.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 96.0, "current_7d_pct": 30.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        # All three accounts are live → the cycle excludes all of them.
+        moves = _reactive(env, state, _reactive_cfg(True),
+                          {"sA": s1, "sC": s3}, {"alpha", "beta", "gamma"})
+        assert len(moves) == 1, f"single family must back exactly one rescue: {moves}"
+        assert moves[0]["to"] == "beta" and moves[0]["slot"] == s1, moves
+    finally:
+        env.restore()
+
+
+def test_reactive_429_gate_off_never_double_books():
+    """Backward-compat: with the pool gate OFF a held account has capacity 0, so
+    the reactive escape never lands on an already-live account (the pre-pool #104
+    rule, unchanged) — it holds if that's the only option, and takes a FREE
+    account when one exists."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": False}})
+        s1 = env.make_slot("alpha", live=True)   # 429'd lane
+        env.make_slot("beta", live=True)          # beta held (live)
+        # gamma exists but is NOT live → a legal, distinct escape target.
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 95.0, "current_7d_pct": 30.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 20.0, "current_7d_pct": 15.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        moves = _reactive(env, state, _reactive_cfg(False), {"sA": s1}, {"beta"})
+        assert len(moves) == 1 and moves[0]["to"] == "gamma", \
+            f"gate-off escape must take free gamma, never double-book live beta: {moves}"
+
+        # Remove gamma's headroom (saturate it) so beta is the ONLY option: hold.
+        state["accounts"]["gamma"].update({"current_5h_pct": 100.0, "current_7d_pct": 100.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        held = _reactive(env, state, _reactive_cfg(False), {"sA": s1}, {"beta"})
+        assert held == [], f"gate-off must HOLD rather than double-book live beta: {held}"
+    finally:
+        env.restore()
+
+
+def test_proactive_fanout_holds_second_lane_on_single_family():
+    """Proactive-ladder twin of the same-cycle capacity guard: two hot lanes on
+    one account fan out, but the only headroom (beta, held elsewhere) has exactly
+    ONE free family. One lane pool-double-books beta; the SECOND must HOLD, not
+    consume the same single family twice in one cycle (the #104 clobber). Pins the
+    round_claims capacity accounting in decide_slot_swaps."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        s1 = env.make_slot("alpha", live=True)   # two hot lanes on alpha
+        s2 = env.make_slot("alpha", live=True)
+        env.make_slot("beta", live=True)          # beta held, ONE family
+        env.make_slot("gamma", live=True)         # gamma held + saturated → no escape
+        env.plant_family("beta", "family-1", "rt-beta-fam1")
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 90.0, "current_7d_pct": 30.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 10.0})
+        state["accounts"]["gamma"].update({"current_5h_pct": 100.0, "current_7d_pct": 100.0})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage(90.0, 30.0), "beta": _usage(5.0, 10.0), "gamma": _usage(100.0, 100.0)}
+        cfg = _reactive_cfg(True)  # gate on; timing gates off
+        # exclude = every live-slot account, as _per_session_cycle now supplies.
+        moves = cus.decide_slot_swaps(state, cfg, usage,
+                                      exclude_accounts={"alpha", "beta", "gamma"})
+        assert len(moves) == 1, f"single family must back exactly one fan-out move: {moves}"
+        assert moves[0]["to"] == "beta" and moves[0]["slot"] in (s1, s2), moves
+    finally:
+        env.restore()
+
+
+# --------------------------------------------------------------------------
 # SOS Condition 2b (P5): pool-aware lane target-starvation
 # --------------------------------------------------------------------------
 
