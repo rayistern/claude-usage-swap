@@ -3531,25 +3531,72 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         return None
     candidates = not_saturated
 
-    # Universal filter (GH #17, all strategies): exclude candidates above
-    # the user-stated weekly ceiling. Previously only headroom/smart applied
-    # this — lowest_usage/drain/round_robin would happily pick an exhausted
-    # account. Falls back to "any candidate" if ALL are above cap (system
-    # is degraded; swap somewhere rather than stay on a hot active).
-    hard_7d = _hard_7d_cap_for_config(config)
-    # The weekly ceiling applies to the aggregate 7d AND (when the gate is on)
-    # to any tracked per-model weekly — so we never swap ONTO an account whose
-    # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
-    # when the gate is off, so this is exactly the old aggregate-7d filter then.
-    # The per-model comparison uses the TARGET-side cap (target_cap_pct,
-    # falling back to cap_pct, falling back to hard_7d): swap-away drains to
-    # cap_pct, but arrivals stop earlier — see _model_weekly_target_cap_for_config.
+    # ---- Per-model weekly (Fable) gate: HARD for premium, NO fallback ----
+    # (fix 2026-07-05, this PR; the per-model analog of PR #139's hard-cap
+    # anti-pingpong HOLD.) Split OUT of the aggregate-7d SOFT filter below —
+    # before 2026-07-05 both conditions lived in one `safe_7d` list — because the
+    # two want OPPOSITE degraded-mode behavior:
+    #
+    #   • aggregate 7d over-cap → SOFT: if EVERY candidate is over the weekly
+    #     ceiling the whole system is degraded, and "swap somewhere rather than
+    #     sit on a hot active" wins (cap_fallback re-admits them, annotated
+    #     DEGRADED). Landing on a 7d-heavy account still lets work through.
+    #   • per-model Fable over-cap for a PREMIUM lane → HARD: a premium lane's
+    #     whole purpose is Fable-clean placement. Landing it on a Fable-DEAD
+    #     account breaks its Fable work outright — strictly WORSE than holding on
+    #     the (5h-hot) account it's already on, which can still do Fable and can
+    #     move next cycle when a clean target frees (e.g. after a 5h reset). So
+    #     if the per-model gate is active and EVERY candidate is at/over the
+    #     model cap, we HOLD (return None) instead of degrading onto one.
+    #
+    # The bug this closes (live 2026-07-05, decisions.jsonl): rayi4 hit its 5h
+    # LADDER step with three premium Fable lanes stacked on it; the daemon fanned
+    # all three off at once. The first two took the clean Fable targets; the
+    # third had none left and fell into the aggregate cap_fallback, which —
+    # because per-model was folded INTO that same soft filter — re-admitted a
+    # Fable-capped account (rayi2, Fable 100%) and landed the premium lane on it.
+    # PR #139's hard-cap HOLD did NOT fire because the FORCING gate here was the
+    # 5h ladder, not a hard cap, so its guard never ran. Making the per-model
+    # gate its own HARD filter fixes BOTH the primary pick AND the fan-out
+    # re-pick (decide_slot_swaps), since both route through this function.
+    #
+    # Standard pool is UNCHANGED: _config_for_pool forces gate_enabled=False for
+    # it (GH #99), so _per_model_weekly_gate is (False, …) and
+    # _max_model_weekly_from_acct returns 0.0 for every candidate → model_safe ==
+    # candidates, the HOLD never fires, and a standard lane may still land on a
+    # Fable-capped account by design.
+    #
+    # Stale-guard preserved (2026-07-05, GH #161): a token_stale / unobservable
+    # account reads per-model 0.0 via _max_model_weekly_from_acct → stays
+    # ELIGIBLE here. Only a FRESH at/over-cap reading excludes a candidate, so we
+    # never refuse a target on a number we couldn't reconfirm.
+    #
+    # Cap used is the TARGET-side one (target_cap_pct, falling back to cap_pct,
+    # falling back to hard_7d) — identical to the pre-split primary filter:
+    # arrivals stop earlier than swap-away drains. See _model_weekly_target_cap_for_config.
+    gate_enabled, _ = _per_model_weekly_gate(config)
     model_cap = _model_weekly_target_cap_for_config(config)
-    safe_7d = [
-        (n, a) for n, a in candidates
-        if a.get("current_7d_pct", 0) < hard_7d
-        and _max_model_weekly_from_acct(a, config) < model_cap
-    ]
+    model_safe = [(n, a) for n, a in candidates
+                  if _max_model_weekly_from_acct(a, config) < model_cap]
+    if gate_enabled and not model_safe:
+        # Premium lane, every reachable target Fable-capped → HOLD. Returning
+        # None keeps this picker SILENT like every other no-target return (it is
+        # also driven from SOS / what-if probes, e.g. _candidate_is_valid_premium_target,
+        # where an echo per capped candidate would be pure noise); the swap
+        # callers (decide_swap's "no valid swap target" branch, decide_slot_swaps'
+        # fan-out HOLD) emit the operator-facing daemon.log line.
+        return None
+    if model_safe:
+        candidates = model_safe
+
+    # Universal filter (GH #17, all strategies): exclude candidates above
+    # the user-stated AGGREGATE weekly ceiling. Previously only headroom/smart
+    # applied this — lowest_usage/drain/round_robin would happily pick an
+    # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
+    # (system is degraded; swap somewhere rather than stay on a hot active). Runs
+    # on the per-model-safe survivors from the HARD gate above.
+    hard_7d = _hard_7d_cap_for_config(config)
+    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -5922,13 +5969,33 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                     reason = (f"{reason} (pool double-book: '{target}' backs another "
                               f"live mount; claiming a distinct login family — #109)")
                 else:
-                    # Pool exhausted. Pre-2026-07-03 this doubled up on the
-                    # original target — installing one token family on two live
-                    # mounts, the exact clobber #104 forbids (hit live on
-                    # slot-3/slot-4, 2026-07-03: one refresh logs the other
-                    # out). HOLD instead: a parked hot slot degrades gracefully.
-                    click.echo(f"  {slot_name}: pool exhausted — holding on '{acct_name}' "
-                               f"(won't double-book '{target}' onto a second live mount — GH #104)")
+                    # No valid DISTINCT target for this slot, and the original
+                    # pick can't be pool-double-booked (no free login family).
+                    # This branch == (retry is None and not can_pool); the
+                    # re-pick returned None for one of two reasons:
+                    #   1. Every other account is saturated / token_expired /
+                    #      would immediately re-trip its own ladder. Pre-2026-07-03
+                    #      the fallback DOUBLED UP on the original target here —
+                    #      installing one token family on two live mounts, the
+                    #      exact clobber #104 forbids (hit live on slot-3/slot-4,
+                    #      2026-07-03: one refresh logs the other out).
+                    #   2. (2026-07-05, this PR) a PREMIUM lane whose every
+                    #      remaining candidate is at/over the per-model Fable
+                    #      weekly cap — pick_swap_target now HOLDS rather than
+                    #      landing a premium lane on a Fable-dead account (the
+                    #      per-model analog of #139's hard-cap HOLD). This is the
+                    #      exact rayi4 fan-out incident: the first two lanes took
+                    #      the clean Fable targets, the third had only Fable-capped
+                    #      accounts left.
+                    # Either way HOLD: a parked hot slot degrades gracefully and
+                    # can move next cycle when a clean target frees (e.g. after a
+                    # 5h reset); staying on the hot account is strictly better
+                    # than a Fable-dead landing or a #104 clobber.
+                    click.echo(f"  {slot_name}: holding on '{acct_name}' — no valid distinct swap "
+                               f"target for this {pool} lane (remaining candidates excluded: "
+                               f"saturated / would re-trip, or over the per-model Fable weekly cap "
+                               f"for a premium lane; won't double-book '{target}' onto a second "
+                               f"live mount — GH #104 / #139)")
                     continue
             taken.add(target)
             round_claims[target] = round_claims.get(target, 0) + 1
