@@ -1979,6 +1979,38 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         if cands:
             n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
+
+    # Per-model launch guard (2026-07-05). The passes above optimize for
+    # spreading across mounts and for aggregate usage — but `_account_estimated_
+    # effective_pct` (their scoring key) and `pick_swap_target`'s degraded
+    # fallback ("no targets below 7d cap") both IGNORE per-model weekly. So when
+    # every spreadable account is model-saturated, launch happily lands a new
+    # session on e.g. Fable-at-100% 'default' (or rayi2 at 97%) even though it
+    # will hit the model wall on its first premium-model turn. A session on a
+    # model-exhausted account is strictly worse than JOINING a healthy account's
+    # existing lane (same login family, no second mount, no clobber). If the
+    # chosen target is model-saturated but a sub-cap healthy account exists,
+    # prefer it — lane-joining it when lane_sharing is on. No-op when the gate is
+    # off (`_max_model_weekly_from_acct` returns 0, so nothing reads as saturated).
+    if target is not None:
+        model_target_cap = _model_weekly_target_cap_for_config(config)
+        chosen = state.get("accounts", {}).get(target.name, {})
+        if model_target_cap > 0 and _max_model_weekly_from_acct(chosen, config) >= model_target_cap:
+            lane_sharing = config.get("per_session", {}).get("lane_sharing", False)
+            sub_cap = [
+                (n, a) for n, a in state.get("accounts", {}).items()
+                if not a.get("token_expired") and not a.get("poll_error")
+                and n not in disabled
+                and _max_model_weekly_from_acct(a, config) < model_target_cap
+                and (lane_sharing or n not in live_occupied)
+            ]
+            if sub_cap:
+                n, _ = min(sub_cap, key=lambda p: _account_estimated_effective_pct(p[1], config))
+                join = " (lane-join)" if n in live_occupied else ""
+                target = SwapTarget(
+                    name=n,
+                    reason=(f"launch model-guard: '{target.name}' is model-week saturated; "
+                            f"picked sub-cap '{n}'{join}"))
     return target
 
 
@@ -4811,7 +4843,44 @@ def decide_swap(
 
     active_acct = state["accounts"][current]
     cur_usage = usage_by_account.get(current)
+    # Per-model weekly cap is a HARD invariant that poll_account_usage persists
+    # into state.json (`per_model_weekly_pct`) on every poll. Read it from
+    # persisted state here so the force-swap-OFF side is SYMMETRIC with target
+    # selection, which already consults persisted per-model via
+    # `_max_model_weekly_from_acct` (line ~3207). Without this, an account that
+    # backs a live lane but is NOT the freshly-polled active mount (inactive
+    # cadence = ~600s) has no `usage_by_account` entry, so the block below used
+    # to `return None` ("no fresh usage poll") BEFORE ever reaching Trigger 1 —
+    # leaving a lane pinned at e.g. Fable 100% until its next poll landed.
+    # Found 2026-07-05: `cus launch auto` on 'default' at Fable 100% never
+    # force-swapped because default polled slow while merkos held the mount.
+    model_cap = _model_weekly_cap_for_config(config)
+    persisted_model = _max_model_weekly_from_acct(active_acct, config)
     if cur_usage is None:
+        # No fresh poll this cycle: the aggregate 5h/7d ladder can't be judged
+        # (it needs live window data), but the per-model hard cap CAN — from the
+        # last persisted read. Enforce only that here; everything else still
+        # correctly waits for a fresh poll.
+        if persisted_model > 0 and persisted_model >= model_cap:
+            target = pick_swap_target(state, config)
+            if target is None or (
+                "[DEGRADED:" in target.reason and "no targets below 7d cap" in target.reason
+            ):
+                _note("model_cap_no_target", "hold",
+                      f"{current} model-week {persisted_model:.1f}% >= {model_cap}% "
+                      f"but no eligible swap target")
+                return None
+            reason = (f"per-model weekly cap: {current} model-week {persisted_model:.1f}% "
+                      f">= {model_cap}% (persisted; no fresh poll this cycle); "
+                      f"target: {target.reason}")
+            _note("hard_7d_cap", "swap", reason)
+            return SwapDecision(
+                target=target.name,
+                reason=reason,
+                tier=determine_tier(active_acct, config),
+                gate="hard_7d_cap",
+                deferrable=False,
+            )
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
@@ -4837,8 +4906,10 @@ def decide_swap(
     # The model comparison uses its own threshold (per_model_weekly.cap_pct,
     # falling back to hard_7d_cap) so e.g. "Fable at 90" can coexist with an
     # aggregate ceiling of 80.
-    cur_model = _max_model_weekly_from_usage(cur_usage, config)
-    model_cap = _model_weekly_cap_for_config(config)
+    # Take the max of the fresh-poll reading and the persisted reading so a maxed
+    # model trips regardless of whether this cycle repolled the account (model_cap
+    # and persisted_model are computed above, next to the cur_usage guard).
+    cur_model = max(_max_model_weekly_from_usage(cur_usage, config), persisted_model)
     agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:

@@ -240,6 +240,54 @@ def test_statusline_shows_slot_hardpin_badge():
         env.restore()
 
 
+def test_pick_launch_account_model_guard_lane_joins_subcap():
+    """Regression 2026-07-05: when every SPREADABLE account is per-model
+    saturated (Fable at cap), the launch picker used to land a NEW session on
+    one of them — pick_swap_target's degraded 'no targets below cap' fallback
+    and _account_estimated_effective_pct both ignore per-model. A session on a
+    model-exhausted account hits the model wall on its first premium turn. With
+    the gate on + lane_sharing on, the model-guard must instead JOIN a sub-cap
+    account's existing live lane. Mirrors the real incident (default/rayi2 at
+    Fable 100/97 spreadable, rayi1 at 5% but live)."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        # alpha/beta are spreadable and Fable-saturated; the only sub-cap
+        # account (gamma) is the live shared mount → join-able, not spreadable.
+        state["accounts"] = {
+            "alpha": {"next_swap_at_pct": 50, "current_5h_pct": 10.0, "current_7d_pct": 10.0,
+                      "per_model_weekly_pct": {"Fable": 100.0}},
+            "beta":  {"next_swap_at_pct": 50, "current_5h_pct": 20.0, "current_7d_pct": 20.0,
+                      "per_model_weekly_pct": {"Fable": 97.0}},
+            "gamma": {"next_swap_at_pct": 50, "current_5h_pct": 5.0, "current_7d_pct": 5.0,
+                      "per_model_weekly_pct": {"Fable": 5.0}},
+        }
+        # gamma's shared mount is live → gamma counts as live-occupied.
+        live = {str(cus.CLAUDE_DIR)}
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        gate_on = cus.deep_merge(cus.load_config(), {
+            "per_model_weekly": {"gate_enabled": True, "models": ["Fable"], "target_cap_pct": 80},
+            "per_session": {"lane_sharing": True},
+        })
+        t = cus.pick_launch_account(state, gate_on)
+        assert t is not None and t.name == "gamma", t
+        assert "model-guard" in t.reason and "lane-join" in t.reason
+
+        # Gate OFF: guard is a no-op — picker returns a saturated spreadable
+        # account (the pre-fix behavior), never rescued to gamma.
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        gate_off = cus.deep_merge(cus.load_config(), {
+            "per_model_weekly": {"gate_enabled": False},
+            "per_session": {"lane_sharing": True},
+        })
+        t2 = cus.pick_launch_account(state, gate_off)
+        assert t2 is not None and t2.name in ("alpha", "beta"), t2
+    finally:
+        env.restore()
+
+
 def test_pick_launch_account_lane_share_fallback():
     """Saturated regime (every healthy account on a live mount): lane_sharing
     off preserves the #104 refusal (None); lane_sharing on returns the
