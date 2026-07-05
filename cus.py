@@ -6779,6 +6779,182 @@ def _auto_heal_live_mount(state: dict, config: dict, no_execute: bool = False) -
     return True
 
 
+# ---------------------------------------------------------------------------
+# LANE-mount blank detection + auto-heal (2026-07-05, GH #141 follow-up).
+#
+# The GH #141 fix above heals only the SHARED mount (~/.claude/.credentials.json).
+# But a per-slot LANE has its OWN mount creds (slot-N/.credentials.json) — the
+# file the running Claude Code session on that lane actually reads — and it can be
+# blanked the exact same way by an EXTERNAL writer (Claude's own logout, a crash
+# mid-write). That is precisely what happened to slot-2 on 2026-07-05: its mount
+# creds went blank and had to be fixed by hand, because neither `cus sos` nor the
+# daemon's auto-heal looked at anything but the shared mount. These helpers are the
+# lane analogue of Condition 0 + `_auto_heal_live_mount`: same predicate
+# (`_live_mount_creds_invalid`), same atomic-write + rotated-backup + never-write-
+# a-blank discipline, but scoped to each LIVE lane's own mount.
+# ---------------------------------------------------------------------------
+
+def _blanked_live_lanes(state: dict, config: dict) -> list[tuple[str, str]]:
+    """(slot, account) for every LIVE lane whose OWN mount creds are blanked/invalid.
+
+    A "live lane" is a slot with a registered account (`state.slots[slot].account`)
+    AND a live session on its mount (`occupied_slot_accounts` → `mount_in_use` /proc
+    ground truth). The file a lane's session reads is the slot mount's own
+    `.credentials.json` (`mount_creds_path`) — NOT the leased pooled-family store,
+    which is only the swap SOURCE / save-back target. When THAT mount file is
+    blanked (empty accessToken / expiresAt<=0, the 2026-07-05 slot-2 signature) the
+    session shows "not logged in".
+
+    Deliberately excludes the cases the task calls out as NOT-a-fault:
+      * Only lane-serving modes (per_session/hybrid) have first-class lanes — the
+        complement of the shared-mount check, which is global/hybrid. In global the
+        daemon does not manage lanes, so it does not heal them here.
+      * IDLE / observe-only slots (no live session on the mount) are skipped:
+        occupied_slot_accounts only returns slots with a live PID, so a blank in an
+        idle slot — expected, it holds no session — never surfaces.
+      * Slots with no registered account are skipped (nothing authoritative to
+        reinstall; also covers a slot mid-swap that hasn't committed an account).
+    """
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    out: list[tuple[str, str]] = []
+    # account -> [live slot names]; already /proc-gated and account-gated.
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            cred = mount_creds_path(slot_path(slot))
+            try:
+                creds = read_json(cred) if cred.exists() else None
+            except (json.JSONDecodeError, OSError):
+                creds = None  # unreadable == unusable from the session's point of view
+            if _live_mount_creds_invalid(creds):
+                out.append((slot, account))
+    return out
+
+
+def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Path | None:
+    """Newest USABLE creds file to reinstall into a blanked live lane mount, or
+    None when nothing usable exists (needs a real relogin → escalate to SOS).
+
+    Honors the GH #104/#109 login-family discipline, which is the ONE thing that
+    differs from the shared-mount heal's source pick:
+      * If the lane LEASES a pooled family (`state.slots[slot].login_family`, and
+        the independent-logins gate is on), the only safe source is THAT family's
+        own creds. Installing the account's shared snapshot instead would put a
+        DIFFERENT refresh-token family on the live lane and clobber every other
+        holder of that snapshot the next time either side refreshes (#104). So a
+        pooled lane whose family store is itself blanked/missing heals from
+        NOTHING here (returns None) rather than cross-contaminating — it escalates
+        to the relogin SOS, same as the shared-mount "no usable backup" case.
+      * A plain (non-pooled) lane is a shared-snapshot copy, so it heals from the
+        account's newest usable snapshot/backup — the exact same
+        `_newest_usable_creds_source` the shared-mount heal uses.
+
+    "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
+    swap install-point guard and the shared-mount heal apply — so whatever this
+    returns is safe to atomic-copy into the mount without re-blanking it.
+    """
+    lease = slot_leased_family(state, slot)
+    if lease is not None and lease[0] == account and independent_logins_enabled(config):
+        fam_path = login_family_creds_path(*lease)
+        if fam_path.exists():
+            try:
+                if not _live_mount_creds_invalid(read_json(fam_path)):
+                    return fam_path
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Leased family store blanked/missing → NO cross-family fallback (#104).
+        return None
+    return _newest_usable_creds_source(account)
+
+
+def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
+    """SOS for a blanked LIVE lane mount (GH #141 follow-up, 2026-07-05 slot-2).
+
+    Only reached when the daemon's in-cycle heal (`_auto_heal_live_lanes`) could
+    NOT fix the lane — i.e. no usable credential source exists for `account`
+    (snapshot + backups, and any leased login family, are all blanked), which is
+    the one case that genuinely needs a human `cus relogin`.
+    """
+    return SOSCondition(
+        severity="urgent",
+        summary=(f"lane {slot} ({account}) mount creds are blanked — "
+                 f"session will show 'not logged in'"),
+        action=(
+            f"The live lane mount {slot}/.credentials.json has been blanked/invalidated "
+            f"(empty accessToken or expiresAt <= 0), the 2026-07-05 slot-2 signature "
+            f"(GH #141 lane follow-up). The Claude Code session running on lane {slot} is "
+            f"locked out even though other accounts may be fine, and the daemon could NOT "
+            f"self-heal it — '{account}' has no usable credential source (its snapshot and "
+            f"backups, and any leased login family, are all blanked). Re-login the account:\n"
+            f"      cus relogin {account}   # then: cus poll\n"
+            f"    or restore a good backup if one exists:\n"
+            f"      cus restore-creds {account} --list"),
+        affected=account,
+    )
+
+
+def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Self-heal blanked live LANE mounts in-daemon (GH #141 follow-up, 2026-07-05).
+
+    The lane analogue of `_auto_heal_live_mount`: for every LIVE lane whose own
+    mount creds are blanked (`_blanked_live_lanes`), reinstall its owning account's
+    newest USABLE credential source (`_lane_heal_source` — the leased family store
+    if pooled, else the account snapshot/backup) into the lane mount, with the SAME
+    atomic-write + rotated-backup + never-write-a-blank discipline the shared-mount
+    heal uses. Runs in `_emit_sos_after` BEFORE `diagnose()`, so a healable blank
+    never reaches the operator as an SOS — the heal fixes the mount and diagnose
+    then sees it valid. Only a lane with NO usable source falls through to the
+    URGENT relogin SOS (`_lane_mount_sos`).
+
+    Idempotent (a healthy lane is byte-for-byte untouched — the invalid-check gates
+    the whole thing), never clobbers a healthy lane, and honors login-family
+    discipline (a pooled lane heals only from its own family — see
+    `_lane_heal_source`). Returns the list of healed slot names. `no_execute` logs
+    the intended heal without writing, for `cus daemon --once --no-execute`.
+    """
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    healed: list[str] = []
+    for slot, account in _blanked_live_lanes(state, config):
+        source = _lane_heal_source(slot, account, state, config)
+        dest = mount_creds_path(slot_path(slot))
+        if source is None:
+            # No usable snapshot/backup/family: cannot self-heal without a browser
+            # relogin. Leave the blank so diagnose() surfaces the URGENT SOS.
+            click.echo(f"  auto-heal: live lane {slot} ({account}) mount is blanked but there is NO "
+                       f"usable credential source — leaving it for the URGENT relogin SOS "
+                       f"(GH #141 lane follow-up)")
+            continue
+        if no_execute:
+            click.echo(f"  auto-heal (--no-execute): WOULD restore '{account}' creds from {source} "
+                       f"into live lane {slot} (GH #141 lane follow-up)")
+            continue
+        # Install-point guard mirror (#141): never write a blank. The source was
+        # already validated by _lane_heal_source, but re-check at the install point
+        # so a source that went bad between pick and copy can't re-blank the mount.
+        try:
+            if _live_mount_creds_invalid(read_json(source)):
+                continue
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Same discipline as _auto_heal_live_mount / restore_creds_backup: back up
+        # the (blank) lane mount first so the heal is itself reversible, then
+        # atomic-copy the validated source over it. Only the lane mount is touched
+        # — the family store / snapshot is a heal SOURCE here, never a write target.
+        backup_credentials_file(dest)
+        atomic_copy(source, dest, mode=0o600)
+        msg = (f"live lane {slot} ({account}) mount creds were blanked/invalid (GH #141 lane "
+               f"follow-up) — auto-restored '{account}' credentials from {source} into {dest}; "
+               f"the lane's session is usable again without a human (2026-07-05 slot-2 incident).")
+        click.echo(f"  AUTO-HEAL: {msg}")
+        try:
+            append_inbox("auto-heal", f"blanked live lane {slot} self-healed (GH #141 follow-up)", msg)
+        except OSError:
+            pass  # inbox is best-effort observability; never fail the heal over it
+        healed.append(slot)
+    return healed
+
+
 def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
     """Human label for WHY a reachable account is NOT a valid premium swap target.
 
@@ -7031,6 +7207,20 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             live_creds, live_mode, live_active, live_ident, active_ident)
         if live_cond is not None:
             out.append(live_cond)
+
+    # Condition 0b (2026-07-05, GH #141 follow-up): a LIVE LANE's own mount creds
+    # are blanked. Condition 0 above only inspects the SHARED mount; a slot lane's
+    # own slot-N/.credentials.json can be blanked independently (Claude's logout,
+    # a crash mid-write) — the 2026-07-05 slot-2 incident, which `cus sos` reported
+    # as all-clear because nothing scanned lane mounts. Only in lane-serving modes
+    # (per_session/hybrid); `_blanked_live_lanes` self-gates on mode and returns
+    # only LIVE lanes with a registered account whose mount is actually invalid
+    # (idle/observe-only slots and mid-swap slots are excluded there). In the
+    # daemon, `_emit_sos_after` auto-heals blanked lanes BEFORE this diagnose runs,
+    # so a lane only reaches here when it has NO usable source (genuine relogin
+    # needed); an ad-hoc `cus sos` still reports the blank so an operator sees it.
+    for _lane_slot, _lane_acct in _blanked_live_lanes(state, config):
+        out.append(_lane_mount_sos(_lane_slot, _lane_acct))
 
     # Condition 1: token expired anywhere
     for name, acct in accounts.items():
@@ -10722,6 +10912,13 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # the diagnose() below then sees it valid. Only a mount with NO usable
         # backup falls through to the URGENT re-login SOS (needs a human).
         _auto_heal_live_mount(state, config, no_execute=no_execute)
+        # GH #141 follow-up (2026-07-05 slot-2): the shared-mount heal above never
+        # looked at per-slot LANE mounts, so a blanked lane (Claude's own logout /
+        # a crash mid-write) sat locked out until fixed by hand. Same funnel, same
+        # discipline: heal every LIVE lane whose own creds are blanked BEFORE
+        # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
+        # global mode / when no lane is blanked.
+        _auto_heal_live_lanes(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
         maybe_write_sos(conditions, state)
         if conditions:
