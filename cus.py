@@ -1338,7 +1338,7 @@ def _distinct_family_capacity(account: str, state: dict, config: dict | None, sl
     Gate off (default, no pool): capacity is 1 (or 0 if the account is already
     live on a mount) — i.e. 'never double-book', the pre-pool #104 rule, bit-for-
     bit unchanged."""
-    cap = 0 if _account_held_by_other_live_mount(state, account, slot) else 1
+    cap = 0 if _account_held_by_other_live_mount(state, account, slot, config) else 1
     if independent_logins_enabled(config):
         cap += _free_family_count(account, state)
         if slot is not None and has_independent_login(account, slot):
@@ -1489,7 +1489,41 @@ def family_identity(account: str, family_id: str) -> dict:
         return {}
 
 
-def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None) -> bool:
+def _shared_mount_holds(account: str, state: dict, config: dict | None = None) -> bool:
+    """True iff the shared ~/.claude mount is a live holder of `account`.
+
+    The shared mount holds state["active"] as a live account in `global` and
+    `hybrid` mode — every bare (non-slot) session rides it. This is the second
+    live-mount surface a slot swap can clobber (#104): a plain snapshot copy of
+    the shared account into a slot puts one OAuth token family on TWO live mounts.
+
+    Why NOT gated on mount_in_use(CLAUDE_DIR): bare sessions launch with the
+    DEFAULT config dir and set no CLAUDE_CONFIG_DIR env var, so mount_pids can't
+    see them and mount_in_use(CLAUDE_DIR) reads False even with dozens of live
+    bare sessions. That false-negative is exactly the 2026-07-05 slot-move
+    clobber (issue #141): `cus slot move slot-5 merkos --dry-run` said "not live
+    on any other mount / plain snapshot" while merkos held the shared mount with
+    ~30 bare sessions. So in global/hybrid mode the shared mount is treated as
+    UNCONDITIONALLY holding state["active"] — mirroring the daemon, whose
+    _hybrid_cycle excludes state["active"] from every slot target unconditionally
+    (exclude_for_slots), never via a mount_in_use probe.
+
+    In `per_session` mode the shared ~/.claude mount is observe-only (the daemon
+    never manages it for bare sessions and never excludes state["active"] from
+    slot decisions), so we preserve the pre-existing, detectable-only behavior
+    there rather than newly blocking per_session slot moves onto state["active"].
+    """
+    if state.get("active") != account:
+        return False
+    mode = (config if config is not None else load_config()).get("mode", "global")
+    if mode in ("global", "hybrid"):
+        return True
+    # per_session: honor only a detectable live holder (unchanged behavior).
+    return mount_in_use(CLAUDE_DIR)
+
+
+def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None,
+                                      config: dict | None = None) -> bool:
     """True iff `account` is currently live on a mount OTHER than `this_slot` — a
     live slot or the shared ~/.claude mount.
 
@@ -1503,15 +1537,19 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
     cycle; slot-7's guard read the cached map from before slot-2's install,
     judged rayi3 unheld, and copied the snapshot — two live mounts on one token
     family, and the next refresh logged slot-2 out (empty refreshToken on its
-    live creds). Ground truth costs one /proc scan per swap; swaps are rare."""
+    live creds). Ground truth costs one /proc scan per swap; swaps are rare.
+
+    `config` selects the mode used to judge the shared-mount holder (see
+    _shared_mount_holds). Optional/back-compat: None re-loads it. The daemon's
+    slot targets never include state["active"] (it's in exclude_for_slots), so
+    the shared-mount clause is a no-op there — it only bites the manual
+    `cus slot move` path, which has no such exclusion (issue #141)."""
     for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
         if s != this_slot:
             return True
     # The shared mount counts too: a slot copying merkos while the shared mount
-    # is live on merkos double-books it exactly the same way.
-    if state.get("active") == account and mount_in_use(CLAUDE_DIR):
-        return True
-    return False
+    # is live on merkos double-books it exactly the same way (issue #141).
+    return _shared_mount_holds(account, state, config)
 
 
 def read_login_provenance(account: str, slot: str) -> dict | None:
@@ -4408,7 +4446,7 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     install_src = None
     used_independent = False
     if (slot is not None and independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot)):
+            and _account_held_by_other_live_mount(state, target_name, slot, config)):
         # #127: liveness-verified claim — probes each free family's refresh
         # token, retires dead stores (the pre-PR#126 poisoning landmines), and
         # persists the rotation into the store this install copies from.
@@ -12649,9 +12687,13 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     # Ground-truth occupancy (max_age_seconds=0 bypasses the cache) — the same
     # source the real clobber guard reads, so preview and reality can't diverge.
     held_by = [s for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(target, []) if s != slot_name]
-    if state.get("active") == target and mount_in_use(CLAUDE_DIR):
+    # Shared-mount holder: mode-aware, NOT gated on mount_in_use(CLAUDE_DIR) —
+    # bare sessions on ~/.claude set no CLAUDE_CONFIG_DIR so mount_pids can't see
+    # them (issue #141). _shared_mount_holds treats global/hybrid state["active"]
+    # as an unconditional live holder; per_session keeps the detectable-only rule.
+    if _shared_mount_holds(target, state, config):
         held_by = held_by + ["~/.claude (shared mount)"]
-    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name)
+    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config)
     gate = independent_logins_enabled(config)
     if target == current:
         plan, detail = "noop", f"{slot_name} is already on '{target}'"

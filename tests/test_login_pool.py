@@ -457,7 +457,12 @@ def test_saveback_routes_rotated_tokens_to_leased_family():
     never to the account snapshot."""
     env = _Env()
     try:
-        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        # mode=per_session: this exercises the slot save-back path, where the
+        # shared ~/.claude mount is observe-only, so a slot may swap back onto the
+        # _Env default active account ("alpha") without a shared-mount double-book.
+        # In global/hybrid mode that same move is now (correctly) a #141 clobber
+        # and would require a distinct family — see the shared-mount tests below.
+        env.set_config({"mode": "per_session", "independent_logins": {"use_independent_logins": True}})
         mover = env.make_slot("alpha", live=True)
         env.make_slot("beta", live=True)
         env.plant_family("beta", "family-1", "rt-beta-fam1")
@@ -1091,6 +1096,114 @@ def test_slot_move_plan_verdicts():
         assert cus._slot_move_plan(state, cfg_on, mover, "beta")["plan"] == "claim"
         # Gate off: held with a family present is still "refuse" (no pool to use).
         assert cus._slot_move_plan(state, {}, mover, "beta")["plan"] == "refuse"
+    finally:
+        env.restore()
+
+
+# ---------------------------------------------------------------------------
+# `cus slot move` — shared-mount (global/hybrid) double-book clobber (issue #141,
+# 2026-07-05). The shared ~/.claude mount holds state["active"] as a live account
+# in global/hybrid mode, but bare sessions set no CLAUDE_CONFIG_DIR so
+# mount_in_use(CLAUDE_DIR) reads False. The double-book guard must count the
+# shared-mount account UNCONDITIONALLY in global/hybrid mode (not via mount_in_use),
+# or a slot-move plain-snapshots the shared account onto a second live mount and
+# clobbers its token family. In _Env, mount_pids only ever sees slot dirs, so the
+# shared mount always reads not-in-use — i.e. the exact bare-undetectable scenario.
+# ---------------------------------------------------------------------------
+
+def test_shared_mount_holds_is_mode_aware():
+    """_shared_mount_holds: unconditional for global/hybrid state["active"]
+    (bare sessions undetectable), detectable-only for per_session."""
+    env = _Env(accounts=("merkos", "beta"))          # active = merkos
+    try:
+        assert cus.mount_in_use(cus.CLAUDE_DIR) is False, "shared mount reads not-in-use in _Env"
+        assert cus._shared_mount_holds("merkos", cus.load_state(), {"mode": "hybrid"}) is True
+        assert cus._shared_mount_holds("merkos", cus.load_state(), {"mode": "global"}) is True
+        # per_session: observe-only mount → not held unless mount_in_use detects it.
+        assert cus._shared_mount_holds("merkos", cus.load_state(), {"mode": "per_session"}) is False
+        # A non-active account is never the shared-mount holder.
+        assert cus._shared_mount_holds("beta", cus.load_state(), {"mode": "hybrid"}) is False
+    finally:
+        env.restore()
+
+
+def test_slot_move_dry_run_flags_shared_mount_account_claim():
+    """The reported bug (#141): `cus slot move <slot> merkos --dry-run` where
+    merkos is the active shared-mount account WITH a free family must print
+    CLAIM, not SNAPSHOT."""
+    env = _Env(accounts=("merkos", "beta"))
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("beta", live=True)
+        env.plant_family("merkos", "family-1", "rt-merkos-fam1")
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "merkos", "--dry-run"])
+        assert r.exit_code == 0, r.output
+        assert "CLAIM" in r.output and "SNAPSHOT" not in r.output, r.output
+        assert "shared mount" in r.output, r.output
+    finally:
+        env.restore()
+
+
+def test_slot_move_onto_shared_mount_account_with_family_claims_no_clobber():
+    """(a) Move a slot onto the shared-mount account (hybrid, active=merkos,
+    ~/.claude in use) WITH a free family → claims the family, installs a distinct
+    token (NOT a clobbering snapshot copy of merkos's base credentials)."""
+    env = _Env(accounts=("merkos", "beta"))
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("beta", live=True)
+        env.plant_family("merkos", "family-1", "rt-merkos-fam1")
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "merkos"])
+        assert r.exit_code == 0, r.output
+        assert "claimed login family: merkos/family-1" in r.output, r.output
+        assert _slot_account(mover) == "merkos"
+        # Distinct family token installed — NOT merkos's base snapshot (rt-merkos).
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-merkos-fam1", live_rt
+        # merkos's base snapshot (what the shared mount rides) is untouched.
+        snap_rt = cus._credential_refresh_token(cus.read_json(env.accounts_dir / "account-merkos" / ".credentials.json"))
+        assert snap_rt == "rt-merkos", snap_rt
+    finally:
+        env.restore()
+
+
+def test_slot_move_onto_shared_mount_account_without_family_refuses_no_clobber():
+    """(b) Same as (a) but NO free family → refused (no clobber of the shared
+    mount). --force skips the pre-flight but execute_swap still refuses the
+    pool exhaustion — never a plain snapshot copy of the shared account."""
+    env = _Env(accounts=("merkos", "beta"))
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("beta", live=True)
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "merkos"])
+        assert r.exit_code != 0, r.output
+        assert "refusing" in r.output and "GH #104" in r.output, r.output
+        assert _slot_account(mover) == "beta", "must not have moved"
+        r2 = CliRunner().invoke(cus.cli, ["slot", "move", mover, "merkos", "--force"])
+        assert r2.exit_code != 0 and "pool exhausted" in r2.output, r2.output
+        assert _slot_account(mover) == "beta", "must not clobber even under --force"
+        # The slot's live creds were never overwritten with merkos's base snapshot.
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-beta", live_rt
+    finally:
+        env.restore()
+
+
+def test_slot_move_non_shared_unheld_account_still_snapshots_in_hybrid():
+    """(c) The fix must not over-fire: in hybrid mode, moving onto a DIFFERENT
+    account that is neither the shared-mount account nor held by a slot still
+    resolves to a plain snapshot install (unchanged)."""
+    env = _Env(accounts=("merkos", "beta", "gamma"))   # active = merkos (shared)
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        mover = env.make_slot("beta", live=True)
+        plan = cus._slot_move_plan(cus.load_state(), cus.load_config(), mover, "gamma")
+        assert plan["plan"] == "snapshot", plan
+        r = CliRunner().invoke(cus.cli, ["slot", "move", mover, "gamma"])
+        assert r.exit_code == 0, r.output
+        assert _slot_account(mover) == "gamma"
+        live_rt = cus._credential_refresh_token(cus.read_json(cus.slot_path(mover) / ".credentials.json"))
+        assert live_rt == "rt-gamma", live_rt
     finally:
         env.restore()
 
