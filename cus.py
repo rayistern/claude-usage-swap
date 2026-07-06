@@ -597,6 +597,43 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "within_pct_of_step": 5,       # accelerate when extrapolated usage is within this many pts of the next step
         "fast_interval_seconds": 45,   # near-threshold poll cadence (vs the normal active/inactive interval)
+        # Clustered-account compounded-burn allowance (2026-07-06 rayi4 incident).
+        # An account backing MULTIPLE live lanes climbs toward its cap ~N× faster
+        # than its per-account `burn_rate` (measured from single-lane poll-to-poll
+        # history) predicts, so the plain `within_pct_of_step` band fires too late:
+        # rayi4 sat at 84% 5h on the SLOW inactive cadence and rode past its 95%
+        # step before the daemon re-polled. Widen the fast-poll band by this many
+        # pts for each EXTRA lane an account backs (band = within + bonus*(lanes-1)),
+        # so a clustered near-cap account is fast-polled early enough to swap a lane
+        # off in time. 0 = off (prior single-band behavior). Only accounts backing
+        # >= 2 live lanes are affected, so under normal one-lane-per-account
+        # operation this is inert (no extra polling → no 429-budget cost).
+        "cluster_within_bonus_pct": 10,
+    },
+    # Anti-clustering lane spread (2026-07-06 incident: the daemon piled ALL live
+    # lanes onto ONE "best-scored" account — first rayi5, then rayi4 — instead of
+    # spreading them). Root cause: the smart/headroom scorers rank an account purely
+    # on usage/headroom/burn-proximity with NO awareness of how many live lanes it
+    # already backs, so the SAME burn-soon account is the top pick for every lane
+    # each cycle; combined with the #109 pool double-book escape hatch, several lanes
+    # STACK onto it (4 mounts on 3 families → the shared token diverged → recurring
+    # "mount blanked / not logged in" auto-heal loop), and they then all hit that one
+    # account's 5h cap simultaneously with no headroom to swap. Two coupled levers:
+    #   (1) cluster_penalty — a swap-target SCORE penalty of this many points per
+    #       live lane already backing the candidate (existing occupancy + this-cycle
+    #       claims), so an account that already holds a lane loses to a distinct empty
+    #       one. Prevents cross-cycle re-convergence onto the same magnet account.
+    #   (2) max_stack — the daemon will not pile a NON-urgent (deferrable, e.g.
+    #       burn-before-reset) move onto an account that already backs >= max_stack
+    #       lanes when it can instead HOLD the lane on its current account. Urgent
+    #       moves (hard-cap / reactive-429 escapes) may still stack via independent
+    #       login families when clean accounts are genuinely scarce — that path is a
+    #       last resort the #104/#109 family accounting still guards.
+    # `enabled: False` reverts BOTH levers to prior behavior bit-for-bit.
+    "spread_lanes": {
+        "enabled": True,
+        "cluster_penalty": 40.0,       # score pts deducted per live lane already backing a candidate target
+        "max_stack": 1,                # deferrable moves won't grow an account past this many lanes when it can hold
     },
     # Per-model WEEKLY tracking (2026-07-02). The usage API exposes per-model
     # usage only weekly (no per-model 5h window). `gate_enabled: False` by
@@ -2776,7 +2813,12 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     # Only ever SHORTENS the interval (min via the `<` guard), never lengthens it.
     if _poll_accel_enabled(config):
         in_backoff, _ = account_in_backoff(state, account_name)
-        if not in_backoff and _account_near_step(acct, config, normal_interval):
+        # Lane count feeds the clustered-account band widening (2026-07-06): an
+        # account backing several live lanes must fast-poll EARLIER because its
+        # compounded burn outruns the single-lane burn_rate the estimator measured.
+        lane_count = len(occupied_slot_accounts(state).get(account_name, []))
+        if not in_backoff and _account_near_step(acct, config, normal_interval,
+                                                 lane_count=lane_count):
             fast = float(config.get("poll_accel", {}).get("fast_interval_seconds", 45))
             if fast < interval:
                 interval = fast
@@ -3468,7 +3510,7 @@ def _next_ladder_step(acct: dict, config: dict) -> float:
 
 
 def _account_near_step(acct: dict, config: dict, normal_interval_seconds: float,
-                       now=None) -> bool:
+                       now=None, lane_count: int = 0) -> bool:
     """Is this account close enough to its next ladder step to warrant fast
     polling (Fix B)? True when EITHER:
       (1) its burn-extrapolated usage (to now) is within `within_pct_of_step`
@@ -3479,11 +3521,21 @@ def _account_near_step(acct: dict, config: dict, normal_interval_seconds: float,
           still numerically below the band but won't be for long.
     Pure predicate over the account dict + config; `normal_interval_seconds` is
     passed in (not read from state) precisely to keep it I/O-free and testable.
-    Returns False when poll_accel is disabled, so the gate reverts cleanly."""
+    Returns False when poll_accel is disabled, so the gate reverts cleanly.
+
+    `lane_count` (2026-07-06 rayi4 incident): how many LIVE lanes this account
+    backs. An account under N concurrent live sessions climbs ~N× faster than its
+    per-account `burn_rate` (measured before those lanes piled on) predicts, so
+    the near-step band is widened by `poll_accel.cluster_within_bonus_pct` per
+    EXTRA lane. Default 0 ⇒ single-lane behavior (band unchanged). This is why
+    clustered rayi4 sat at 84% on the slow cadence and rode past its 95% step —
+    the plain 5-pt band never triggered until it was already too late."""
     if not _poll_accel_enabled(config):
         return False
     pa = config.get("poll_accel", {})
     within = float(pa.get("within_pct_of_step", 5))
+    if lane_count > 1:
+        within += float(pa.get("cluster_within_bonus_pct", 10)) * (lane_count - 1)
     step = _next_ladder_step(acct, config)
     # (1) already inside the band on the extrapolated NOW value.
     if _account_estimated_effective_pct(acct, config, now) >= step - within:
@@ -3647,6 +3699,38 @@ def _disabled_accounts(config: dict) -> set:
     stops NEW placements. Re-enable by deleting the key or setting false."""
     return {a.get("name") for a in config.get("accounts", [])
             if isinstance(a, dict) and a.get("disabled")}
+
+
+def _spread_lanes_enabled(config: dict) -> bool:
+    """Master gate for the anti-clustering lane-spread levers (2026-07-06).
+    False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
+    behavior bit-for-bit."""
+    return bool(config.get("spread_lanes", {}).get("enabled", True))
+
+
+def _lane_load_penalty(name: str, state: dict, config: dict) -> float:
+    """Anti-clustering swap-target score penalty for candidate account `name`
+    (2026-07-06 clustering incident).
+
+    Returns `spread_lanes.cluster_penalty` points for EACH live lane already
+    backing `name` — read from `state["_lane_load"]`, a caller-supplied
+    account→lane-count map (existing /proc occupancy PLUS this-cycle's queued
+    claims; see decide_slot_swaps). The picker subtracts this from a candidate's
+    strategy score so an account that already holds one or more lanes loses to a
+    distinct EMPTY one, breaking the "every lane's best pick is the same magnet
+    account" attractor that piled all lanes onto rayi5 then rayi4.
+
+    0.0 when the feature is off, when no load map was supplied (every non-lane
+    caller — SOS probes, `cus switch`, global mode — passes no `_lane_load`, so
+    their scoring is untouched), or when the candidate backs no lanes. Scales
+    linearly with lane count, so a magnet that has already accreted 2-3 lanes is
+    penalized 2-3× and the fleet disperses within a cycle or two."""
+    if not _spread_lanes_enabled(config):
+        return 0.0
+    load = (state.get("_lane_load") or {}).get(name, 0)
+    if not load:
+        return 0.0
+    return float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0)) * load
 
 
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
@@ -3825,8 +3909,12 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     if strategy == "lowest_usage":
         # cux balanced. Sort by the user's effective threshold metric
         # (honors thresholds.{five_hour,seven_day}), then secondary tiebreak
-        # by 5h for stability.
-        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config), kv[1].get("current_5h_pct", 0.0)))
+        # by 5h for stability. Anti-cluster (2026-07-06): a lane-load penalty is
+        # ADDED to the effective-util sort key (higher util = sorted later), so a
+        # candidate already backing live lanes is deprioritized vs an empty one.
+        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
+                                        + _lane_load_penalty(kv[0], state, config),
+                                        kv[1].get("current_5h_pct", 0.0)))
         chosen, _ = candidates[0]
         return SwapTarget(name=chosen, reason=_annotate("lowest_usage: lowest effective util"))
 
@@ -3896,9 +3984,11 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         def score(acct: dict) -> float:
             return (100 - acct.get("current_5h_pct", 0.0)) * w5 + (100 - acct.get("current_7d_pct", 0.0)) * w7
 
-        candidates.sort(key=lambda kv: -score(kv[1]))
+        # Anti-cluster (2026-07-06): subtract the lane-load penalty so an account
+        # already backing live lanes scores below a distinct empty one.
+        candidates.sort(key=lambda kv: -(score(kv[1]) - _lane_load_penalty(kv[0], state, config)))
         chosen, chosen_acct = candidates[0]
-        s = score(chosen_acct)
+        s = score(chosen_acct) - _lane_load_penalty(chosen, state, config)
         return SwapTarget(name=chosen, reason=_annotate(f"headroom: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={s:.1f}"))
 
     if strategy == "smart":
@@ -3974,7 +4064,22 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
             return s, " ".join(reasons) if reasons else "(headroom only)"
 
-        scored = [(n, a, *smart_score(a)) for n, a in candidates]
+        # Anti-cluster (2026-07-06 rayi5/rayi4 pile-up): after the usage/burn
+        # score, subtract cluster_penalty per live lane already backing each
+        # candidate. Without this the burn-soon bonus (+~98) made the ONE
+        # about-to-reset account the runaway #1 pick for EVERY lane, so they all
+        # migrated onto it cycle after cycle. The penalty scales with lane count,
+        # so a magnet that has already accreted lanes falls behind a distinct
+        # empty account and the fleet disperses. Inert when spread_lanes is off or
+        # no _lane_load map was supplied (non-lane callers).
+        scored = []
+        for n, a in candidates:
+            sc, rz = smart_score(a)
+            pen = _lane_load_penalty(n, state, config)
+            if pen:
+                sc -= pen
+                rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
+            scored.append((n, a, sc, rz))
         scored.sort(key=lambda x: -x[2])
         chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
         return SwapTarget(
@@ -6122,6 +6227,20 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     round_claims: dict[str, int] = {}
     locked = _locked_slots(config)
     occupied = occupied_slot_accounts(state)
+    # Anti-clustering lane-load base (2026-07-06): account → number of live lanes
+    # it ALREADY backs at cycle start. Fed (merged with this-cycle's round_claims)
+    # into pick_swap_target's score penalty AND consulted by the deferrable-move
+    # HOLD gate below, so the daemon spreads lanes one-per-account instead of
+    # piling every lane onto the single burn-soon magnet (the rayi5→rayi4 pile-up).
+    base_lane_load: dict[str, int] = {a: len(s) for a, s in occupied.items()}
+
+    def _cur_lane_load() -> dict[str, int]:
+        """account → lanes it will back = pre-existing live lanes + moves already
+        queued onto it THIS cycle. Recomputed per pick so each successive fan-out
+        re-pick sees the accreting load and steers to a fresh account."""
+        names = set(base_lane_load) | set(round_claims)
+        return {a: base_lane_load.get(a, 0) + round_claims.get(a, 0) for a in names}
+
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
     # — dropped here so a group whose slots are all locked never burns a
     # decide_swap and fan-out never counts them.
@@ -6153,6 +6272,10 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
             drop = drop - rescuable
         if drop:
             shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
+        # Anti-cluster: expose the current lane-load so the PRIMARY pick (through
+        # decide_swap → pick_swap_target) penalizes an account already backing
+        # lanes and prefers a distinct empty one.
+        shim["_lane_load"] = _cur_lane_load()
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
         if traces is not None:
@@ -6204,14 +6327,51 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                                 target, state, cfg_view, slot_name))
                 shim2 = dict(shim)
                 shim2["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
+                # Anti-cluster: the re-pick sees the accreting lane-load too, so it
+                # steers to a fresh account rather than the loaded magnet.
+                shim2["_lane_load"] = _cur_lane_load()
                 retry = pick_swap_target(shim2, cfg_view)
                 retry_healthy = retry is not None and not _target_would_immediately_re_trip(
                     state.get("accounts", {}).get(retry.name, {}), cfg_view)
+                # Anti-clustering HOLD (2026-07-06 rayi5→rayi4 pile-up). The #109
+                # pool double-book below is what lets several lanes STACK onto one
+                # burn-soon account in a single cycle (4 mounts on 3 families → the
+                # shared token diverged → the "mount blanked" auto-heal loop, and
+                # they then all hit that account's 5h cap together). The whole
+                # incident was `burn_before_reset` moves — a pure OPTIMIZATION that
+                # fires only while the lane's current account is BELOW its own step
+                # (decide_swap gates bbr on current_max < ladder_threshold), i.e.
+                # the lane does NOT need to move at all. When such a move would grow
+                # a target past `max_stack` live lanes (existing occupancy + this
+                # cycle's claims), HOLD: the lane keeps its perfectly-usable current
+                # account and can move to a DISTINCT account next cycle. Scoped to
+                # the bbr gate on purpose — a LADDER move means the source IS hot
+                # (at/over its step) and genuinely needs off, so when clean accounts
+                # are scarce it still pool-double-books (the task's "allow stacking
+                # when clean accounts are scarce"); likewise hard-cap / reactive-429
+                # escapes (deferrable=False) must go somewhere. The #104/#109 family
+                # accounting guards those last-resort stacks. Gated on
+                # spread_lanes.enabled (off ⇒ pre-fix path, bit-for-bit).
+                sl_cfg = config.get("spread_lanes", {})
+                spread_on = _spread_lanes_enabled(config)
+                max_stack = int(sl_cfg.get("max_stack", 1))
+                target_lane_load = base_lane_load.get(target, 0) + round_claims.get(target, 0)
+                cluster_hold = (spread_on and decision.gate == "burn_before_reset"
+                                and target_lane_load >= max_stack)
                 if retry is not None and (retry_healthy or not can_pool):
                     # Re-pick reasons were silently dropped pre-2026-07-03 —
                     # decisions.jsonl showed the ORIGINAL pick's stats next to
                     # the re-picked target (log said "5h=0%" for a 99% move).
                     target, reason = retry.name, retry.reason
+                elif cluster_hold:
+                    # Would pile a non-urgent move onto an already-loaded account —
+                    # keep the lane put instead (anti-clustering).
+                    click.echo(f"  {slot_name}: holding on '{acct_name}' — not stacking a "
+                               f"non-urgent {decision.gate} move onto '{target}', which already "
+                               f"backs {target_lane_load} live lane(s) (spread_lanes.max_stack="
+                               f"{max_stack}); the lane stays put and can move to a distinct "
+                               "account next cycle (2026-07-06 lane-clustering incident)")
+                    continue
                 elif can_pool:
                     reason = (f"{reason} (pool double-book: '{target}' backs another "
                               f"live mount; claiming a distinct login family — #109)")
@@ -6345,6 +6505,13 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
                     if _distinct_family_capacity(x, state, config, slot_name)
                        - round_claims.get(x, 0) <= 0}
         shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in drop}
+        # Anti-cluster (2026-07-06): even an urgent 429 escape prefers a distinct,
+        # unloaded account over one already backing lanes. Load = live occupancy +
+        # this-cycle's reactive claims (round_claims). No HOLD here — a 429'd lane
+        # MUST leave — but the penalty biases WHICH account it lands on.
+        occ_now = occupied_slot_accounts(state)
+        shim["_lane_load"] = {a: len(occ_now.get(a, [])) + round_claims.get(a, 0)
+                              for a in set(occ_now) | set(round_claims)}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
         # a premium slot's may not.
@@ -11900,7 +12067,8 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
     "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
     "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
-    "poll_accel": "Near-threshold responsiveness (2026-07-06 rayi3 incident: burned from under its 95% step to 100% between two ~180s polls, hit the native usage-limit menu before the swap). Two config-gated fixes: (A) the ladder/cap swap TRIGGER decides on burn-EXTRAPOLATED usage (last poll + rate x time-to-next-poll), so an account at 91%-last-poll but climbing fast trips the 95% step NOW instead of next cycle — extrapolation only ever trips EARLIER, never masks a real over-cap reading; (B) an account whose extrapolated usage is within `within_pct_of_step` (default 5) points of its next step — or projected to cross it before the next normal poll — is polled on `fast_interval_seconds` (default 45) instead of the normal cadence. `enabled: false` reverts BOTH to prior behavior bit-for-bit. Only accounts actually near a step accelerate (the fleet is not blanket-fast-polled), and the 429 poll-backoff gate still wins (a throttled account is never fast-polled).",
+    "poll_accel": "Near-threshold responsiveness (2026-07-06 rayi3 incident: burned from under its 95% step to 100% between two ~180s polls, hit the native usage-limit menu before the swap). Two config-gated fixes: (A) the ladder/cap swap TRIGGER decides on burn-EXTRAPOLATED usage (last poll + rate x time-to-next-poll), so an account at 91%-last-poll but climbing fast trips the 95% step NOW instead of next cycle — extrapolation only ever trips EARLIER, never masks a real over-cap reading; (B) an account whose extrapolated usage is within `within_pct_of_step` (default 5) points of its next step — or projected to cross it before the next normal poll — is polled on `fast_interval_seconds` (default 45) instead of the normal cadence. `enabled: false` reverts BOTH to prior behavior bit-for-bit. Only accounts actually near a step accelerate (the fleet is not blanket-fast-polled), and the 429 poll-backoff gate still wins (a throttled account is never fast-polled). `cluster_within_bonus_pct` (default 10, 2026-07-06 rayi4 incident) WIDENS the near-step band by this many points per EXTRA live lane an account backs, because an account under N concurrent sessions climbs ~N× faster than its single-lane burn_rate predicts — so a clustered near-cap account (rayi4 sat at 84% on the slow cadence) fast-polls early enough to swap a lane off in time. Inert for one-lane-per-account operation.",
+    "spread_lanes": "Anti-clustering lane spread (2026-07-06 incident: the daemon piled ALL live lanes onto ONE burn-soon account — first rayi5, then rayi4 — which over-subscribed its login families → the shared token diverged → a recurring 'mount blanked / not logged in' auto-heal loop, and then all lanes hit that account's 5h cap at once with no time to swap). The scorers rank accounts on usage/burn only, so the same magnet is every lane's top pick each cycle. Two coupled levers, both gated by `enabled: true` (false reverts bit-for-bit): (1) `cluster_penalty` (default 40) subtracts this many score points per live lane already backing a candidate target, so an account that already holds a lane loses to a distinct empty one — this breaks the cross-cycle convergence; (2) `max_stack` (default 1) stops a NON-urgent (deferrable, e.g. burn-before-reset) move from growing an account past this many lanes — the lane HOLDS on its current account instead. Urgent moves (hard-cap / reactive-429 escapes) may still stack via independent login families when clean accounts are genuinely scarce, guarded by the #104/#109 family accounting.",
     "strategy": "Swap target picker — see docs/STRATEGIES.md. `smart` (recommended): hard 7d cap + burn-before-reset for 5h windows about to expire. `headroom`: weighted 5h+7d score with hard 7d cap. `lowest_usage`: cux balanced — sort by 7d util only. `drain`: deplete-current. `strict_priority`: priority order. `round_robin`: cycle by name.",
     "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
