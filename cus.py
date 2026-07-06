@@ -323,6 +323,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # False ⇒ bit-for-bit pre-#127 claim behavior.
         "verify_family_on_claim": True,
     },
+    # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
+    # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
+    # fires an URGENT SOS AFTER a live mount's creds have already blanked/logged
+    # out. This layer scans every LIVE mount each cycle and emits a WARNING (not
+    # urgent) BEFORE failure — when a mount's OAuth access token is near expiry
+    # and not refreshing, or its refresh token is nearing its assumed TTL and
+    # will soon need a browser re-login. It NEVER makes a network grant to probe
+    # (refresh tokens are single-use — a probe would rotate/clobber the live
+    # family, GH #104); it judges purely from the stored expiresAt / token
+    # presence / provenance age. Backward-compatible: default-on but only ever
+    # adds soft WARNINGs, never a hard action, and the reactive path is untouched.
+    "creds_warn": {
+        # Master gate. False ⇒ the pre-emptive scan is skipped entirely and
+        # behavior is bit-for-bit the reactive-only pre-2026-07-06 daemon.
+        "enabled": True,
+        # Warn when a live mount's OAuth access token expiresAt is within this
+        # many MINUTES of now AND the mount isn't observed refreshing. A healthy
+        # session refreshes its own token well ahead of expiry (fresh tokens sit
+        # hours out), so a token this close to expiry that hasn't been rewritten
+        # recently is one that isn't self-maintaining — the state that precedes a
+        # stale/blank mount if a refresh later fails. Heads-up only (self-heals
+        # on next use); ~45 min gives lead time without noising on normal churn.
+        "access_expiry_minutes": 45,
+        # A mount whose creds file was (re)written within this many minutes is
+        # treated as "recently refreshed" and suppressed from the access-expiry
+        # warning — an actively-maintained mount that just rotated its token is
+        # not at risk even if we catch it momentarily near a stale expiresAt.
+        "recent_refresh_minutes": 10,
+    },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
     "thresholds": {
@@ -1775,13 +1804,21 @@ def login_age_days(account: str, slot: str) -> float | None:
     return (datetime.now(timezone.utc) - minted_dt).total_seconds() / 86400.0
 
 
-def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, float | None]:
-    """Classify a provisioned login's freshness against the ASSUMED refresh-token
-    lifetime. Returns (state, days_left) where state is one of:
+def _expiry_state_from_age(age_days: float | None, config: dict) -> tuple[str, float | None]:
+    """Classify a refresh token's remaining life from its age in days against the
+    ASSUMED refresh-token lifetime. Returns (state, days_left) where state is:
       "ok"      — comfortably within lifetime
       "near"    — within warn_expiry_within_days of assumed expiry
       "expired" — past the assumed lifetime (a swap would fall back to a copy)
-      "unknown" — no provenance timestamp to judge by
+      "unknown" — no age to judge by (age_days is None)
+
+    Factored out of login_expiry_state (2026-07-06) so the SAME assumed-TTL math
+    can be reused by the pre-emptive live-mount creds-health scan, which needs to
+    classify base-account-snapshot / shared-mount / lane refresh tokens — not just
+    provisioned login families. login_expiry_state remains the login-family entry
+    point (it feeds this the provenance-derived age); the new scan feeds it an age
+    resolved per-mount (`_mount_refresh_age_days`). Keeping one classifier means
+    the "near"/"expired" thresholds can never drift between the two callers.
 
     The lifetime is a config assumption (refresh_token_ttl_days), NOT a measured
     fact — #109 Phase 0 still owes the real number. This only drives a soft sos
@@ -1789,15 +1826,22 @@ def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, floa
     cfg = config.get("independent_logins", {}) if isinstance(config, dict) else {}
     ttl = cfg.get("refresh_token_ttl_days", 30)
     warn_within = cfg.get("warn_expiry_within_days", 5)
-    age = login_age_days(account, slot)
-    if age is None:
+    if age_days is None:
         return ("unknown", None)
-    days_left = ttl - age
+    days_left = ttl - age_days
     if days_left <= 0:
         return ("expired", days_left)
     if days_left <= warn_within:
         return ("near", days_left)
     return ("ok", days_left)
+
+
+def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, float | None]:
+    """Classify a provisioned login's freshness against the ASSUMED refresh-token
+    lifetime. Returns (state, days_left) — see `_expiry_state_from_age` for the
+    state vocabulary. Thin wrapper: resolves the login family's provenance age
+    (`login_age_days`) and hands it to the shared classifier."""
+    return _expiry_state_from_age(login_age_days(account, slot), config)
 
 
 def list_provisioned_logins() -> list[dict]:
@@ -7071,6 +7115,261 @@ def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -
     return healed
 
 
+# ---------------------------------------------------------------------------
+# PRE-EMPTIVE creds-health early-warning (2026-07-06)
+# ---------------------------------------------------------------------------
+# The blank-mount detection + auto-heal above (GH #141 + lane follow-up) is the
+# REACTIVE backstop: it only notices AFTER a live mount's creds have already
+# blanked/logged out, and fires an URGENT SOS (or silently heals). Incident
+# 2026-07-05: a live LOCKED lane's mount creds blanked and the operator only
+# learned via an after-the-fact SOS. This layer adds a PROACTIVE scan each cycle
+# over every LIVE mount (lanes + shared mount) that emits a soft WARNING BEFORE
+# a mount fails — while its OAuth access token is merely near-expiry-and-idle, or
+# its refresh token is nearing its assumed TTL and will soon need a browser
+# re-login. It NEVER makes a network grant to probe liveness (OAuth refresh
+# tokens are single-use — a probe grant would rotate the stored token and clobber
+# the live family, GH #104); it judges purely from the STORED expiresAt / token
+# presence / provenance age. The reactive path is untouched — this only ADDS an
+# earlier, softer signal. Gated by config `creds_warn.enabled` (default True).
+
+
+def _account_snapshot_age_days(account: str) -> float | None:
+    """Best-available age (days) of an account's base SNAPSHOT refresh token, or
+    None if there's nothing to judge by.
+
+    Login FAMILIES carry a `minted_ts` provenance record (see login_age_days), but
+    a base account snapshot / the shared mount has no such record — so we fall back
+    to the account's meta.yaml timestamps as a mint proxy: `refreshed_ts` (written
+    on the last `cus init --force` snapshot refresh) preferred, else `imported_ts`
+    (first import). This is an imperfect proxy — a refresh token can rotate on the
+    live mount without a snapshot refresh — but it only feeds the SOFT refresh-TTL
+    WARNING, never a hard action, and degrades to "unknown" (no warning) when the
+    timestamp is missing, so an over/under-estimate is harmless. NEVER a network
+    probe — refresh tokens are single-use (GH #104)."""
+    meta = account_meta(account)
+    stamp = meta.get("refreshed_ts") or meta.get("imported_ts")
+    if not stamp or not isinstance(stamp, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+
+def _mount_refresh_age_days(account: str, slot: str | None, state: dict, config: dict) -> float | None:
+    """Age (days) of the refresh token a given LIVE mount actually reads, or None
+    when no age source exists (→ the refresh-TTL warning is skipped for it).
+
+    Resolves the right provenance the same way `_lane_heal_source` resolves the
+    right heal source, so the age we age-out on matches the token in play:
+      * a lane LEASING a pooled family → that family's `minted_ts` provenance;
+      * a lane with a legacy per-(slot,account) independent login → its provenance;
+      * everything else (a plain shared-snapshot-copy lane, or the shared mount,
+        slot=None) → the account snapshot mint proxy (`_account_snapshot_age_days`).
+    """
+    if slot is not None:
+        lease = slot_leased_family(state, slot)
+        if lease is not None and lease[0] == account and independent_logins_enabled(config):
+            return login_age_days(*lease)  # login_age_days keys on (account, family_id)
+        if has_independent_login(account, slot):
+            return login_age_days(account, slot)
+    return _account_snapshot_age_days(account)
+
+
+def _diagnose_mount_creds_health(
+    mount_label: str,
+    account: str,
+    creds: Any,
+    now_ms: int,
+    config: dict,
+    *,
+    refresh_age_days: float | None = None,
+    recently_refreshed: bool = False,
+) -> SOSCondition | None:
+    """PURE predicate for the pre-emptive creds-health scan: given ONE live mount's
+    already-parsed creds dict + the current time + config (+ its resolved refresh-
+    token age and whether it was recently rewritten), return a soft WARNING
+    SOSCondition or None. No file / process / network I/O — the impure inputs
+    (creds dict, age, recently_refreshed flag) are resolved by the caller
+    (`_diagnose_live_mounts_creds_health`), mirroring `_diagnose_premium_headroom`,
+    so this is unit-testable with plain values.
+
+    Deliberately returns None (no WARNING) for an ALREADY-BLANK/invalid mount: that
+    is the REACTIVE layer's job (`_diagnose_live_mount_creds` / the lane heal fire
+    an URGENT for it). The two layers must not collide — a blanked mount is one
+    URGENT, not also a WARNING. This layer only speaks to mounts that are still
+    valid but AGING toward failure.
+
+    Precedence (one WARNING per mount, so SOS.md stays readable and de-dups
+    cleanly): the refresh-token-TTL warning wins over the access-token warnings —
+    it is the only one that needs a human action (a browser `cus relogin` with a
+    deadline), and it subsumes the access-token heads-up. Among the access-token
+    signals, an ALREADY-stale access token (condition 3) outranks a merely
+    near-expiry one (condition 1).
+
+    Summaries are kept STABLE across cycles (no live-decrementing minutes/days in
+    the summary — those go in the action) so the existing SOS notify de-dup
+    (`maybe_write_sos` hashes severity:summary) fires the desktop notification once
+    per condition, not every poll."""
+    if not config.get("creds_warn", {}).get("enabled", True):
+        return None
+    # A blank/invalid mount belongs to the reactive URGENT path — never double it
+    # up as a WARNING here (keeps the two layers from colliding; test (d)).
+    if _live_mount_creds_invalid(creds):
+        return None
+
+    il = config.get("independent_logins", {}) if isinstance(config, dict) else {}
+    ttl = il.get("refresh_token_ttl_days", 30)
+    warn_within = il.get("warn_expiry_within_days", 5)
+
+    # (2) Refresh token approaching its assumed TTL → a browser re-login will soon
+    # be required. Highest human-action value, so it wins.
+    state, days_left = _expiry_state_from_age(refresh_age_days, config)
+    if state in ("near", "expired"):
+        # Relogin-by date, derived from now_ms so tests are deterministic.
+        by_dt = datetime.fromtimestamp(now_ms / 1000, timezone.utc) + timedelta(days=max(0.0, days_left or 0.0))
+        by_date = by_dt.date().isoformat()
+        age_txt = f"~{refresh_age_days:.0f} days old" if refresh_age_days is not None else "of unknown age"
+        if state == "near":
+            return SOSCondition(
+                severity="warning",
+                summary=(f"refresh token on {mount_label} ({account}) nears its assumed "
+                         f"{ttl}-day expiry — plan a browser re-login soon"),
+                action=(
+                    f"The {mount_label} mount's login for '{account}' is {age_txt}; its OAuth "
+                    f"refresh token is assumed to expire around {by_date} (within "
+                    f"{warn_within}d — config independent_logins.warn_expiry_within_days). Once it "
+                    f"expires a live session can no longer self-refresh and the mount blanks / logs "
+                    f"out (the 2026-07-05 failure mode). No action needed yet — it keeps refreshing "
+                    f"until then — but plan a browser re-login before {by_date}:\n"
+                    f"      cus relogin {account}"),
+                affected=account,
+            )
+        return SOSCondition(
+            severity="warning",
+            summary=(f"refresh token on {mount_label} ({account}) is past its assumed "
+                     f"{ttl}-day TTL — re-login before it blanks"),
+            action=(
+                f"The {mount_label} mount's login for '{account}' is {age_txt}, past the assumed "
+                f"{ttl}-day refresh-token TTL. It MAY still work (the TTL is an assumption, not a "
+                f"measured fact — #109 Phase 0), but it is the most likely mount to blank/log out "
+                f"next. Re-login it soon to be safe:\n"
+                f"      cus relogin {account}"),
+            affected=account,
+        )
+
+    # Access-token signals need a numeric expiresAt to judge; without one we can't
+    # say anything (a valid-but-timestamp-less token isn't provably at risk).
+    exp = _creds_expires_at(creds)
+    if exp is None:
+        return None
+    minutes_left = (exp - now_ms) / 60_000.0
+    exp_iso = datetime.fromtimestamp(exp / 1000, timezone.utc).isoformat(timespec="minutes")
+
+    # (3) Degrading-but-not-blank: access token already past expiresAt (token_stale)
+    # while the login is still present. This is the state that PRECEDES a blank if
+    # the self-refresh later fails.
+    if minutes_left <= 0:
+        return SOSCondition(
+            severity="warning",
+            summary=(f"access token on {mount_label} ({account}) is already stale — "
+                     f"mount will try to self-refresh; at risk if the refresh token is old"),
+            action=(
+                f"The live {mount_label} mount for '{account}' still has a login, but its OAuth "
+                f"access token expired at {exp_iso} (already past). A running session normally "
+                f"self-refreshes it on next use — heads-up only. But if that refresh ALSO fails the "
+                f"mount blanks (the 2026-07-05 signature). If it stays stale across cycles, plan a "
+                f"re-login:\n"
+                f"      cus relogin {account}"),
+            affected=account,
+        )
+
+    # (1) Access token near expiry AND the mount isn't observed refreshing. A
+    # healthy session refreshes well ahead of expiry (fresh tokens sit hours out),
+    # so a token this close to expiry whose creds file hasn't been rewritten
+    # recently is one that isn't self-maintaining.
+    window = config.get("creds_warn", {}).get("access_expiry_minutes", 45)
+    if minutes_left <= window and not recently_refreshed:
+        return SOSCondition(
+            severity="warning",
+            summary=(f"access token on {mount_label} ({account}) expires soon and the "
+                     f"mount isn't refreshing — may age into a stale/blank state"),
+            action=(
+                f"The live {mount_label} mount for '{account}' has an OAuth access token expiring in "
+                f"~{minutes_left:.0f} min ({exp_iso}) and its creds file hasn't been rewritten "
+                f"recently, so it isn't self-refreshing right now. A healthy session refreshes well "
+                f"ahead of expiry; near-expiry AND idle is the state that ages into a stale/blank "
+                f"mount if a later refresh can't reach Anthropic. Heads-up only — it should self-heal "
+                f"on next use; watch for a blank-mount SOS on {mount_label}."),
+            affected=account,
+        )
+    return None
+
+
+def _diagnose_live_mounts_creds_health(state: dict, config: dict) -> list[SOSCondition]:
+    """Impure driver for the pre-emptive creds-health scan: enumerate every LIVE
+    mount, read its creds + resolve its refresh-token age + whether it was recently
+    rewritten, and collect the WARNINGs `_diagnose_mount_creds_health` returns.
+
+    Live mounts, by mode (mirrors the reactive layer's scoping):
+      * LANES — per_session/hybrid: every slot with a live session on its own mount
+        (`occupied_slot_accounts`, /proc ground truth). The file that lane's session
+        reads is `mount_creds_path(slot_path(slot))`.
+      * SHARED mount — global/hybrid: `~/.claude/.credentials.json`, read by bare
+        sessions; its account is the active one.
+
+    Read-only: reads creds files and stats their mtime; never writes, refreshes, or
+    makes a network call. Returns a (possibly empty) list of WARNING SOSConditions;
+    the caller merges them into `diagnose()`'s output so they ride the existing
+    SOS.md write + notify de-dup. Off entirely when `creds_warn.enabled` is False."""
+    if not config.get("creds_warn", {}).get("enabled", True):
+        return []
+    mode = config.get("mode", "global")
+    now_ms = int(time.time() * 1000)
+    recent_min = config.get("creds_warn", {}).get("recent_refresh_minutes", 10)
+    out: list[SOSCondition] = []
+    seen: set[tuple[str, str]] = set()  # (mount_label, account) — one warning per mount/cycle
+
+    def _recently_written(path: Path) -> bool:
+        """True iff the creds file was (re)written within recent_refresh_minutes —
+        the read-only 'is this mount actively maintaining its token' signal (no
+        network probe). A just-rotated mount is not at risk even if momentarily
+        caught near a stale expiresAt."""
+        try:
+            return path.exists() and (time.time() - path.stat().st_mtime) < recent_min * 60
+        except OSError:
+            return False
+
+    def _scan(mount_label: str, account: str, cred_path: Path, slot: str | None) -> None:
+        if (mount_label, account) in seen:
+            return
+        seen.add((mount_label, account))
+        try:
+            creds = read_json(cred_path) if cred_path.exists() else None
+        except (json.JSONDecodeError, OSError):
+            creds = None  # unreadable → reactive layer owns it; predicate returns None
+        cond = _diagnose_mount_creds_health(
+            mount_label, account, creds, now_ms, config,
+            refresh_age_days=_mount_refresh_age_days(account, slot, state, config),
+            recently_refreshed=_recently_written(cred_path),
+        )
+        if cond is not None:
+            out.append(cond)
+
+    if mode in ("per_session", "hybrid"):
+        for account, slots in occupied_slot_accounts(state).items():
+            for slot in slots:
+                _scan(slot, account, mount_creds_path(slot_path(slot)), slot)
+    if mode in ("global", "hybrid"):
+        active = state.get("active")
+        if active:
+            _scan("shared", active, CREDS_JSON, None)
+    return out
+
+
 def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
     """Human label for WHY a reachable account is NOT a valid premium swap target.
 
@@ -11056,6 +11355,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # global mode / when no lane is blanked.
         _auto_heal_live_lanes(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
+        # PRE-EMPTIVE creds-health early-warning (2026-07-06): AFTER the reactive
+        # auto-heals above (so a just-healed mount reads valid, not near-blank) and
+        # AFTER diagnose() (so a genuinely blanked mount surfaces as its URGENT, not
+        # doubled by a WARNING — the predicate returns None for blanks). Scans every
+        # LIVE mount and appends soft WARNINGs for tokens AGING toward expiry/blank
+        # before they fail. Merged into the same conditions list so they ride the
+        # existing SOS.md write + notify de-dup (`maybe_write_sos`).
+        conditions.extend(_diagnose_live_mounts_creds_health(state, config))
         maybe_write_sos(conditions, state)
         if conditions:
             for c in conditions:
