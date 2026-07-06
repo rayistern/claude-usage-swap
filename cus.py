@@ -575,6 +575,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "max_extrapolation_minutes": 10,   # don't trust a measured rate beyond this many min past the last poll
     },
+    # Near-threshold responsiveness (2026-07-06 rayi3 incident). rayi3 burned from
+    # UNDER its 95% ladder step to 100% 5h BETWEEN two ~180s daemon polls, so a
+    # live session hit Claude's native "usage limit" menu before the daemon swapped
+    # its lane off — the whole point of the 95% step is to swap BEFORE the cap, but
+    # the swap fired late because the daemon acted on a usage snapshot that lagged
+    # the real fast burn. Two complementary, config-gated fixes hang off this block:
+    #   Fix A — the ladder/cap swap TRIGGER decides on burn-EXTRAPOLATED usage
+    #     (last poll + burn_rate x time-to-next-poll), not the stale last-polled
+    #     value, so an account at 91%-last-poll but burning fast trips the 95% step
+    #     NOW instead of next cycle. Extrapolation only ever pushes the trigger
+    #     EARLIER (max() with the raw reading), never masks a real over-cap value.
+    #   Fix B — accounts whose extrapolated usage is within `within_pct_of_step` of
+    #     their next swap step (or projected to cross it before the next normal
+    #     poll) are polled on the fast `fast_interval_seconds` cadence instead of
+    #     the normal one, so the daemon SEES the fast burn in time to act on it.
+    # `enabled: False` reverts BOTH to prior behavior bit-for-bit. Only accounts
+    # actually near a step accelerate (the fleet is NOT blanket-fast-polled), and
+    # the 429 poll-backoff gate still wins — a throttled account is never fast-polled.
+    "poll_accel": {
+        "enabled": True,
+        "within_pct_of_step": 5,       # accelerate when extrapolated usage is within this many pts of the next step
+        "fast_interval_seconds": 45,   # near-threshold poll cadence (vs the normal active/inactive interval)
+    },
     # Per-model WEEKLY tracking (2026-07-02). The usage API exposes per-model
     # usage only weekly (no per-model 5h window). `gate_enabled: False` by
     # default = surface-only (shown in `cus status`, no effect on swaps) so
@@ -2703,6 +2726,10 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     inactive interval and defeating the adaptive repoll entirely.
     """
     interval = _account_poll_interval(state, config, account_name)
+    # Preserve the un-shortened class cadence: Fix B's "will it cross the step by
+    # the next poll" projection horizon must be the NORMAL interval, not one
+    # already shrunk by the token_stale fast-track below.
+    normal_interval = interval
     acct = state.get("accounts", {}).get(account_name, {})
     last = acct.get("last_poll_ts")
     if not last:
@@ -2734,6 +2761,26 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
         if fast_interval < interval:
             interval = fast_interval
             role = f"{role}/token_stale-fast"
+    # Fix B — near-threshold acceleration (2026-07-06 rayi3 incident). An account
+    # whose burn-extrapolated usage is within poll_accel.within_pct_of_step of its
+    # next swap step (or projected to cross it before the next NORMAL poll) is
+    # polled on the fast `fast_interval_seconds` cadence, so the daemon sees a fast
+    # burn toward the cap in time to swap BEFORE it. `normal_interval` (the class
+    # cadence computed above, before any token_stale shortening) is the projection
+    # horizon for the "will it cross by next poll" test. Bounded by design: only
+    # accounts actually near a step accelerate — the fleet is NOT blanket-fast-
+    # polled (that is the 2026-06-19 429-burnout trap). The 429 poll-backoff gate
+    # still wins: an account in reactive backoff is skipped in the daemon loop
+    # BEFORE this function, and we re-check `account_in_backoff` here so the
+    # status-preview / any other caller never fast-polls a throttled account.
+    # Only ever SHORTENS the interval (min via the `<` guard), never lengthens it.
+    if _poll_accel_enabled(config):
+        in_backoff, _ = account_in_backoff(state, account_name)
+        if not in_backoff and _account_near_step(acct, config, normal_interval):
+            fast = float(config.get("poll_accel", {}).get("fast_interval_seconds", 45))
+            if fast < interval:
+                interval = fast
+                role = f"{role}/near-step-fast"
     # GH #59 composition: a 5h window that reset AFTER our last poll means the
     # stored usage is pre-reset garbage — poll now regardless of cadence class,
     # so the adaptive early wake actually refreshes the account it woke for.
@@ -3354,10 +3401,26 @@ def estimate_window_pct(acct: dict, window: str, config: dict, now=None) -> floa
     return min(100.0, polled + rate * dt_min)
 
 
-def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> float:
+def _account_estimated_effective_pct(acct: dict, config: dict, now=None,
+                                     look_ahead_seconds: float = 0.0) -> float:
     """Like _account_effective_pct, but using extrapolated per-window values (C).
     Used by the target-fullness judgments (saturation filter + would-re-trip) so
-    a fast-climbing account near the line is treated as already-full."""
+    a fast-climbing account near the line is treated as already-full.
+
+    `look_ahead_seconds` (Fix A, 2026-07-06 rayi3 incident): project the burn
+    FORWARD past `now` by this many seconds — i.e. estimate where usage will be
+    by the time the daemon can next observe/act on this account (its poll
+    interval), not just where it is right now. The swap TRIGGER passes the
+    account's poll interval here so a fast burn that would blow past the ladder
+    step / cap in the unobserved gap between polls trips the swap THIS cycle
+    (default 0.0 = extrapolate-to-now, the original behavior for all existing
+    callers). Implemented by shifting the `now` passed to estimate_window_pct,
+    which already clamps to 100 and never returns below the polled value, so a
+    look-ahead only ever moves the result UP."""
+    if look_ahead_seconds:
+        if now is None:
+            now = datetime.now(timezone.utc)
+        now = now + timedelta(seconds=max(0.0, look_ahead_seconds))
     thr_cfg = config.get("thresholds", {})
     vals = []
     if thr_cfg.get("five_hour", True):
@@ -3370,6 +3433,97 @@ def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> floa
     # exhausted account is still excluded as a target by pick_swap_target's
     # explicit model-cap filter, so it can never be picked.
     return max(vals) if vals else 0.0
+
+
+# --------------------------------------------------------------------------
+# Near-threshold acceleration + extrapolation-aware trigger (2026-07-06 rayi3
+# incident). See DEFAULT_CONFIG["poll_accel"] for the full WHY. These are pure
+# helpers (usage dict + config + now → number / bool) so the swap-timing logic
+# is unit-testable apart from the poll I/O.
+# --------------------------------------------------------------------------
+
+def _poll_accel_enabled(config: dict) -> bool:
+    """Master gate for both near-threshold fixes. False ⇒ prior behavior
+    bit-for-bit (trigger reads raw polled %, no fast cadence)."""
+    return bool(config.get("poll_accel", {}).get("enabled", True))
+
+
+def _next_ladder_step(acct: dict, config: dict) -> float:
+    """The usage % this account's ladder will next trip at — its persisted
+    `next_swap_at_pct`, resolved against configured steps with the SAME
+    end-of-ladder sentinel handling decide_swap's Trigger 2 uses (a value >= 100
+    means the ladder ran off the end, so treat it as the last configured step —
+    the most aggressive but bounded threshold). Kept as a standalone pure helper
+    so Fix A (trigger) and Fix B (fast poll) agree on exactly which step matters.
+    """
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    step = acct.get("next_swap_at_pct", steps[0])
+    try:
+        step = float(step)
+    except (TypeError, ValueError):
+        step = float(steps[0])
+    if step >= 100:
+        step = float(steps[-1])
+    return step
+
+
+def _account_near_step(acct: dict, config: dict, normal_interval_seconds: float,
+                       now=None) -> bool:
+    """Is this account close enough to its next ladder step to warrant fast
+    polling (Fix B)? True when EITHER:
+      (1) its burn-extrapolated usage (to now) is within `within_pct_of_step`
+          points of the step — we're in the danger zone and want frequent
+          confirmation; OR
+      (2) its measured burn rate projects it CROSSING the step before the next
+          NORMAL poll (`normal_interval_seconds` out) — a fast climber that is
+          still numerically below the band but won't be for long.
+    Pure predicate over the account dict + config; `normal_interval_seconds` is
+    passed in (not read from state) precisely to keep it I/O-free and testable.
+    Returns False when poll_accel is disabled, so the gate reverts cleanly."""
+    if not _poll_accel_enabled(config):
+        return False
+    pa = config.get("poll_accel", {})
+    within = float(pa.get("within_pct_of_step", 5))
+    step = _next_ladder_step(acct, config)
+    # (1) already inside the band on the extrapolated NOW value.
+    if _account_estimated_effective_pct(acct, config, now) >= step - within:
+        return True
+    # (2) projected to cross the step by the next normal poll.
+    projected = _account_estimated_effective_pct(
+        acct, config, now, look_ahead_seconds=normal_interval_seconds)
+    return projected >= step
+
+
+def _burn_extrapolation_delta(acct: dict, window: str, config: dict, now=None,
+                              look_ahead_seconds: float = 0.0) -> float:
+    """Pct-points a window is projected to climb from its last OBSERVATION to
+    now+look_ahead at the measured burn rate. 0.0 when the estimator is off, no
+    rate has been measured, or the anchor timestamp is missing/unparseable.
+
+    Exists for the per-model weekly projection: per-model weekly rides the 7d
+    window and cus tracks no per-model burn rate of its own, so Fix A projects
+    the per-model % forward on the 7d rate (a shared-window proxy). Mirrors the
+    dt/cap math inside estimate_window_pct but returns just the DELTA so it can
+    be added to a per-model base that estimate_window_pct doesn't know about.
+    Conservative: rate is only ever positive (see _compute_burn_rate), so the
+    delta only pushes the projected value UP."""
+    est_cfg = config.get("estimator", {})
+    if not est_cfg.get("enabled", True):
+        return 0.0
+    rate = acct.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
+    last_observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    if rate <= 0 or not last_observed:
+        return 0.0
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        t0 = datetime.fromisoformat(last_observed.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return 0.0
+    proj = now + timedelta(seconds=max(0.0, look_ahead_seconds))
+    max_min = est_cfg.get("max_extrapolation_minutes", 10)
+    dt_min = max(0.0, min((proj - t0).total_seconds() / 60.0, max_min))
+    return rate * dt_min
 
 
 def _is_seven_day_reset_drop(prev_pct, new_pct, config: dict) -> bool:
@@ -5335,6 +5489,20 @@ def decide_swap(
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
+    # Fix A — extrapolation-aware trigger (2026-07-06 rayi3 incident). The ladder
+    # (Trigger 2) and hard-cap (Trigger 1) trips below compare against the
+    # BURN-EXTRAPOLATED usage, projected forward to the moment the daemon could
+    # next act on this account (its poll interval), instead of the raw last-polled
+    # value. rayi3 read 91% at one poll and 100% at the next ~180s later — a live
+    # session hit the native usage-limit menu in that gap before any swap. Anchor
+    # the projection horizon at the account's own poll interval; when poll_accel
+    # is disabled these stay 0 / raw and every trip is byte-identical to before.
+    _trig_now = datetime.now(timezone.utc)
+    _trig_look_ahead = (
+        _account_poll_interval(state, config, current)
+        if _poll_accel_enabled(config) else 0.0
+    )
+
     # NOTE: the previous "Trigger 0: active is rate-limited (poll 429)" has
     # been REMOVED (GH #18). That trigger fired on the POLLING endpoint's
     # 429 — Anthropic's per-IP throttle on /api/oauth/usage, which is NOT
@@ -5359,6 +5527,19 @@ def decide_swap(
     # aggregate ceiling of 80.
     cur_model = _max_model_weekly_from_usage(cur_usage, config)
     model_cap = _model_weekly_cap_for_config(config)
+    # Fix A: force the hard-cap trips on the burn-EXTRAPOLATED values, not the
+    # stale poll. Aggregate 7d extrapolates via estimate_window_pct (same base as
+    # cur_usage.seven_day.utilization — they're synced by update_state_with_usage).
+    # Per-model weekly has no burn rate of its own; it rides the 7d window, so we
+    # project it forward on the 7d rate (a conservative shared-window proxy). Both
+    # use max()/+delta so extrapolation only ever raises the value — a real
+    # over-cap poll is never masked. Inert when poll_accel is off (look_ahead 0).
+    if _poll_accel_enabled(config):
+        cur_7d = max(cur_7d, estimate_window_pct(
+            active_acct, "7d", config, _trig_now + timedelta(seconds=_trig_look_ahead)))
+        if cur_model > 0:
+            cur_model = min(100.0, cur_model + _burn_extrapolation_delta(
+                active_acct, "7d", config, _trig_now, _trig_look_ahead))
     agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
@@ -5540,7 +5721,19 @@ def decide_swap(
         # this, and reactive 429 catches actually-exhausted accounts.
         threshold = cfg_steps[-1]
 
+    # Fix A (2026-07-06 rayi3 incident): trip the ladder on the burn-EXTRAPOLATED
+    # max(5h, 7d), projected forward to the next poll — NOT the raw last-polled
+    # value. max() with the raw current_max_pct so extrapolation only ever trips
+    # EARLIER, never masks a genuine over-step poll; inert when poll_accel is off
+    # (_trig_look_ahead == 0 ⇒ extrapolate-to-now on a freshly-polled account ≈
+    # raw). This is the core fix: rayi3 sat at 91%-last-poll (< 95% step) while
+    # burning fast enough to hit 100% before the next poll; extrapolating its
+    # ~180s poll interval forward trips the 95% step THIS cycle so the lane swaps
+    # off BEFORE the native cap instead of after.
     cur_pct = current_max_pct(cur_usage, config)
+    if _poll_accel_enabled(config):
+        cur_pct = max(cur_pct, _account_estimated_effective_pct(
+            active_acct, config, _trig_now, look_ahead_seconds=_trig_look_ahead))
     if cur_pct < threshold:
         _note("below_threshold", "hold",
               f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
@@ -5571,7 +5764,17 @@ def decide_swap(
         cur_7d_val = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
         five_h_over = th_cfg.get("five_hour", True) and cur_5h >= threshold
         seven_d_over = th_cfg.get("seven_day", True) and cur_7d_val >= threshold
-        if five_h_over and not seven_d_over and cur_5h < max_defer_pct:
+        # Fix A (2026-07-06): gate the max_defer_pct "too close to gamble" guard on
+        # the burn-EXTRAPOLATED 5h, not the raw poll. Deferring a swap because 5h
+        # resets soon is safe ONLY if 5h won't hit the native cap first; a fast
+        # burner sitting at raw 88% but projected to 96% before the reset must NOT
+        # be deferred (that is exactly the rayi3 too-late failure via this path).
+        # Extrapolation only raises cur_5h_eff, so it can only make us defer LESS.
+        cur_5h_eff = cur_5h
+        if _poll_accel_enabled(config):
+            cur_5h_eff = max(cur_5h, estimate_window_pct(
+                active_acct, "5h", config, _trig_now + timedelta(seconds=_trig_look_ahead)))
+        if five_h_over and not seven_d_over and cur_5h_eff < max_defer_pct:
             time_to_reset_s = _five_hour_remaining_seconds(cur_usage, active_acct)
             if time_to_reset_s is not None and 0 < time_to_reset_s <= wait_window_s:
                 msg = (
@@ -11697,6 +11900,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
     "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
     "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
+    "poll_accel": "Near-threshold responsiveness (2026-07-06 rayi3 incident: burned from under its 95% step to 100% between two ~180s polls, hit the native usage-limit menu before the swap). Two config-gated fixes: (A) the ladder/cap swap TRIGGER decides on burn-EXTRAPOLATED usage (last poll + rate x time-to-next-poll), so an account at 91%-last-poll but climbing fast trips the 95% step NOW instead of next cycle — extrapolation only ever trips EARLIER, never masks a real over-cap reading; (B) an account whose extrapolated usage is within `within_pct_of_step` (default 5) points of its next step — or projected to cross it before the next normal poll — is polled on `fast_interval_seconds` (default 45) instead of the normal cadence. `enabled: false` reverts BOTH to prior behavior bit-for-bit. Only accounts actually near a step accelerate (the fleet is not blanket-fast-polled), and the 429 poll-backoff gate still wins (a throttled account is never fast-polled).",
     "strategy": "Swap target picker — see docs/STRATEGIES.md. `smart` (recommended): hard 7d cap + burn-before-reset for 5h windows about to expire. `headroom`: weighted 5h+7d score with hard 7d cap. `lowest_usage`: cux balanced — sort by 7d util only. `drain`: deplete-current. `strict_priority`: priority order. `round_robin`: cycle by name.",
     "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
