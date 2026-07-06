@@ -2475,6 +2475,27 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         return {"action": "skipped", "account": None, "detail": f"no owner resolvable ({verdict}: {detail})"}
 
     snap = ACCOUNTS_DIR / f"account-{save_to}" / ".credentials.json"
+    # ---- 2026-07-06 wrong-account clobber guard (periodic/gc credentials) ----
+    # For an "unknown" verdict (no refresh-token lineage — rotation-shaped) cross-
+    # check the MOUNT's own .claude.json identity against save_to's trusted anchor
+    # (meta.yaml + login families). A drifted mount whose identity disagrees is not
+    # a rotation; saving its tokens into save_to's snapshot is the same clobber the
+    # swap path guards. "expected"/"foreign" verdicts are lineage-proven and bypass
+    # this. Degrades to allow when there is no anchor (unchanged legacy behavior).
+    if verdict == "unknown":
+        mount_cj = mount_claude_json_path(mount)
+        mount_ident = {}
+        if mount_cj.exists():
+            try:
+                mount_ident = _identity_fields(read_json(mount_cj))
+            except (json.JSONDecodeError, OSError):
+                mount_ident = {}
+        ok, why = guard_canonical_identity_write(save_to, mount_ident)
+        if not ok:
+            sidecar = quarantine_rejected_canonical_write(
+                snap, json.dumps(live_creds, indent=2).encode(), why)
+            return {"action": "refused_wrong_account", "account": save_to,
+                    "detail": f"drifted mount, unknown lineage — {why}; quarantined to {sidecar.name}"}
     # GH #77: never let an older live file clobber a fresher snapshot (e.g.
     # the account was re-logged-in out-of-band while this mount sat idle).
     live_exp = _creds_expires_at(live_creds)
@@ -3775,6 +3796,21 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         and not acct.get("poll_error")
     ]
 
+    # ---- Poisoned-canonical-store exclusion (2026-07-06, this PR) ----
+    # HARD filter, NO fallback: never select an account whose canonical
+    # .claude.json identity contradicts its trusted anchor (meta.yaml + login
+    # families). Installing such an account's snapshot copies the WRONG account's
+    # identity/token onto the live mount — the exact wrong-account-clobber this PR
+    # guards, now spreading OUTWARD. Unlike the cap/headroom SOFT filters below
+    # there is deliberately no degraded re-admit: a poisoned target is never a
+    # lesser-evil option, only a vector for propagating the corruption. If this
+    # empties the pool the picker returns None and SOS surfaces the poisoned
+    # account (Condition 10.5) pointing the operator at `cus relogin`.
+    candidates = [(name, acct) for name, acct in candidates
+                  if not account_canonical_store_poisoned(name)[0]]
+    if not candidates:
+        return None
+
     # Rate-limited is a SOFT filter by default — try non-rate-limited first,
     # but fall back to rate-limited candidates if nothing else is available.
     # See smart_strategy.allow_rate_limited_targets in DEFAULT_CONFIG for
@@ -4272,6 +4308,191 @@ def _dir_identity(account_name: str) -> dict:
         return _identity_fields(read_json(p))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Wrong-account canonical-store clobber guard (2026-07-06 incident)
+#
+# THE INCIDENT (verified live 2026-07-06, recurring over two days): an account's
+# CANONICAL credential store — account-<X>/.claude.json (identity) and
+# account-<X>/.credentials.json (tokens) — was silently overwritten with a
+# DIFFERENT account's identity + token. Concretely, account-rayi1/.claude.json's
+# oauthAccount was rayi2's and its .credentials.json polled identically to rayi2,
+# even though account-rayi1/meta.yaml AND the independent-login families under
+# logins/rayi1/family-* still correctly held rayi1's identity. So the sources the
+# swap/save-back path does NOT rewrite (meta.yaml at `cus init` time, the login
+# families at browser-`/login` time) stayed CORRECT while the canonical store —
+# which the save-back path DOES write — got clobbered.
+#
+# THE WRITE VECTOR: _execute_swap_locked's OUTGOING-account save-back copies the
+# live mount's identity keys into account-<current>/.claude.json with NO identity
+# check (the GH #3 guard only covered the CREDENTIALS refresh-token lineage, never
+# the paired .claude.json identity write). When a bare/slot session had drifted to
+# another account, its live .claude.json carried the wrong oauthAccount, and the
+# save-back persisted it over current's canonical identity. The credentials clobber
+# rides the "unknown" verdict (a rotation-shaped token that matches no snapshot is
+# assumed to be current's and saved back) on the same fully-drifted mount.
+#
+# THE FIX: meta.yaml + the login families are the TRUSTED ANCHOR precisely because
+# the buggy path never writes them. Before any save-back into a canonical store we
+# verify the incoming identity against that anchor; a mismatch is REFUSED and the
+# rejected bytes are quarantined to a sidecar instead of overwriting the good store.
+# ---------------------------------------------------------------------------
+
+def _meta_anchor_identity(account: str) -> dict:
+    """Identity facets from an account's meta.yaml — a TRUSTED anchor source.
+
+    meta.yaml records oauth_account_uuid + oauth_email at `cus init` time and is
+    NOT rewritten by the swap/save-back path, so in the 2026-07-06 clobber it
+    stayed correct (rayi1) while the canonical .claude.json lied (rayi2). That
+    write-path asymmetry is the whole reason meta anchors and .claude.json is the
+    suspect. 'unknown'/'unknown (run /login)' placeholders (a freshly `cus add`ed
+    account that never logged in) count as ABSENT — there is no identity to
+    enforce yet, so we must not treat the placeholder as an anchor."""
+    meta = account_meta(account)
+    out: dict = {}
+    uuid = meta.get("oauth_account_uuid")
+    if isinstance(uuid, str) and uuid and uuid != "unknown":
+        out["accountUuid"] = uuid
+    email = meta.get("oauth_email")
+    if isinstance(email, str) and email and not email.startswith("unknown"):
+        out["emailAddress"] = email
+    return out
+
+
+def _family_anchor_identities(account: str) -> list[dict]:
+    """Identity facets recorded by every independent-login family for `account`
+    (GH #109) — a second TRUSTED anchor witness. Each family dir's .claude.json
+    was written by a real browser `/login` AS that account, a path the buggy
+    save-back never touches, so in the incident the families held rayi1's true
+    identity while the canonical store was clobbered."""
+    out: list[dict] = []
+    for fam in list_login_families(account):
+        ident = family_identity(account, fam)
+        if ident:
+            out.append(ident)
+    return out
+
+
+def account_identity_anchor(account: str) -> tuple[dict | None, str]:
+    """The AUTHORITATIVE identity for `account`, reconciled ONLY from sources the
+    swap/save-back path does not write (so the clobber bug cannot poison the
+    anchor itself): meta.yaml (`cus init`-time) and the independent-login families
+    (browser-`/login`-time). Deliberately does NOT trust
+    account-<X>/.claude.json — that is the exact file 2026-07-06 showed can be
+    overwritten with a WRONG account's oauthAccount while meta + families stay
+    correct.
+
+    Returns (identity | None, source):
+      - (identity, "meta+families")  meta and every family agree — strongest.
+      - (identity, "meta")           meta present, no families to cross-check.
+      - (identity, "families")       meta absent/placeholder, families agree.
+      - (None, "ambiguous: ...")     the witnesses CONTRADICT each other. The
+        account is already inconsistent; callers must refuse the write and raise
+        SOS rather than pick a side and compound the damage (task's meta-missing/
+        ambiguous → refuse rule).
+      - (None, "no-anchor: ...")     no trustworthy evidence at all (never logged
+        in / feature unused). Callers treat this as "cannot prove a mismatch" and
+        fall through to prior behavior — refusing here would break legitimate
+        onboarding / no-op writes and every existing test that has no meta.yaml.
+    """
+    meta = _meta_anchor_identity(account)
+    fams = _family_anchor_identities(account)
+    # Hard contradiction between meta and any family → the account's own trusted
+    # witnesses disagree; don't guess which is right.
+    for fam in fams:
+        if meta and _identities_match(meta, fam) is False:
+            return (None, f"ambiguous: meta.yaml {meta} disagrees with a login family {fam}")
+    # Families disagreeing among themselves is the same don't-guess situation.
+    for i in range(1, len(fams)):
+        if _identities_match(fams[0], fams[i]) is False:
+            return (None, f"ambiguous: login families disagree ({fams[0]} vs {fams[i]})")
+    if meta and fams:
+        # Merge so the anchor carries every facet either witness knows (e.g.
+        # meta has the uuid, a family also supplies the email).
+        merged = dict(meta)
+        for fam in fams:
+            for k, v in fam.items():
+                merged.setdefault(k, v)
+        return (merged, "meta+families")
+    if meta:
+        return (meta, "meta")
+    if fams:
+        merged_f: dict = {}
+        for fam in fams:
+            for k, v in fam.items():
+                merged_f.setdefault(k, v)
+        return (merged_f, "families")
+    return (None, "no-anchor: meta.yaml has no oauth uuid/email and no login families")
+
+
+def guard_canonical_identity_write(account: str, incoming_identity: dict) -> tuple[bool, str]:
+    """Single choke-point: may `incoming_identity` be written into
+    account-<account>'s canonical store? Returns (allow, reason).
+
+    Closes the 2026-07-06 wrong-account clobber (see the block comment above).
+    Policy — the anchor is account_identity_anchor(account):
+      - anchor present + incoming MATCHES anchor  → allow.
+      - anchor present + incoming MISMATCH        → REFUSE (the incident).
+      - anchor present + no shared fields          → allow: cannot disprove (e.g.
+        meta carries only a uuid and the incoming payload only an email).
+      - anchor AMBIGUOUS (witnesses disagree)     → REFUSE: the account is
+        already poisoned; writing more only compounds it.
+      - no anchor at all / empty incoming          → allow: nothing to prove a
+        mismatch against, and refusing would break legitimate onboarding /
+        no-op writes (and every test with no meta.yaml). Degrade-to-allow keeps
+        the guard strictly non-breaking where there is no evidence.
+    """
+    if not incoming_identity:
+        return (True, "no identity in incoming payload — nothing to verify")
+    anchor, source = account_identity_anchor(account)
+    if anchor is None:
+        if source.startswith("ambiguous"):
+            return (False, f"'{account}' identity anchor is self-inconsistent ({source})")
+        return (True, f"no trustworthy anchor for '{account}' ({source}) — cannot prove a mismatch")
+    if _identities_match(incoming_identity, anchor) is False:
+        return (False,
+                f"incoming identity {incoming_identity} != '{account}' trusted anchor {anchor} ({source})")
+    return (True, f"incoming identity matches '{account}' anchor ({source})")
+
+
+def account_canonical_store_poisoned(account: str) -> tuple[bool, str]:
+    """True iff account-<X>'s canonical .claude.json identity CONTRADICTS its
+    trusted anchor (meta.yaml + login families) — the 2026-07-06 clobber shape,
+    where the canonical store is the WRONG side and meta/families are right.
+
+    Returns (poisoned, detail). Used by (a) the swap-target picker, to HARD-
+    exclude a poisoned account (installing its snapshot would spread the wrong
+    creds onto the live mount) and (b) SOS, to name the CANONICAL store as the
+    clobbered side and point at `cus relogin`. Conservative: an absent anchor or
+    absent canonical file is NOT poisoned (nothing to contradict) — only a live,
+    hard disagreement counts."""
+    anchor, source = account_identity_anchor(account)
+    if anchor is None:
+        return (False, f"no trustworthy anchor to check against ({source})")
+    canonical = account_canonical_identity(account)  # reads account-<X>/.claude.json
+    if not canonical:
+        return (False, "canonical .claude.json absent or carries no identity")
+    if _identities_match(canonical, anchor) is False:
+        return (True,
+                f"canonical .claude.json {canonical} != trusted anchor {anchor} ({source})")
+    return (False, f"canonical store matches anchor ({source})")
+
+
+def quarantine_rejected_canonical_write(dest_path: Path, incoming_bytes: bytes, why: str) -> Path:
+    """Divert a REFUSED canonical-store write to a sidecar next to the target
+    file instead of overwriting it: the good canonical store is left untouched
+    and the wrong-account bytes are preserved for forensics rather than lost.
+    Returns the sidecar path. Best-effort — a failed sidecar write still means
+    the overwrite was refused (the load-bearing half)."""
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    tag = hashlib.sha256((why + ts).encode()).hexdigest()[:8]
+    sidecar = dest_path.with_name(dest_path.name + f".rejected-{tag}-{ts}")
+    try:
+        atomic_write_bytes(sidecar, incoming_bytes, mode=0o600)
+    except OSError:
+        pass
+    return sidecar
 
 
 def _recover_pending_swap() -> None:
@@ -4775,15 +4996,50 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # save, nowhere to save it). We update the ENTIRE .claude.json in the
     # source dir (not just account-bound keys) so that any per-account state
     # Claude writes there persists.
+    #
+    # ---- 2026-07-06 wrong-account clobber guard (identity save-back) ----
+    # The live mount's identity is verified against current's TRUSTED anchor
+    # (meta.yaml + login families — see guard_canonical_identity_write) BEFORE
+    # it is persisted. A drifted mount (a session that logged in as / drifted to
+    # another account) carries a wrong oauthAccount in its live .claude.json;
+    # writing it here is exactly how account-rayi1/.claude.json ended up holding
+    # rayi2's identity. `identity_saveback_ok` is also consumed by the credentials
+    # save-back below: a mount whose IDENTITY is foreign is not a place we trust an
+    # "unknown"-verdict token from either.
+    identity_saveback_ok = True
     if current is not None:
+        assert current_dir is not None  # narrowed: current_dir is set iff current is
         current_identity = {k: live_cj[k] for k in ACCOUNT_BOUND_KEYS if k in live_cj}
-        # Read existing per-account .claude.json (if any), overlay current account-bound keys
-        if (current_dir / ".claude.json").exists():
-            existing = read_json(current_dir / ".claude.json")
+        identity_saveback_ok, _guard_reason = guard_canonical_identity_write(
+            current, _identity_fields(live_cj))
+        if not identity_saveback_ok:
+            # REFUSE: keep current's existing canonical .claude.json untouched and
+            # quarantine the rejected (wrong-account) identity next to it. Losing
+            # the outgoing account's own state-key updates for this one swap is far
+            # cheaper than clobbering its identity with another account's.
+            sidecar = quarantine_rejected_canonical_write(
+                current_dir / ".claude.json",
+                json.dumps({k: live_cj.get(k) for k in ACCOUNT_BOUND_KEYS}, indent=2).encode(),
+                _guard_reason)
+            msg = (f"WRONG-ACCOUNT GUARD at swap ({current} -> {target_name}): refused to save the live "
+                   f"mount's identity into '{current}' canonical .claude.json — {_guard_reason}. "
+                   f"Kept the existing canonical identity; quarantined the rejected one to {sidecar.name}. "
+                   f"The live mount has DRIFTED to another account; restart that session. If '{current}'s "
+                   f"own canonical store looks wrong, re-login it: `cus relogin {current}`.")
+            click.echo(f"creds-save-back: {msg}")
+            try:
+                append_inbox("wrong-account-guard",
+                             f"identity save-back refused for '{current}' (drifted live mount)", msg)
+            except OSError:
+                pass  # inbox is best-effort observability; never fail a swap over it
         else:
-            existing = {}
-        existing.update(current_identity)
-        write_json(current_dir / ".claude.json", existing)
+            # Read existing per-account .claude.json (if any), overlay current account-bound keys
+            if (current_dir / ".claude.json").exists():
+                existing = read_json(current_dir / ".claude.json")
+            else:
+                existing = {}
+            existing.update(current_identity)
+            write_json(current_dir / ".claude.json", existing)
 
     # ---- GH #3: refresh-time drift detection on the credentials save-back ----
     # The live file is read into memory EXACTLY ONCE and those same bytes are
@@ -4848,6 +5104,10 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         else:
             click.echo(f"creds-save-back: saved ({slot}, {current}) independent login back to its store entry (GH #109)")
     elif live_creds is not None:
+        # live_creds is only populated when current is not None (read a few lines
+        # up), which in turn guarantees current_dir is a real path — assert it so
+        # the snapshot writes below type-check.
+        assert current_dir is not None
         verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
         if verdict in ("expected", "unknown"):
             # "expected": provably current's tokens — the normal save-back.
@@ -4890,6 +5150,27 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                     append_inbox("freshness-guard", f"save-back skipped — '{current}' snapshot fresher than live", msg)
                 except OSError:
                     pass  # inbox is best-effort observability; never fail a swap over it
+            elif verdict == "unknown" and not identity_saveback_ok:
+                # ---- 2026-07-06 wrong-account clobber guard (credentials) ----
+                # "unknown" = no refresh-token lineage evidence (rotation-shaped),
+                # so the historical behavior assumes the tokens are current's. But
+                # when the SAME mount's .claude.json identity was just refused as
+                # foreign (identity_saveback_ok False), this is a fully-DRIFTED
+                # mount, not a rotation — its tokens belong to another account, and
+                # saving them into current's snapshot is the credentials half of
+                # the recurring clobber. Refuse + quarantine instead of guessing.
+                sidecar = quarantine_rejected_canonical_write(
+                    current_dir / ".credentials.json", live_creds_bytes, "drifted mount, unknown lineage")
+                msg = (f"WRONG-ACCOUNT GUARD at swap ({current} -> {target_name}): refused to save "
+                       f"unattributable live tokens into '{current}' snapshot — the live mount's identity "
+                       f"was refused as foreign, so these rotation-shaped tokens are not trustworthy as "
+                       f"'{current}'s. Kept the snapshot; quarantined to {sidecar.name}.")
+                click.echo(f"creds-save-back: {msg}")
+                try:
+                    append_inbox("wrong-account-guard",
+                                 f"token save-back refused for '{current}' (drifted live mount)", msg)
+                except OSError:
+                    pass
             else:
                 # ---- end GH #77 freshness guard ----
                 if verdict == "unknown":
@@ -8418,8 +8699,17 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         # Wrong-account stored login: --finish refuses this, but a hand-edited
         # store or a --force override could leave one behind. It would seed a
         # swap with the wrong account's tokens, so treat it as critical.
+        #
+        # 2026-07-06 disambiguation: a login-store-vs-canonical mismatch has TWO
+        # possible culprits. Historically this blamed the LOGIN store. But the
+        # recurring clobber makes the CANONICAL .claude.json the wrong side while
+        # the login store is right — so only blame the login store here when the
+        # canonical store is anchor-CONSISTENT. When canonical is itself poisoned,
+        # the dedicated Condition 10.5 below reports it (naming the canonical store,
+        # not the correct login) and we skip the misleading login-blame message.
         if _identities_match(login_store_identity(acct, slot), account_canonical_identity(acct)) is False:
-            mismatched.append(f"{slot}->{acct}")
+            if not account_canonical_store_poisoned(acct)[0]:
+                mismatched.append(f"{slot}->{acct}")
         exp_state, _ = login_expiry_state(acct, slot, config)
         if exp_state == "expired":
             expired.append(f"{slot}->{acct}")
@@ -8432,6 +8722,31 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             action=("A stored login's identity does not match its account. Re-provision it: "
                     "`cus login-mount <slot> <account>` and log in as the correct account."),
             affected="system",
+        ))
+
+    # Condition 10.5 (2026-07-06, this PR): CANONICAL store poisoned by a wrong-
+    # account clobber. This is the OTHER side of the identity-mismatch coin from
+    # Condition 10: here account-<X>/.claude.json disagrees with X's TRUSTED anchor
+    # (meta.yaml + login families), i.e. the canonical store was overwritten with
+    # another account's identity while meta + families stayed correct (the live
+    # 2026-07-06 rayi1<-rayi2 incident). Naming the CANONICAL store as the bad side
+    # — not the (correct) login families — is the whole point of splitting this out.
+    # The guard has already refused further wrong writes and the picker excludes the
+    # account as a swap target; the operator fix is a browser re-login.
+    for acct_name in state.get("accounts", {}):
+        poisoned, detail = account_canonical_store_poisoned(acct_name)
+        if not poisoned:
+            continue
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=(f"'{acct_name}' CANONICAL store is clobbered with a wrong account's identity: "
+                     f"{detail}"),
+            action=(f"account-{acct_name}/.claude.json (and likely .credentials.json) hold ANOTHER "
+                    f"account's identity/token, while '{acct_name}'s meta.yaml + login families are "
+                    f"correct — so the CANONICAL store is the bad side, not the families. cus has "
+                    f"refused further wrong-account writes and excluded '{acct_name}' as a swap target. "
+                    f"Repair with a browser re-login: `cus relogin {acct_name}` then `cus poll`."),
+            affected=acct_name,
         ))
     if expired:
         out.append(SOSCondition(
