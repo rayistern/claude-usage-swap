@@ -7004,7 +7004,7 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
 @dataclass
 class SOSCondition:
     """One thing that needs human action. Severity drives statusline color."""
-    severity: str  # "urgent" (red) | "warning" (yellow)
+    severity: str  # "urgent" (red) | "warning" (yellow) | "info" (soft, sos-only)
     summary: str   # one-line headline
     action: str    # concrete next step
     affected: str  # account name or "daemon" or "system"
@@ -7750,10 +7750,16 @@ def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
     every branch is computed with the SAME helper the picker uses so the label
     can never disagree with the actual eligibility verdict.
     """
-    # token_stale is the offline-spare signature from the 2026-07-05 incident:
-    # the account still LOOKS pickable (pick_swap_target does not filter it) but
-    # its usage is frozen and a swap onto it can fail. We exclude it in the
-    # counter, so it must be nameable here too.
+    # token_stale = our stored access token aged out (nothing polls an idle
+    # account), but the refresh token is still good — recoverable. As of the
+    # 2026-07-06 false-URGENT fix, an idle token_stale account WITH real headroom
+    # is counted as a viable (refresh-on-swap) target upstream and never reaches
+    # this labeller. It only lands here when it is ALSO lost for another reason
+    # (its last-known numbers read over a cap). We deliberately label it
+    # TOKEN_STALE rather than the cap reason: a stale account's cached usage % is
+    # NOT trustworthy for a decision (2026-07-05 incident), so the honest operator
+    # action is "revive it" (force-poll / relogin), after which its REAL numbers
+    # decide — not "it's over cap" on a number we could not reconfirm.
     if acct.get("token_stale"):
         return "TOKEN_STALE"
     if acct.get("token_expired"):
@@ -7863,13 +7869,51 @@ def _diagnose_premium_headroom(
     else:
         blocking = set(live_held)
 
-    # 3. Count VALID targets and NAME the lost capacity. A candidate is any known
-    #    account that is not blocked by a live mount. For each, we drive the real
-    #    picker with a distinct premium-lane leaver (cap/headroom filters do not
-    #    depend on WHICH lane departs, so any premium leaver != candidate serves).
+    # 3. Count usable targets and NAME the lost capacity. A candidate is any known
+    #    account not blocked by a live mount. For each we drive the real picker with
+    #    a distinct premium-lane leaver (cap/headroom filters do not depend on WHICH
+    #    lane departs, so any premium leaver != candidate serves).
+    #
+    #    Two usable buckets, because they carry DIFFERENT urgency:
+    #      • valid_targets     — FRESH, below every cap, refresh-token good. A swap
+    #                            lands cleanly with no recovery step. Drives the
+    #                            existing healthy / high-water-WARNING tiers unchanged.
+    #      • stale_refreshable — idle token_stale (its stored access token aged out
+    #                            because nothing polls an idle account) but the
+    #                            refresh token is still VALID, and below every cap on
+    #                            its last-known numbers. A swap installs the snapshot
+    #                            creds and the existing auto-refresh fast-track (see
+    #                            the token_stale fast-track near cus.py:2779 /
+    #                            `_refresh_account_token`) revives the token on use —
+    #                            so it IS a usable target, just not a zero-recovery one.
+    #
+    #    FALSE-URGENT INCIDENT (2026-07-06) this split fixes: the only free
+    #    Fable-clean accounts were IDLE (rayi4 @ 5h 0%/Fable 54%, rayi3 @ 5h 0%/Fable
+    #    82%). An idle account is never polled, so its stored access token aged out →
+    #    token_stale. The OLD code blanket-EXCLUDED every token_stale account from the
+    #    target count, so it reported "0 valid swap targets" and screamed the URGENT
+    #    will-429 line — even though those accounts were perfectly swappable. Proof:
+    #    `cus force-poll rayi4 rayi3` freshened them and `cus sos` flipped straight to
+    #    all-clear with ZERO change in real capacity. A token_stale-but-not-
+    #    token_expired account with real headroom is therefore a genuine target and
+    #    must NOT trigger the 429 klaxon.
+    #
+    #    STALE-vs-REFRESHABLE distinction — DO NOT "fix" this back by re-excluding
+    #    stale accounts: a token_stale account's cached USAGE numbers can be a wrong
+    #    stale reading, and we must NOT trust a stale % as authoritative for a swap
+    #    DECISION (that bit us on 2026-07-05 — see the stale-guard in pick_swap_target).
+    #    But this ALARM is not executing a swap on the stale number — it only decides
+    #    "does a plausibly-usable target EXIST." Counting a stale-but-refreshable
+    #    account as a *candidate* is therefore correct and safe: if its last-known
+    #    numbers show headroom it is a viable target; the refresh-on-swap then re-reads
+    #    its REAL numbers before anything commits. token_EXPIRED (dead refresh token)
+    #    is the genuinely-unusable case — pick_swap_target filters it, so it never
+    #    becomes a usable target and it alone (with over-cap/blocked candidates) can
+    #    still produce the URGENT line.
     premium_config = _config_for_pool(config, "premium")
-    valid_targets: list[str] = []
-    lost: list[str] = []  # reachable-but-unusable accounts = visible lost capacity
+    valid_targets: list[str] = []       # fresh, below every cap → clean swap
+    stale_refreshable: list[str] = []   # idle token_stale, below caps → refresh-on-swap
+    lost: list[str] = []                # reachable-but-unusable = visible lost capacity
     for name, acct in sorted(accounts.items()):
         if name in blocking:
             continue  # held by a live mount, no free family → would double-book
@@ -7877,19 +7921,29 @@ def _diagnose_premium_headroom(
         if not leavers:
             continue  # the only premium lane IS this account; nothing swaps onto it
         leaver = leavers[0]
-        if acct.get("token_stale"):
-            # Excluded up front: the picker would happily return a token_stale
-            # account (it filters token_EXPIRED, not stale), but a stale token is
-            # the offline-spare that caused the incident. Count it as lost, not valid.
-            lost.append(f"{name} TOKEN_STALE")
+        # pick_swap_target does NOT filter token_stale (only token_expired /
+        # poll_error), and its per-model gate reads a stale account as 0.0
+        # (stale-guard) → eligible. So this predicate tells us whether the candidate
+        # is below every cap on its LAST-KNOWN numbers — for fresh and stale alike.
+        is_valid = _candidate_is_valid_premium_target(
+            leaver, name, state, accounts, premium_config)
+        if acct.get("token_stale") and not acct.get("token_expired"):
+            # Refreshable spare: below caps → usable-after-refresh (counts toward
+            # "a target exists"); over a cap on its (untrusted) last-known numbers →
+            # revive it before trusting them, so it is named as lost, not counted.
+            if is_valid:
+                stale_refreshable.append(name)
+            else:
+                lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
             continue
-        if _candidate_is_valid_premium_target(leaver, name, state, accounts, premium_config):
+        if is_valid:
             valid_targets.append(name)
         else:
             lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
 
     n_lanes = len(premium_lanes)
-    m = len(valid_targets)
+    m = len(valid_targets)           # FRESH, below-cap targets (drive the existing tiers)
+    s = len(stale_refreshable)       # idle-stale-but-refreshable targets
 
     # High-water step: reuse thresholds.steps' top step (~90%), config-driven.
     steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
@@ -7899,14 +7953,6 @@ def _diagnose_premium_headroom(
         eff = _account_effective_pct(accounts.get(acct_name, {}), config)
         if eff >= top_step:
             hot_lanes.append((acct_name, prem_slots, eff))
-
-    # Nothing to say while there is genuine target-pool headroom AND no lane is
-    # already hot — this is the backward-compatible "no false positives when
-    # there IS headroom" guarantee.
-    if m >= 1 and not hot_lanes:
-        return None
-    if m > 1:
-        return None  # >1 valid target = healthy pool, even with a hot lane
 
     lane_desc = "; ".join(
         f"{a} ({'/'.join(premium_lanes[a])} @ {_account_effective_pct(accounts.get(a, {}), config):.0f}%)"
@@ -7923,23 +7969,61 @@ def _diagnose_premium_headroom(
         + f" Live premium lanes: {lane_desc}."
     )
 
-    if m == 0:
-        # The pool of viable targets is fully collapsed. The next lane to cap
-        # 429s with no recourse — URGENT even before any lane is hot.
+    # ---- At least one FRESH target: unchanged healthy / high-water behavior ----
+    # A fresh, below-cap target means a clean swap is available, so the only
+    # question is whether the pool is thin. This is the backward-compatible path;
+    # its verdicts are byte-for-byte what they were before the stale split.
+    if m >= 1:
+        if m > 1:
+            return None  # >1 fresh target = healthy pool, even with a hot lane
+        if not hot_lanes:
+            return None  # single fresh target but no lane is hot yet → quiet
+        # m == 1 AND a lane is already past the high-water step: a single mistake
+        # (that last target caps, or the hot lane trips) away from the wall → WARNING.
+        hot_names = ", ".join(f"{a} @ {eff:.0f}%" for a, _s, eff in hot_lanes)
         return SOSCondition(
-            severity="urgent",
-            summary=(f"{n_lanes} premium lane(s) live, 0 valid swap targets — "
-                     f"a premium lane will 429 when it caps"),
+            severity="warning",
+            summary=(f"{n_lanes} premium lane(s) live, only 1 valid swap target — "
+                     f"lane(s) past {top_step:.0f}% ({hot_names}) are near the wall"),
             action=levers,
             affected="system",
         )
-    # m == 1 AND a lane is already past the high-water step: a single mistake
-    # (that last target caps, or the hot lane trips) away from the wall → WARNING.
-    hot_names = ", ".join(f"{a} @ {eff:.0f}%" for a, _s, eff in hot_lanes)
+
+    # ---- No FRESH target (m == 0), but idle-stale-but-refreshable targets exist ----
+    # This is the 2026-07-06 false-URGENT shape: the only usable targets are idle
+    # token_stale accounts that WILL refresh on swap. NOT a 429 klaxon — downgrade to
+    # an informational note (severity "info", quieter than "warning"). The statusline
+    # surfaces only urgent/warning, so this stays OFF the status bar and shows only in
+    # `cus sos` / SOS.md. This is the ONLY behavior change vs the old URGENT-on-m==0.
+    if s >= 1:
+        stale_desc = ", ".join(stale_refreshable)
+        action = (
+            "The only pooled swap targets for the live premium lane(s) are idle and "
+            "token_stale — their stored access token aged out because nothing polls an "
+            "idle account, but the refresh token is still valid. They are NOT capped: a "
+            "swap installs their snapshot creds and the auto-refresh fast-track revives "
+            "the token on use, so no 429 results. Informational only. To freshen now: "
+            f"`cus force-poll {stale_refreshable[0]}` (or `cus relogin <acct>`)."
+            + lost_desc
+            + f" Idle-stale targets: {stale_desc}. Live premium lanes: {lane_desc}."
+        )
+        return SOSCondition(
+            severity="info",
+            summary=(f"{n_lanes} premium lane(s) live; {s} swap target(s) are idle-stale "
+                     f"and will refresh on swap"),
+            action=action,
+            affected="system",
+        )
+
+    # ---- m == 0 AND s == 0: genuinely zero usable targets ----
+    # Every candidate is over a cap, poll_error, rate_limited, or token_EXPIRED (dead
+    # refresh token). The next premium lane to cap 429s with no recourse → URGENT even
+    # before any lane is hot. This is the ONLY remaining path to the will-429 klaxon;
+    # idle-stale-but-refreshable spares no longer reach it (they route to INFO above).
     return SOSCondition(
-        severity="warning",
-        summary=(f"{n_lanes} premium lane(s) live, only 1 valid swap target — "
-                 f"lane(s) past {top_step:.0f}% ({hot_names}) are near the wall"),
+        severity="urgent",
+        summary=(f"{n_lanes} premium lane(s) live, 0 valid swap targets — "
+                 f"a premium lane will 429 when it caps"),
         action=levers,
         affected="system",
     )
@@ -8472,13 +8556,22 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
         write_json(LAST_NOTIFY, {"signature": signature, "ts": now_iso()})
         if shutil.which("notify-send"):
             urgent = [c for c in conditions if c.severity == "urgent"]
-            title = "🚨 cus SOS" if urgent else "⚠ cus warning"
+            warning = [c for c in conditions if c.severity == "warning"]
+            # Three-tier title/urgency: an info-only set (e.g. the premium-headroom
+            # "targets are idle-stale but will refresh on swap" note) must not fire a
+            # warning-styled critical-ish popup — keep it low-urgency and labelled info.
+            if urgent:
+                title, urgency = "🚨 cus SOS", "critical"
+            elif warning:
+                title, urgency = "⚠ cus warning", "normal"
+            else:
+                title, urgency = "ℹ cus", "low"
             body = conditions[0].summary
             if len(conditions) > 1:
                 body += f" (and {len(conditions) - 1} more)"
             try:
                 subprocess.run(
-                    ["notify-send", "-u", "critical" if urgent else "normal", "-a", "cus", title, body],
+                    ["notify-send", "-u", urgency, "-a", "cus", title, body],
                     check=False, capture_output=True, timeout=5,
                 )
             except (subprocess.SubprocessError, FileNotFoundError):
@@ -13082,7 +13175,13 @@ def sos_cmd(quiet: bool) -> None:
 
     click.echo("🚨 SOS — human action needed:\n")
     for c in conditions:
-        prefix = "[URGENT]" if c.severity == "urgent" else "[WARNING]"
+        # Three tiers: "info" is a soft, non-actionable heads-up (e.g. the premium
+        # lane's only swap targets are idle-stale but WILL refresh on swap — GH
+        # 2026-07-06 false-URGENT fix), so it renders [INFO], not the [WARNING]
+        # that every non-urgent condition used to collapse to.
+        prefix = ("[URGENT]" if c.severity == "urgent"
+                  else "[WARNING]" if c.severity == "warning"
+                  else "[INFO]")
         click.echo(f"  {prefix} {c.summary}")
         for line in c.action.split("\n"):
             click.echo(f"    {line}")

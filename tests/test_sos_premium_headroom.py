@@ -68,9 +68,14 @@ def _occupied(premium_lane_accounts: tuple[str, ...]) -> dict[str, list[str]]:
 # --------------------------------------------------------------------------
 
 def test_zero_valid_targets_fires_urgent():
+    # A genuinely-dead spare (token_EXPIRED = refresh token gone, unrecoverable) is
+    # the real 0-target case. NOTE (2026-07-06): an idle token_STALE spare is NOT
+    # this case — its refresh token is still good, so it now counts as a viable
+    # refresh-on-swap target and downgrades to INFO. See
+    # test_idle_stale_target_with_headroom_is_viable_no_urgent.
     accounts = {
-        "alpha": _acct(five_h=60.0, seven_d=20.0),          # the live premium lane
-        "beta": _acct(five_h=0.0, seven_d=0.0, token_stale=True),  # the only spare, offline
+        "alpha": _acct(five_h=60.0, seven_d=20.0),           # the live premium lane
+        "beta": _acct(five_h=0.0, seven_d=0.0, token_expired=True),  # only spare, DEAD
     }
     state = _state(accounts, ("alpha",))
     cond = cus._diagnose_premium_headroom(state, _cfg(), _occupied(("alpha",)), set())
@@ -78,8 +83,8 @@ def test_zero_valid_targets_fires_urgent():
     assert cond.severity == "urgent"
     assert "1 premium lane(s) live, 0 valid swap targets" in cond.summary
     assert "429" in cond.summary
-    # The offline spare is named as lost capacity with its concrete lever.
-    assert "beta TOKEN_STALE" in cond.action
+    # The dead spare is named as lost capacity with its concrete lever.
+    assert "beta TOKEN_EXPIRED" in cond.action
     assert "cus relogin" in cond.action
     assert "cus add" in cond.action
 
@@ -130,29 +135,66 @@ def test_no_lanes_at_all_never_fires():
 
 
 # --------------------------------------------------------------------------
-# (c) a stale account that would otherwise be the only target → named lost
+# (c) an idle token_stale-but-refreshable spare is a VIABLE target (2026-07-06)
 # --------------------------------------------------------------------------
 
-def test_stale_only_target_named_and_is_the_pivot():
-    # beta is healthy on every axis EXCEPT token_stale — so it is the pivotal
-    # capacity: with the stale flag it's lost (URGENT, named); without it, the
-    # pool has a valid target and nothing fires.
+def test_idle_stale_target_with_headroom_is_viable_no_urgent():
+    # REGRESSION (a) for the 2026-07-06 false-URGENT: beta is idle and token_stale
+    # (its access token aged out because nothing polls an idle account) but has real
+    # Fable + 5h/7d headroom and a still-valid refresh token. It IS a usable target —
+    # a swap installs its snapshot creds and the auto-refresh fast-track revives it.
+    # So the old blanket-exclusion (which screamed "0 valid targets — will 429") must
+    # NOT fire; instead we get the soft INFO "will refresh on swap" note.
     stale = {
-        "alpha": _acct(five_h=70.0, seven_d=20.0),
-        "beta": _acct(five_h=3.0, seven_d=4.0, token_stale=True),
+        "alpha": _acct(five_h=70.0, seven_d=20.0),  # cool live lane (< 90)
+        "beta": _acct(five_h=3.0, seven_d=4.0, token_stale=True,
+                      per_model_weekly_pct={"Fable": 54.0}),  # idle spare, Fable headroom
     }
     state = _state(stale, ("alpha",))
-    cond = cus._diagnose_premium_headroom(state, _cfg(), _occupied(("alpha",)), set())
-    assert cond is not None and cond.severity == "urgent"
-    assert "beta TOKEN_STALE" in cond.action
+    cfg = _cfg(per_model_weekly={"gate_enabled": True, "cap_pct": 97})
+    cond = cus._diagnose_premium_headroom(state, cfg, _occupied(("alpha",)), set())
+    # The critical guarantee: NOT the urgent will-429 line.
+    assert cond is not None
+    assert cond.severity == "info"
+    assert cond.severity != "urgent"
+    assert "0 valid swap targets" not in cond.summary
+    assert "429" not in cond.summary
+    assert "will refresh on swap" in cond.summary
+    assert "1 swap target(s) are idle-stale" in cond.summary
+    # The action names the stale target and the concrete freshen lever.
+    assert "beta" in cond.action
+    assert "cus force-poll" in cond.action
 
-    # Same fleet, beta revived → valid target appears → all clear.
+    # Same fleet, beta revived (fresh) → a clean valid target → all clear.
     healthy = {
         "alpha": _acct(five_h=70.0, seven_d=20.0),
-        "beta": _acct(five_h=3.0, seven_d=4.0),
+        "beta": _acct(five_h=3.0, seven_d=4.0, per_model_weekly_pct={"Fable": 54.0}),
     }
-    assert cus._diagnose_premium_headroom(_state(healthy, ("alpha",)), _cfg(),
+    assert cus._diagnose_premium_headroom(_state(healthy, ("alpha",)), cfg,
                                           _occupied(("alpha",)), set()) is None
+
+
+def test_all_fable_capped_or_expired_still_urgent():
+    # REGRESSION (b): when EVERY candidate is genuinely unusable — a FRESH account
+    # over the premium Fable cap, or a token_EXPIRED (dead refresh token) account —
+    # the urgent will-429 line MUST still fire. Only idle-stale-but-refreshable
+    # spares get the downgrade; real caps and dead tokens do not.
+    accounts = {
+        "alpha": _acct(five_h=70.0, seven_d=20.0),  # the live premium lane
+        "beta": _acct(five_h=5.0, seven_d=5.0,      # FRESH but Fable-capped (99 ≥ 97)
+                      per_model_weekly_pct={"Fable": 99.0}),
+        "gamma": _acct(five_h=5.0, seven_d=5.0, token_expired=True),  # dead refresh token
+    }
+    state = _state(accounts, ("alpha",))
+    cfg = _cfg(per_model_weekly={"gate_enabled": True, "cap_pct": 97})
+    cond = cus._diagnose_premium_headroom(state, cfg, _occupied(("alpha",)), set())
+    assert cond is not None
+    assert cond.severity == "urgent"
+    assert "1 premium lane(s) live, 0 valid swap targets" in cond.summary
+    assert "429" in cond.summary
+    # Both dead-capacity reasons are named.
+    assert "beta over per-model weekly cap" in cond.action
+    assert "gamma TOKEN_EXPIRED" in cond.action
 
 
 def test_lost_capacity_names_capped_and_rate_limited():
@@ -264,22 +306,50 @@ def test_loss_reason_labels():
 # --------------------------------------------------------------------------
 
 def _headroom_conditions(conditions):
-    return [c for c in conditions if "valid swap target" in c.summary]
+    # Match every tier of the premium-headroom SOS — urgent/warning summaries say
+    # "... valid swap target", the info tier says "... will refresh on swap"; both
+    # share the "premium lane(s) live" prefix, so filter on that.
+    return [c for c in conditions if "premium lane(s) live" in c.summary]
 
 
-def test_diagnose_e2e_stale_spare_fires_urgent():
+def test_diagnose_e2e_expired_spare_fires_urgent():
+    # A token_EXPIRED (dead refresh token) spare is genuinely unusable → the
+    # end-to-end diagnose() must still surface the urgent will-429 line.
     env = _Env(accounts=("alpha", "beta"))
     try:
         env.make_slot("alpha", live=True)  # a live premium lane on alpha
         state = cus.load_state()
         state["accounts"]["alpha"].update({"current_5h_pct": 60.0, "current_7d_pct": 20.0})
-        state["accounts"]["beta"]["token_stale"] = True  # the only spare is offline
+        state["accounts"]["beta"]["token_expired"] = True  # only spare is DEAD
         cus.save_state(state)
         env.set_config({"mode": "per_session"})
         conds = _headroom_conditions(cus.diagnose())
         assert len(conds) == 1
         assert conds[0].severity == "urgent"
-        assert "beta TOKEN_STALE" in conds[0].action
+        assert "beta TOKEN_EXPIRED" in conds[0].action
+    finally:
+        env.restore()
+
+
+def test_diagnose_e2e_stale_spare_is_info_not_urgent():
+    # REGRESSION (a), end-to-end: an idle token_STALE spare with headroom is
+    # refreshable-on-swap, so diagnose() must NOT emit the urgent will-429 line —
+    # only the soft INFO "will refresh on swap" note.
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 60.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"]["token_stale"] = True  # idle spare, refresh token good
+        state["accounts"]["beta"].update({"current_5h_pct": 3.0, "current_7d_pct": 4.0})
+        cus.save_state(state)
+        env.set_config({"mode": "per_session"})
+        conds = _headroom_conditions(cus.diagnose())
+        assert len(conds) == 1
+        assert conds[0].severity == "info"
+        assert conds[0].severity != "urgent"
+        assert "will refresh on swap" in conds[0].summary
+        assert not any(c.severity == "urgent" for c in cus.diagnose())
     finally:
         env.restore()
 
