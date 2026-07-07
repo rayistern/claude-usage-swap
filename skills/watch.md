@@ -4,6 +4,8 @@ Stand up a background watchdog that keeps a chosen set of Claude Code sessions a
 
 This was distilled from a real multi-day weekend watch. The design principle throughout: **do the least intervention that works, prefer letting the daemon self-heal, and never take an irreversible action on a session's behalf.**
 
+> **Posture update 2026-07-07 (operator directive — supersedes "prefer letting the daemon self-heal" above for the attended case):** when the watchdog agent is actively present, **the agent's management takes PRECEDENCE over the daemon — act decisively, do NOT ask permission before a safe at-risk swap, and do NOT defer to the daemon to handle it.** When a protected lane is AT-RISK (within ~5% of the 95% step on ANY of 5h/7d/per-model-Fable), **move it preemptively yourself, now**, rather than waiting for the daemon to swap it at the step. The safety rules below still govern *how* you swap (fresh non-`~` reading — force-poll first; dry-run for clobber-safety; in-place so a live session's context is never reset on an unverified/stale number; never touch locked slots; no `--force`; Escape-only in native prompts) — but *whether* to act on a verified at-risk lane is not a question the operator wants asked. The original "least intervention / let the daemon self-heal" principle still applies to the *unattended* case (headless timer with no agent watching) and to genuinely irreversible actions (browser relogins, hand-edits), which still escalate to a human.
+
 ---
 
 ## When to use
