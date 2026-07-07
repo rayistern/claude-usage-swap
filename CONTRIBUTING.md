@@ -24,7 +24,11 @@ Dependencies: Python 3.11+, `click`, `pyyaml`. If you have `uv`, `uv run cus.py`
 
 ## Testing
 
-Currently zero unit tests — design relied heavily on iterative smoke-testing against real OAuth API. If you add a non-trivial change, smoke-test:
+There is a pytest suite under `tests/` (run `pytest tests/ -q`; CI runs it on every push/PR across Python 3.11–3.13). Each test file is also runnable standalone (`python3 tests/test_foo.py`) and fakes `HOME`/account dirs via a `_Env` helper that monkeypatches the module path constants — follow that pattern for new tests so they stay hermetic and don't touch the real `~/claude-accounts/`.
+
+`pytest` is a **dev-only** dependency — do NOT add it to `cus.py`'s PEP 723 runtime metadata.
+
+For changes to the swap mechanism or the daemon loop, also smoke-test against real state before opening the PR:
 
 ```bash
 python3 cus.py init --dry-run
@@ -32,8 +36,6 @@ python3 cus.py poll --no-write
 python3 cus.py daemon --once --no-execute
 python3 cus.py sos
 ```
-
-If you add a unit test suite (pytest preferred), put it in `tests/` and add `pytest` to dev deps. Don't add `pytest` to PEP 723 runtime deps.
 
 ## Lifted methodology
 
@@ -62,6 +64,7 @@ Big ones:
 
 - [ ] `cus.py` parses (`python3 -c "import ast; ast.parse(open('cus.py').read())"`)
 - [ ] `cus.py --help` runs without import errors
+- [ ] `pytest tests/ -q` passes; non-trivial changes add a test
 - [ ] If you added a command, it shows in `--help`
 - [ ] If you added a config knob, it has a default in `DEFAULT_CONFIG` and is documented in `docs/RUNBOOK.md`
 - [ ] If you changed the swap mechanism, you smoke-tested it (`cus switch <name> --dry-run` and a real swap)

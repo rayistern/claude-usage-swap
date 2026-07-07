@@ -199,6 +199,23 @@ USAGE_API_BETA = os.environ.get("CUS_USAGE_BETA", "oauth-2025-04-20")
 USAGE_API_TIMEOUT_SECONDS = 10
 USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 
+# Anthropic messages endpoint — the clock_keepalive ping (2026-07-07) POSTs the
+# smallest possible model request here to START/keep an account's 5h usage
+# window ticking (see DEFAULT_CONFIG["clock_keepalive"] for the full WHY). We
+# authenticate with the account's OAuth (subscription) bearer token, exactly as
+# `claude -p` does; a subscription OAuth token is only accepted on this endpoint
+# when the request carries the Claude Code identity — the `anthropic-beta:
+# oauth-2025-04-20` header AND a leading Claude Code system prompt — so both are
+# sent below. Env-overridable for future endpoint/version shifts. A wrong
+# endpoint/shape degrades gracefully: the ping just fails, is logged
+# (CRED-AUDIT decision=failed), and the daemon moves on.
+MESSAGES_API_URL = os.environ.get("CUS_MESSAGES_ENDPOINT", "https://api.anthropic.com/v1/messages")
+ANTHROPIC_VERSION = os.environ.get("CUS_ANTHROPIC_VERSION", "2023-06-01")
+# The system-prompt marker Claude Code sends so a subscription OAuth token is
+# accepted on /v1/messages. Kept verbatim — the endpoint checks for it.
+KEEPALIVE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
+KEEPALIVE_TIMEOUT_SECONDS = 15
+
 # OAuth token endpoint + Claude Code's public client id. Shared by two callers:
 #   - the claim-time refresh-token liveness probe (#127), and
 #   - token_self_refresh (#96, 2026-07-02), which mints a fresh access token
@@ -613,6 +630,54 @@ DEFAULT_CONFIG: dict[str, Any] = {
         #     needs a browser relogin.
         "unstale_idle_on_poll": True,
         "unstale_cooldown_minutes": 10,
+    },
+    # clock_keepalive (2026-07-07 operator directive) — keep every account's
+    # 5-hour usage window continuously TICKING by pinging DORMANT accounts.
+    #
+    # The mechanic being exploited: Claude's 5-hour usage window is a FIXED
+    # window that STARTS on an account's first model request after a dormant
+    # period and RESETS ~5h later. An account nothing exercises (no lane making
+    # requests) has a DORMANT clock — its 5h window is not running, so it will
+    # not reset on any predictable cadence and there is no "fresh capacity in
+    # ~5h" coming from it. If instead we keep every account's clock ticking, all
+    # accounts cycle through 5h windows continuously and reset on a rolling
+    # basis — so the fleet always has some account minutes-from-fresh, which is
+    # exactly the predictable rolling capacity the rotation daemon wants to pick
+    # from. The operator did this by hand today (CLAUDE_CONFIG_DIR=account-rayi4
+    # claude -p "hi" --model claude-haiku-4-5-20251001 started rayi4's clock);
+    # this block makes it a first-class, config-gated daemon feature.
+    #
+    # The ping is a MINIMAL model request (1 user token "hi", max_tokens=1, the
+    # cheapest model) sent DIRECTLY to the Anthropic messages endpoint with the
+    # account's OAuth bearer token — read-only w.r.t. every live mount/lane (it
+    # never writes any lane's .credentials.json), and wrapped so a failed ping
+    # only logs and moves on, never crashing the poll. After a successful ping
+    # the account is force-re-polled so `five_hour_resets_at` reflects the
+    # now-ticking window.
+    #
+    # Backward-compatible: an ABSENT block uses these defaults (feature ON, per
+    # the operator directive). Set `enabled: false` to revert to the
+    # pre-2026-07-07 behavior (dormant accounts stay dormant).
+    "clock_keepalive": {
+        # Master toggle. Operator wants it ON. False ⇒ the keepalive sweep is
+        # skipped entirely (bit-for-bit pre-feature behavior).
+        "enabled": True,
+        # The model id the ping uses — cheapest available so the keepalive costs
+        # as close to nothing as possible while still counting toward the 5h
+        # window (any model request starts/keeps the window).
+        "model": "claude-haiku-4-5-20251001",
+        # Cooldown: an account is pinged at most once per this many MINUTES.
+        # Default ~290 — just under the 5h / 300-min window — so a dormant
+        # account gets re-primed shortly after each reset (keeping the clock
+        # essentially always ticking) WITHOUT hammering the endpoint. Recorded
+        # per account as `last_keepalive_ping_ts` in state.json.
+        "min_ping_interval_minutes": 290,
+        # Optional account scoping. `accounts` (allowlist): when non-empty, ONLY
+        # these accounts are eligible for keepalive pings; empty/absent ⇒ all
+        # enabled, non-disabled, valid-creds accounts. `exclude` (denylist):
+        # accounts never pinged even if otherwise eligible. Both default empty.
+        "accounts": [],
+        "exclude": [],
     },
     "subagent_skip": {
         "enabled": True,
@@ -2309,30 +2374,6 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     return target
 
 
-def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, Path]:
-    """Find a free slot for a launch (create one if none). Caller save_state()s.
-
-    Preference order: a free slot ALREADY holding prefer_account (no swap
-    needed — cheapest launch), then any free slot, then a new slot. A slot
-    dir on disk with no state entry (orphan) is adopted rather than ignored.
-    """
-    slots_state = state.setdefault("slots", {})
-    free: list[Path] = []
-    for d in list_slot_dirs():
-        if mount_in_use(d):
-            continue
-        if d.name not in slots_state:
-            slots_state[d.name] = {"account": None, "created_ts": now_iso()}
-        free.append(d)
-    if prefer_account:
-        for d in free:
-            if slots_state[d.name].get("account") == prefer_account:
-                return d.name, d
-    if free:
-        return free[0].name, free[0]
-    return create_slot(state)
-
-
 def mount_in_use(mount: Path) -> bool:
     return bool(mount_pids(mount))
 
@@ -3351,6 +3392,241 @@ def _sweep_unstale_idle_accounts(state: dict, config: dict) -> list[str]:
             if _unstale_account_snapshot(name, state, config):
                 out.append(name)
     return out
+
+
+# --------------------------------------------------------------------------
+# clock_keepalive (2026-07-07 operator directive) — keep every account's 5h
+# usage window ticking. See DEFAULT_CONFIG["clock_keepalive"] for the full WHY.
+# --------------------------------------------------------------------------
+
+def _5h_clock_dormant(acct: dict, now_dt: datetime) -> bool:
+    """Is this account's 5-hour usage window NOT currently running?
+
+    Claude's 5h window is a FIXED window: it starts on the account's first model
+    request after a dormant period and resets ~5h later. While it runs, the poll
+    stores its end as `five_hour_resets_at` (an ISO timestamp in the FUTURE). So
+    the window is:
+      * RUNNING (not dormant) ⇔ `five_hour_resets_at` parses and is in the future
+        — something (a live lane, or a recent keepalive ping) started the clock
+        and it is still ticking down.
+      * DORMANT ⇔ there is no future reset: the field is absent, unparseable, or
+        already in the past (the window lapsed and nothing restarted it).
+
+    A dormant clock is the state clock_keepalive exists to break — it will not
+    reset on a predictable cadence, so no "fresh in ~5h" capacity is coming from
+    this account until something pings it. This is a pure predicate (no I/O) so
+    it stays unit-testable apart from the sweep's creds/HTTP side effects."""
+    reset_at = acct.get("five_hour_resets_at")
+    if reset_at:
+        try:
+            reset_dt = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+            if reset_dt > now_dt:
+                return False  # window still ticking → NOT dormant
+        except (TypeError, ValueError):
+            pass  # unparseable ⇒ treat as no known running window ⇒ dormant
+    return True
+
+
+def _keepalive_token_for(account: str, acct: dict, state: dict,
+                         config: dict) -> tuple[str | None, str]:
+    """Resolve a VALID OAuth access token to send the keepalive ping with, or
+    (None, reason) to skip. NEVER pings with dead creds.
+
+    Two cases:
+      * canonical snapshot is refresh-DEAD (`snapshot_refresh_dead`, from the
+        un-stale sweep / seed-from-family PR): the account's own snapshot token
+        can't be trusted, so only ping if a VALID login family is available.
+        `claim_verified_login_family` proves a free family's refresh token alive
+        (rotating+persisting it) and we read that family's fresh access token.
+        No free/verifiable family ⇒ skip and leave the account for relogin.
+      * normal account: use the freshest snapshot/live token
+        (`_read_access_token_with_expiry`); if it has aged out, mint a fresh one
+        via `_refresh_account_token` (a direct refresh grant that writes back to
+        the SNAPSHOT only — never a live lane's .credentials.json) and re-read."""
+    if acct.get("snapshot_refresh_dead"):
+        if not has_free_login_family(account, state):
+            return None, "snapshot refresh-dead and no free login family — leave for relogin"
+        fam = claim_verified_login_family(account, state, config)
+        if not fam:
+            return None, "snapshot refresh-dead; no verified-alive login family available"
+        try:
+            fam_creds = read_json(login_family_creds_path(account, fam))
+            tok = (fam_creds.get("claudeAiOauth") or {}).get("accessToken")
+        except (OSError, json.JSONDecodeError):
+            tok = None
+        if not tok:
+            return None, f"login family {fam} yielded no usable access token"
+        return tok, f"using verified login family {fam} (snapshot refresh-dead)"
+
+    token, expires_at = _read_access_token_with_expiry(account)
+    now_ms = int(time.time() * 1000)
+    fresh = bool(token) and (expires_at is None or _int_or_none(expires_at, now_ms) >= now_ms - 30_000)
+    if not fresh:
+        # Aged out — mint a fresh access token via a direct refresh grant
+        # (writes back to the snapshot only) then re-read. Best-effort: on
+        # failure we fall through and skip below rather than ping a stale token.
+        if _refresh_account_token(account):
+            token, expires_at = _read_access_token_with_expiry(account)
+    if not token:
+        return None, "no usable access token (and refresh grant did not yield one)"
+    return token, "using account snapshot/live token"
+
+
+def _int_or_none(val, default: int) -> int:
+    """Best-effort int() for a stored expiresAt; `default` when unparseable so a
+    malformed timestamp is treated as fresh (the live HTTP call still surfaces a
+    real auth failure)."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _keepalive_ping(access_token: str, model: str) -> tuple[bool, str]:
+    """Send the MINIMAL keepalive model request that starts/keeps an account's
+    5h usage window ticking. Returns (ok, detail); NEVER raises.
+
+    The request is the smallest thing that still counts toward the window: one
+    user token "hi", `max_tokens=1`, the cheapest model. It is authenticated
+    with the account's OAuth (subscription) bearer token exactly as `claude -p`
+    is — hence the Claude Code system-prompt marker + the oauth beta header,
+    which the endpoint requires before it accepts a subscription token on
+    /v1/messages. This is the one seam tests mock — no real network in tests.
+
+    A 429 is reported as SUCCESS-for-our-purposes: an account Anthropic is
+    actively rate-limiting necessarily has a running 5h window, which is exactly
+    the ticking clock we wanted — nothing to do but record it and move on."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "system": KEEPALIVE_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        MESSAGES_API_URL, data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "anthropic-beta": USAGE_API_BETA,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": OAUTH_USER_AGENT,
+        }, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=KEEPALIVE_TIMEOUT_SECONDS) as resp:
+            resp.read(USAGE_API_RESPONSE_LIMIT_BYTES)  # drain; body is irrelevant
+            return True, f"HTTP {getattr(resp, 'status', 200)}"
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return True, "HTTP 429 (already rate-limited; window is ticking)"
+        detail = ""
+        try:
+            detail = e.read(512).decode(errors="replace")[:200] if e.fp else ""
+        except OSError:
+            pass
+        return False, f"HTTP {e.code}: {detail}"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _sweep_clock_keepalive(state: dict, config: dict) -> list[str]:
+    """Each daemon cycle, keep every DORMANT account's 5h clock ticking (Fix,
+    2026-07-07 operator directive). Returns the names actually pinged this cycle.
+
+    For each ENABLED, non-`disabled`, in-scope account whose 5h window is DORMANT
+    (`_5h_clock_dormant`) and that is not being kept alive by a live lane, send a
+    single cheap keepalive ping (`_keepalive_ping`) — cooldown-bounded by
+    `clock_keepalive.min_ping_interval_minutes` (recorded as `last_keepalive_ping_ts`
+    per account) and skipping accounts in poll-backoff or needing relogin. On a
+    successful ping, force a usage re-poll of that account so `five_hour_resets_at`
+    reflects the now-ticking window. Every step is wrapped so a single account's
+    failure only logs (CRED-AUDIT) and moves on — never crashes the poll.
+
+    Routine non-candidates (out of scope, disabled, live lane, still-ticking) are
+    skipped SILENTLY to avoid flooding the log every cycle; only dormant accounts
+    we deliberately decline to ping (cooldown, backoff, dead creds, relogin) or
+    actually ping/fail get a CRED-AUDIT line."""
+    kcfg = config.get("clock_keepalive", {})
+    if not kcfg.get("enabled", True):
+        return []
+    interval_min = kcfg.get("min_ping_interval_minutes", 290)
+    model = kcfg.get("model", "claude-haiku-4-5-20251001")
+    allow = set(kcfg.get("accounts") or [])
+    deny = set(kcfg.get("exclude") or [])
+    now_dt = datetime.now(timezone.utc)
+    pinged: list[str] = []
+
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict):
+            continue
+        # ── silent, routine non-candidates (would flood the log every cycle) ──
+        if allow and name not in allow:
+            continue
+        if name in deny:
+            continue
+        if acct.get("disabled"):
+            continue  # disabled accounts are out of rotation — never ping
+        # A live lane actively making requests already keeps this account's clock
+        # ticking; pinging it would be wasteful. `_account_on_fast_cadence` is the
+        # existing "is this account burning right now" predicate (live slot, or the
+        # shared-active mount in use).
+        if _account_on_fast_cadence(state, config, name):
+            continue
+        if not _5h_clock_dormant(acct, now_dt):
+            continue  # window still ticking — nothing to keep alive
+
+        # ── dormant candidate: from here a decline/ping is worth one audit line ──
+        in_backoff, until = account_in_backoff(state, name)
+        if in_backoff:
+            _cred_audit("clock-keepalive-ping", "skipped",
+                        f"in poll-backoff until {until}", account=name)
+            continue
+        if acct.get("token_expired"):
+            _cred_audit("clock-keepalive-ping", "skipped",
+                        "token_expired — needs browser relogin", account=name)
+            continue
+        # Cooldown: at most one ping per account per min_ping_interval_minutes.
+        last_ping = acct.get("last_keepalive_ping_ts")
+        if last_ping:
+            try:
+                last_dt = datetime.fromisoformat(str(last_ping).replace("Z", "+00:00"))
+                if (now_dt - last_dt).total_seconds() < interval_min * 60:
+                    _cred_audit("clock-keepalive-ping", "skipped",
+                                f"within cooldown ({interval_min}m since last ping)",
+                                account=name)
+                    continue
+            except (TypeError, ValueError):
+                pass  # unparseable stamp ⇒ treat as no cooldown, proceed
+
+        token, why = _keepalive_token_for(name, acct, state, config)
+        if not token:
+            _cred_audit("clock-keepalive-ping", "skipped", why, account=name)
+            continue
+
+        try:
+            ok, detail = _keepalive_ping(token, model)
+        except Exception as e:  # noqa: BLE001 — a ping must never crash the poll
+            _cred_audit("clock-keepalive-ping", "failed",
+                        f"unexpected {type(e).__name__}: {e}", account=name)
+            continue
+
+        if not ok:
+            _cred_audit("clock-keepalive-ping", "failed", f"{why}; {detail}", account=name)
+            continue
+
+        # Success — stamp the cooldown, audit, then force a usage re-poll so
+        # `five_hour_resets_at` reflects the now-ticking window (caller persists).
+        acct["last_keepalive_ping_ts"] = now_iso()
+        _cred_audit("clock-keepalive-ping", "pinged", f"{why}; {detail}", account=name)
+        try:
+            update_state_with_usage(state, {name: poll_account_usage(name)})
+        except Exception as e:  # noqa: BLE001 — re-poll is a nicety, not required
+            _cred_audit("clock-keepalive-ping", "pinged",
+                        f"re-poll after ping failed ({type(e).__name__}); "
+                        f"next cycle will refresh five_hour_resets_at", account=name)
+        pinged.append(name)
+
+    return pinged
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -10349,6 +10625,34 @@ def _latest_stops_per_session() -> dict[str, str]:
 _TRANSCRIPT_INDEX_CACHE: dict[str, tuple[float, dict]] = {}
 
 
+class _TranscriptIndexData(dict):
+    """Transcript index: the GH #91 by-stem dict[str, Path] (stem -> path,
+    last-seen-wins) PLUS an `.exact` set of (project_dirname, stem) pairs
+    captured in the SAME scan (GH #90/#95).
+
+    Why a dict subclass: every existing caller and test relies on the plain
+    by-stem mapping contract (`idx[stem]`, `idx.get(stem)`, `set(idx)`,
+    `idx == {}`), so the fallback-lookup shape must not change. Subclassing
+    keeps all of that intact while piggybacking the extra set from the same
+    directory walk at no additional syscall cost.
+
+    Why `.exact` exists: after GH #91 removed the per-session glob, the
+    RESIDUAL scaling term in `cus status` (GH #90/#95) was the cwd-first
+    candidate probe in _resolve_transcript — one live `.exists()` stat per
+    UNIQUE session id ever logged. sessions.log is append-only, so status
+    cost grew with total HISTORY (~13.5k unique ids -> ~13.5k stats ->
+    multi-second, 100%-CPU status on the 2026-07-02 incident box) instead of
+    with the transcripts actually on disk. The scan already visits every
+    existing transcript, so "does <cwd-encoded-dir>/<sid>.jsonl exist?" can
+    be answered by set membership at zero syscalls — see the
+    `live_candidate_stat=False` path in _resolve_transcript.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.exact: set[tuple[str, str]] = set()
+
+
 def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     """One-shot {session_id: transcript_path} index of ~/.claude/projects.
 
@@ -10379,15 +10683,26 @@ def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     if hit and now - hit[0] < max_age_seconds:
         return hit[1]
     projects_root = CLAUDE_DIR / "projects"
-    index: dict[str, Path] = {}
+    index = _TranscriptIndexData()
     if projects_root.exists():
         for jsonl in projects_root.glob("*/*.jsonl"):
             index[jsonl.stem] = jsonl
+            # GH #90/#95: record the (project_dirname, stem) pair so bulk
+            # scans can answer the cwd-first existence question by set
+            # membership instead of a per-session-id stat. Same walk, no
+            # extra syscalls — glob already enumerated this entry.
+            index.exact.add((jsonl.parent.name, jsonl.stem))
     _TRANSCRIPT_INDEX_CACHE[key] = (now, index)
     return index
 
 
-def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Path | None:
+def _resolve_transcript(
+    session_id: str,
+    cwd: str,
+    index: dict[str, Path],
+    *,
+    live_candidate_stat: bool = True,
+) -> Path | None:
     """Deterministic cwd-first transcript resolution with an O(1) index
     fallback (GH #91 + review finding 2026-07-02).
 
@@ -10396,11 +10711,49 @@ def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Pa
     by a same-id duplicate from another project dir. Only when that direct
     candidate is absent do we fall back to the prebuilt index (O(1)), never
     to the minutes-long full-tree glob that _find_transcript's fallback runs.
+
+    `live_candidate_stat` (GH #90/#95) selects HOW the cwd-first candidate's
+    existence is checked:
+
+      True (default) — a live Path.exists() stat, exactly the pre-#90 code
+        path. Kept as the default for the swap/orchestration callers
+        (find_live_panes' _validate + step-1.5 loop): those probe a BOUNDED
+        set (live panes x recent entries), so per-call stats are cheap, and
+        freshness matters there — a transcript written milliseconds ago
+        (the GH #23 SessionStart->first-JSONL race) must be seen the moment
+        it lands, because a swap decision hangs on it.
+
+      False — membership in the index's `.exact` set captured by the same
+        scan that built the by-stem fallback map. Used by the BULK scan in
+        find_live_sessions, where the candidate probe runs once per unique
+        session id ever logged and was therefore the history-proportional
+        cost behind the GH #90/#95 status hang. Within one call the index
+        is built milliseconds earlier, so results are identical to the live
+        stat modulo the same in-flight-file races the exists()->stat()
+        sequence already had; across cached calls (daemon cycles sharing
+        the 5s-TTL scan) a transcript CREATED inside the TTL window is
+        seen up to 5s late — the same staleness bound the GH #91 review
+        already accepted for the fallback map, and irrelevant to the
+        one-shot `cus status` process where the cache is always cold.
+
+    A plain-dict index (defensive: tests or callers holding a pre-#90-shape
+    map) has no `.exact` set, so it always gets the live stat regardless of
+    the flag — degraded to the old cost, never to wrong results.
     """
     if cwd:
-        candidate = CLAUDE_DIR / "projects" / cwd.replace("/", "-") / f"{session_id}.jsonl"
-        if candidate.exists():
-            return candidate
+        dirname = cwd.replace("/", "-")
+        if live_candidate_stat or not isinstance(index, _TranscriptIndexData):
+            candidate = CLAUDE_DIR / "projects" / dirname / f"{session_id}.jsonl"
+            if candidate.exists():
+                return candidate
+        elif (dirname, session_id) in index.exact:
+            # Construct the Path only AFTER the membership hit: on the bulk
+            # path this function runs once per unique session id ever logged
+            # and almost all of them miss (~10.6k of 13.5k on the incident
+            # box), so building a 4-segment pathlib object per miss was
+            # itself a measurable chunk of the scan (~µs each x tens of
+            # thousands). A set probe on an interned tuple is ~100x cheaper.
+            return CLAUDE_DIR / "projects" / dirname / f"{session_id}.jsonl"
     return index.get(session_id)
 
 
@@ -10447,11 +10800,29 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
         # never the minutes-long glob that _find_transcript's fallback runs
         # (see _resolve_transcript / _transcript_index for the incident
         # numbers and the duplicate-id correctness note).
-        transcript = _resolve_transcript(sid, e.get("cwd", ""), transcripts)
-        if transcript and transcript.exists():
-            mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
-            if (now - mtime).total_seconds() < 3600:
-                is_live = True
+        #
+        # GH #90/#95: live_candidate_stat=False — this loop runs once per
+        # UNIQUE session id ever logged (append-only sessions.log, ~13.5k on
+        # the incident box), so a live stat here made status cost grow with
+        # history. Resolution now rides entirely on the index built at the
+        # top of this call: zero syscalls per historical id.
+        transcript = _resolve_transcript(
+            sid, e.get("cwd", ""), transcripts, live_candidate_stat=False
+        )
+        if transcript:
+            # Single guarded stat replaces the old exists()+stat() pair:
+            # halves the syscalls for resolved ids (bounded by transcripts
+            # on disk, not by history) AND closes the latent TOCTOU crash
+            # where the file vanished between exists() and stat() — the old
+            # sequence would have raised an unhandled OSError there. A
+            # vanished file now just contributes no liveness signal, which
+            # is exactly what exists()==False meant before.
+            try:
+                mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+                if (now - mtime).total_seconds() < 3600:
+                    is_live = True
+            except OSError:
+                pass
 
         if is_live:
             live.append(LiveSession(
@@ -11039,12 +11410,23 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     now = datetime.now(timezone.utc)
 
     # Group by pane; latest entry overwrites (entries are oldest-first).
+    # GH #90/#95: entries_by_pane keeps the FULL per-pane entry list (same
+    # oldest-first order) for the step-1.5 cmdline-staleness sweep below.
+    # That sweep used to re-scan ALL of `entries` once per live pane —
+    # filtering on pane inside the loop and fromisoformat-parsing every
+    # line's timestamp each time — an O(total_entries x live_panes) pass
+    # over an append-only log (~14.6k lines on the incident box). Grouping
+    # here is one O(total_entries) pass; the sweep then touches only its
+    # own pane's entries. Identical subset, identical order, no semantic
+    # change — pure loop restructure.
     by_pane: dict[str, dict] = {}
+    entries_by_pane: dict[str, list[dict]] = {}
     for e in entries:
         pane = e.get("pane", "")
         if not pane or pane == "no-tmux":
             continue
         by_pane[pane] = e
+        entries_by_pane.setdefault(pane, []).append(e)
 
     # GH #22: count how many panes share each cwd. The newest-mtime
     # fallback (step 3 below) is CWD-wide and can't disambiguate between
@@ -11173,9 +11555,12 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         # uncompetitive (best_mtime stays 0 and any newer-than-1h pe wins).
         if best_mtime > 0 and (now_ts - best_mtime) > active_mtime_window:
             best_mtime = 0.0
-        for pe in entries:
-            if pe.get("pane") != pane:
-                continue
+        # GH #90/#95: iterate only THIS pane's entries (pre-grouped above in
+        # the same pass that built by_pane) instead of re-scanning the whole
+        # log per pane. The old `if pe.get("pane") != pane: continue` filter
+        # is exactly what the grouping applied, so subset and order are
+        # unchanged — this is the O(n x panes) -> O(n) half of the fix.
+        for pe in entries_by_pane.get(pane, ()):
             pe_ts_str = pe.get("ts")
             if not pe_ts_str:
                 continue
@@ -13809,6 +14194,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         for _unstaled in _sweep_unstale_idle_accounts(state, config):
             click.echo(f"  un-staled idle account {_unstaled}: minted a fresh access token via a "
                        f"direct OAuth refresh grant and cleared token_stale (Fix 4)")
+        # clock_keepalive (2026-07-07 operator directive): keep every DORMANT
+        # account's fixed 5h usage window TICKING with a cheap "hi" ping, so the
+        # whole fleet cycles through 5h windows continuously and resets on a
+        # rolling basis (always-fresh capacity on tap). Cooldown-bounded, skips
+        # live/disabled/backoff/relogin accounts, and force-re-polls each pinged
+        # account so five_hour_resets_at reflects the now-running clock. Gated by
+        # clock_keepalive.enabled (default on); a failed ping only logs.
+        for _pinged in _sweep_clock_keepalive(state, config):
+            click.echo(f"  clock-keepalive: pinged dormant account {_pinged} to start a fresh "
+                       f"5h window (keeping its clock ticking for rolling capacity)")
         # GH #59: countdown fallback — for any account whose 5h reset elapsed
         # without a fresh poll this cycle, trust the countdown and infer the
         # window reset (5h→0) BEFORE the ladder-reset + decision below, so both

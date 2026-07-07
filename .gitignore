@@ -1,6 +1,24 @@
-.a5c/
+# --- cus working data (safety: never commit real credentials/state) ---
+# cus stores account snapshots + state under ~/claude-accounts/ (outside the
+# repo), but guard against a stray copy or symlink landing in-tree.
+claude-accounts/
+*.credentials.json
+.credentials.json.bak.*
+SOS.md
+
+# --- Python ---
 *.pyc
 __pycache__/
 .venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# --- Editors / OS ---
 *.swp
 .DS_Store
+.idea/
+.vscode/
+
+# --- Agent scaffolding (not for the public tree) ---
+.a5c/
