@@ -3282,6 +3282,13 @@ def _unstale_account_snapshot(account: str, state: dict, config: dict | None = N
 
     verdict, tok = _oauth_refresh_grant(rt)
     if verdict != "alive" or not isinstance(tok, dict):
+        # A definitive invalid_grant is the "dead snapshot" signal (2026-07-07 merkos
+        # incident): flag it on the account so the swap-target picker excludes it and
+        # the SOS surfaces it (no extra network call — this probe already ran). An
+        # "unknown" (network/endpoint) verdict is NOT recorded as dead — that would be
+        # a transient masquerading as a death certificate.
+        if verdict == "dead":
+            acct["snapshot_refresh_dead"] = True
         _cred_audit("unstale-refresh", "failed",
                     f"refresh grant {verdict} (dead ⇒ browser relogin; unknown ⇒ retry later)",
                     account=account, token_fp=_audit_token_fp(creds))
@@ -3311,8 +3318,11 @@ def _unstale_account_snapshot(account: str, state: dict, config: dict | None = N
         return False
 
     # Clear the stale flag in state (caller saves). token_expired stays cleared too
-    # — a working refresh grant proves the account is reachable.
+    # — a working refresh grant proves the account is reachable. Clear any prior
+    # dead-snapshot flag too: the grant just proved the snapshot's refresh token is
+    # ALIVE (e.g. after a relogin restored it), so it must no longer be excluded.
     acct.pop("token_stale", None)
+    acct.pop("snapshot_refresh_dead", None)
     acct["token_expired"] = False
     _cred_audit("unstale-refresh", "refreshed",
                 "minted fresh access token via direct OAuth grant; cleared token_stale",
@@ -4080,6 +4090,31 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # account (Condition 10.5) pointing the operator at `cus relogin`.
     candidates = [(name, acct) for name, acct in candidates
                   if not account_canonical_store_poisoned(name)[0]]
+    if not candidates:
+        return None
+
+    # ---- Dead-snapshot exclusion (2026-07-07 merkos incident, this PR) ----
+    # HARD filter, NO fallback (mirrors the poisoned-store exclusion above): never
+    # select an account whose canonical snapshot is DEAD (its OAuth refresh grant
+    # returns invalid_grant — flagged `snapshot_refresh_dead` by the idle-account
+    # un-stale sweep) AND that has NO free login family to seed a lane from instead.
+    # Installing such an account's snapshot blanks the target mount on Claude Code's
+    # first refresh — the merkos blank-on-install that logged chats1a out.
+    #
+    # Why the `has_free_login_family` carve-out: an account that is dead-snapshot BUT
+    # has a claimable family is STILL a valid target — the swap install-point seeds
+    # the lane from that family (CRED-AUDIT op=snapshot-dead-family-fallback) instead
+    # of the dead snapshot, so the account can host the new lane after all. Only when
+    # there's ALSO no family does the account genuinely become un-hostable.
+    #
+    # We read the state FLAG here (set by the sweep's refresh-grant probe), NOT a
+    # fresh probe: the picker runs every cycle and must stay cheap + side-effect-free
+    # (the probe rotates a token). The swap install-point does the DEFINITIVE re-probe
+    # (`_account_snapshot_dead`) — decision layer optimistic, execution layer
+    # authoritative, the same split as has_free_login_family / claim_verified_login_family.
+    # If this empties the pool the picker returns None and the dead-snapshot SOS fires.
+    candidates = [(name, acct) for name, acct in candidates
+                  if not (acct.get("snapshot_refresh_dead") and not has_free_login_family(name, state))]
     if not candidates:
         return None
 
@@ -5735,6 +5770,65 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 f"Provision another: `cus login-mount {target_name}`.")
     if install_src is None:
         install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # ---- 2026-07-07 dead-snapshot family-seed (merkos incident) ----
+    # At this point, if neither the claimed-pool-family block above nor
+    # swap_install_source picked a distinct login family, install_src is the account
+    # SNAPSHOT (target_creds) — the default copy path. That snapshot can be DEAD: its
+    # refresh token fails the OAuth refresh grant with invalid_grant even though the
+    # account is perfectly usable through a live login family. merkos was exactly this
+    # (the un-stale sweep logs `op=unstale-refresh account=merkos decision=failed
+    # reason="refresh grant dead"` while lane tabby-2 ran on merkos via a valid
+    # family). Installing the dead snapshot blanks the mount on Claude Code's first
+    # refresh — the "not logged in" that blanked chats1a when it was swapped onto
+    # merkos. The #141 blank-SHAPE guards below do NOT catch it: a dead snapshot can
+    # be well-shaped (an expired-but-present access token, a positive-but-past
+    # expiresAt) yet still be dead.
+    #
+    # So: when we're about to install the snapshot and it probes DEAD, seed the lane
+    # from a VALID login family instead — claim a FREE family (its own distinct
+    # family, #104-safe, recorded as the slot's login_family lease below, exactly the
+    # supported rescue path). claim_verified_login_family (#127) proves each family
+    # alive via the refresh grant, retires dead stores, and persists the rotation
+    # into the store this install copies from. If NO valid family can be claimed
+    # (snapshot dead AND pool empty/all-dead), REFUSE rather than blank the mount:
+    # raise (a clean no-op — live_creds_path is still untouched until the atomic_copy
+    # below), which _execute_slot_moves logs as a failed move; the picker's dead-
+    # snapshot exclusion keeps it from being re-picked and the SOS points at relogin.
+    # Scoped to the SLOT + gate-on path (claiming/leasing a family is only meaningful
+    # for a lane in the pool model); a gate-off dead snapshot still hits the #141
+    # blank guards / picker exclusion. Degrade-to-safe: refusing a swap never logs
+    # anyone out; installing a dead snapshot does.
+    if (claimed_family is None and not used_independent
+            and slot is not None and independent_logins_enabled(config)
+            and _account_snapshot_dead(target_name, config)):
+        _seed_fam = claim_verified_login_family(target_name, state, config)
+        if _seed_fam is not None:
+            claimed_family = _seed_fam
+            install_src = login_family_creds_path(target_name, _seed_fam)
+            used_independent = True
+            try:
+                _seed_fp = _audit_token_fp(read_json(install_src))
+            except (json.JSONDecodeError, OSError):
+                _seed_fp = "unreadable"
+            _cred_audit("snapshot-dead-family-fallback", "seeded-from-family",
+                        "account snapshot is DEAD (refresh invalid_grant) — seeded the lane from a "
+                        "valid login family instead of blanking the mount (merkos incident)",
+                        slot=slot, mount=slot, account=target_name,
+                        login_family=f"{target_name}/{_seed_fam}", token_fp=_seed_fp)
+            click.echo(f"creds-install: '{target_name}' snapshot is DEAD — seeded {slot} from valid "
+                       f"login family {target_name}/{_seed_fam} instead (no dead-snapshot blank)")
+        else:
+            _cred_audit("snapshot-dead-family-fallback", "refused-no-source",
+                        "account snapshot is DEAD and no valid login family could be claimed — "
+                        "refusing to install dead creds (would blank the mount)",
+                        slot=slot, mount=slot, account=target_name)
+            raise RuntimeError(
+                f"refusing to install '{target_name}' onto lane {slot}: its canonical snapshot "
+                f"credentials are DEAD (the OAuth refresh grant returns invalid_grant) and no valid "
+                f"login family remains to seed from — installing the dead snapshot would blank the mount "
+                f"and log the session out (the 2026-07-07 merkos dead-snapshot incident, which blanked "
+                f"chats1a). Re-login the account first: `cus relogin {target_name}`. Lane left on its "
+                f"prior account (no creds written).")
     # ---- 2026-07-07 divergence-logout guard (GH #104 lane invariant) ----
     # INVARIANT: a SLOT swap that lands on an account ALSO held by the shared
     # ~/.claude mount or by another live lane MUST run a DISTINCT login family —
@@ -7734,6 +7828,14 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct.pop("rate_limited", None)
         acct.pop("token_stale", None)
         acct["token_expired"] = False
+        # A SUCCESSFUL poll of an INACTIVE account read its SNAPSHOT's access token
+        # (poll_account_usage → _read_access_token reads storage for inactive accts),
+        # so the snapshot authenticates and is NOT refresh-dead — clear a stale flag
+        # (e.g. after a relogin restored the snapshot). The ACTIVE account is polled
+        # from the LIVE creds, whose success says nothing about the snapshot (merkos:
+        # live family fine, snapshot dead), so we must NOT clear it for the active one.
+        if name != state.get("active"):
+            acct.pop("snapshot_refresh_dead", None)
         update_backoff(acct, success=True, config=config)
         # Estimator (C, 2026-06-23): measure per-window burn rate (%/min) from the
         # gap between the PRIOR poll and this one, before the old values are
@@ -8161,6 +8263,12 @@ _LANE_HEAL_HISTORY: dict[tuple[str, str], list[float]] = {}
 # _UNSTALE_ATTEMPT_MS: account -> last un-stale refresh-grant attempt (Fix 4,
 #   2026-07-07), the poll-burnout backoff clock for the idle-account un-stale sweep.
 _UNSTALE_ATTEMPT_MS: dict[str, float] = {}
+# _SNAPSHOT_DEAD_PROBE: account -> (wall-clock seconds of the last probe, is-dead bool),
+#   the cooldown cache for `_account_snapshot_dead` (2026-07-07 merkos dead-snapshot
+#   incident). That probe is a network round-trip that ROTATES the snapshot's refresh
+#   token on success, so — like the un-stale sweep — it must run at most once per
+#   `unstale_cooldown_minutes` per account (poll-burnout backoff). Cleared below.
+_SNAPSHOT_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
 
 
 def _reset_blank_tracking() -> None:
@@ -8170,6 +8278,119 @@ def _reset_blank_tracking() -> None:
     _PREEMPT_ATTEMPT_MS.clear()
     _LANE_HEAL_HISTORY.clear()
     _UNSTALE_ATTEMPT_MS.clear()
+    _SNAPSHOT_DEAD_PROBE.clear()
+
+
+def _account_snapshot_dead(account: str, config: dict | None = None, *, force: bool = False) -> bool:
+    """True iff account-<X>'s CANONICAL snapshot (.credentials.json) cannot
+    currently authenticate — the "dead snapshot" the 2026-07-07 merkos incident
+    exposed.
+
+    THE INCIDENT: merkos's canonical snapshot held a DEAD refresh token (the
+    OAuth refresh grant returns invalid_grant — see the un-stale sweep's
+    `CRED-AUDIT op=unstale-refresh account=merkos decision=failed
+    reason="refresh grant dead"`), yet merkos was perfectly usable through a live
+    login FAMILY (lane tabby-2 ran on it fine). The danger is the SWAP install-
+    point: installing that dead snapshot into a NEW lane mount blanks the mount
+    ("not logged in") the moment Claude Code attempts its first token refresh —
+    exactly what blanked chats1a when it was swapped onto merkos.
+
+    WHY `_live_mount_creds_invalid` DOESN'T CATCH THIS: that predicate only flags
+    the blank-SHAPED signature (empty accessToken / expiresAt<=0). A dead snapshot
+    can be perfectly well-SHAPED — a real-looking-but-expired access token, a
+    positive-but-past expiresAt — and still be dead because its refresh branch was
+    rotated away elsewhere. Shape alone can't tell a dead branch from a live one;
+    only the refresh grant can (the same lesson as #127 / classify_live_creds_owner).
+
+    Verdict:
+      * access token currently VALID (non-blank, within expiry) → NOT dead: the
+        snapshot authenticates right now, so no (token-rotating) probe is needed.
+        This cheap path keeps the common healthy-account case network-free.
+      * no refresh token AND no valid access token → dead (nothing to mint from).
+      * else probe the refresh token via `_oauth_refresh_grant`:
+          - "alive"   → PERSIST the rotated tokens into the snapshot (the grant is
+                        single-use — #104 — so the fresh pair MUST land on disk or
+                        the family is lost) and return NOT dead. Mirrors the persist
+                        block in `_unstale_account_snapshot`.
+          - "dead"    → invalid_grant → return dead.
+          - "unknown" → network/endpoint drift → FAIL OPEN (return NOT dead): a
+                        transient must never turn a working account into a refused
+                        swap. The #141 blank-shape guards still backstop an actually
+                        blank install, so worst case is exactly today's behavior.
+
+    Cooldown-cached in `_SNAPSHOT_DEAD_PROBE` (poll-burnout backoff, bypassed by
+    `force`). Never raises into the caller."""
+    snap = account_creds_path(account)
+    if not snap.exists():
+        # Missing snapshot is owned by other guards (the `cus init` check in
+        # _execute_swap_locked; the #141 blank-shape guards). Not a dead-refresh case.
+        return False
+    try:
+        creds = read_json(snap)
+    except (json.JSONDecodeError, OSError):
+        # Unreadable snapshot: the #141 install-point guard already refuses it as
+        # blank. Not our (dead-refresh) call to make.
+        return False
+    # Cheap path: a currently-valid access token means the snapshot authenticates
+    # right now — definitively not dead, and no token-rotating probe needed. The 30s
+    # grace mirrors poll_account_usage so we don't probe a token about to expire.
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    access0 = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    exp = _creds_expires_at(creds)
+    now_ms = int(time.time() * 1000)
+    if isinstance(access0, str) and access0.strip() and exp is not None and int(exp) > now_ms - 30_000:
+        return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # No refresh token to mint from AND no valid access token above → unusable.
+        return True
+    cfg = config if config is not None else load_config()
+    cooldown_min = cfg.get("token_self_refresh", {}).get("unstale_cooldown_minutes", 10)
+    now = time.time()
+    if not force:
+        cached = _SNAPSHOT_DEAD_PROBE.get(account)
+        if cached is not None and (now - cached[0]) < cooldown_min * 60:
+            return cached[1]
+    verdict, tok = _oauth_refresh_grant(rt)
+    if verdict == "alive" and isinstance(tok, dict):
+        # Persist the rotation BEFORE returning (mirrors _unstale_account_snapshot):
+        # after a successful grant the snapshot's OLD refresh token is a dead branch
+        # (single-use rotation, #104), so the fresh pair must land on disk or we'd
+        # lose the family. Whole assembly is guarded so a malformed grant response
+        # can never crash a swap.
+        try:
+            access = tok.get("access_token")
+            if isinstance(access, str) and access:
+                new_oauth = dict(creds.get("claudeAiOauth") or {})
+                new_oauth["accessToken"] = access
+                new_oauth["refreshToken"] = tok.get("refresh_token") or rt
+                expires_in = tok.get("expires_in")
+                if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+                    new_oauth["expiresAt"] = int((time.time() + float(expires_in)) * 1000)
+                new_creds = dict(creds)
+                new_creds["claudeAiOauth"] = new_oauth
+                backup_credentials_file(snap)
+                write_json(snap, new_creds, mode=0o600)
+                _cred_audit("snapshot-dead-probe", "refreshed",
+                            "snapshot access token was expired but its refresh grant is ALIVE — "
+                            "minted+persisted fresh tokens; snapshot is usable",
+                            account=account, token_fp=_audit_token_fp(new_creds),
+                            extra=f"new_expiry={_expiry_repr(new_creds)}")
+        except (OSError, TypeError, ValueError):
+            pass  # persist failed; fall through — the grant WAS alive, so not dead
+        _SNAPSHOT_DEAD_PROBE[account] = (now, False)
+        return False
+    if verdict == "dead":
+        _SNAPSHOT_DEAD_PROBE[account] = (now, True)
+        _cred_audit("snapshot-dead-probe", "detected",
+                    "snapshot refresh grant returned invalid_grant — canonical creds are DEAD "
+                    "(installing them would blank the mount)",
+                    account=account, token_fp=_audit_token_fp(creds))
+        return True
+    # "unknown" → fail open. Cache the not-dead verdict for the cooldown so a flapping
+    # endpoint isn't hammered, but never let a transient refuse a swap.
+    _SNAPSHOT_DEAD_PROBE[account] = (now, False)
+    return False
 
 
 def _lane_lastvalid_path(mount_creds: Path) -> Path:
@@ -8329,7 +8550,20 @@ def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Pat
                 return shadow
         except (json.JSONDecodeError, OSError):
             pass
-    return _newest_usable_creds_source(account)
+    # Fall through to the account's newest usable snapshot/backup — UNLESS the
+    # snapshot is DEAD (its refresh grant returns invalid_grant). 2026-07-07 merkos
+    # incident: `_newest_usable_creds_source` only rejects blank-SHAPED creds
+    # (`_live_mount_creds_invalid`), so a well-shaped-but-dead snapshot would be
+    # returned here and re-blank the mount on Claude Code's first refresh — a
+    # heal→blank→heal loop (which the Fix 2 stuck-session detector would then flag).
+    # Dropping the dead snapshot from the plain-lane heal chain means such a lane
+    # escalates straight to the URGENT relogin SOS (a human is genuinely needed)
+    # instead of looping. The pooled-lane branch above already never touches the
+    # snapshot (#176), so this closes the one remaining dead-snapshot heal path.
+    source = _newest_usable_creds_source(account)
+    if source is not None and source == account_creds_path(account) and _account_snapshot_dead(account, config):
+        return None
+    return source
 
 
 def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
@@ -9790,6 +10024,37 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                     f"Repair with a browser re-login: `cus relogin {acct_name}` then `cus poll`."),
             affected=acct_name,
         ))
+
+    # Condition 10.6 (2026-07-07 merkos incident, this PR): DEAD SNAPSHOT with no
+    # valid login family. The account's canonical snapshot refresh token is dead
+    # (invalid_grant — flagged `snapshot_refresh_dead` by the un-stale sweep) AND it
+    # has no free login family to seed a NEW lane from. Such an account can still
+    # serve an EXISTING lane that already runs a live family (that lane is never
+    # disturbed) — but it can no longer HOST a new lane: the swap install-point
+    # refuses it (would blank the mount) and the picker excludes it. Surface it so
+    # the operator reloginss before the account silently drops out of rotation. An
+    # account that is dead-snapshot but HAS a free family is deliberately NOT alarmed
+    # here — the install-point seeds new lanes from the family, so it's still usable.
+    for acct_name, acct in state.get("accounts", {}).items():
+        if not isinstance(acct, dict):
+            continue
+        if acct.get("snapshot_refresh_dead") and not has_free_login_family(acct_name, state):
+            out.append(SOSCondition(
+                severity="urgent",
+                summary=(f"'{acct_name}' snapshot creds are dead and no valid login family remains — "
+                         f"relogin required before it can host new lanes"),
+                action=(f"account-{acct_name}/.credentials.json's refresh token is dead (the OAuth "
+                        f"refresh grant returns invalid_grant) and '{acct_name}' has no free login "
+                        f"family to seed a lane from, so cus has excluded it as a swap target and will "
+                        f"refuse to install it onto a new lane — installing the dead snapshot would "
+                        f"blank the mount (the 2026-07-07 merkos dead-snapshot incident, which blanked "
+                        f"chats1a). Any existing lane already running a live family keeps working. "
+                        f"Restore it with a browser re-login:\n"
+                        f"      cus relogin {acct_name}   # then: cus poll\n"
+                        f"    or add another independent login family:\n"
+                        f"      cus login-mount {acct_name}"),
+                affected=acct_name,
+            ))
     if expired:
         out.append(SOSCondition(
             severity="warning",
