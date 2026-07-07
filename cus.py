@@ -2514,6 +2514,9 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
                     "detail": "live not fresher than family store (periodic no-op)"}
         backup_credentials_file(fam_path)
         atomic_write_bytes(fam_path, json.dumps(live_creds, indent=2).encode(), mode=0o600)
+        _cred_audit("saveback", "wrote", "pooled family store (#109)",
+                    slot=slot_name, mount=mount.name, account=expected_account,
+                    login_family=f"{lease[0]}/{lease[1]}", token_fp=_audit_token_fp(live_creds))
         return {"action": "saved", "account": expected_account, "family": lease[1],
                 "detail": f"pooled login {lease[0]}/{lease[1]} (#109 pool)"}
 
@@ -2546,6 +2549,12 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         if not ok:
             sidecar = quarantine_rejected_canonical_write(
                 snap, json.dumps(live_creds, indent=2).encode(), why)
+            _cred_audit("identity-refuse", "refused-identity", why,
+                        slot=slot_name, mount=mount.name, account=save_to,
+                        incoming_identity=mount_ident, emit_identity=True,
+                        existing_identity=account_identity_anchor(save_to)[0],
+                        token_fp=_audit_token_fp(live_creds),
+                        extra="quarantined=" + sidecar.name)
             return {"action": "refused_wrong_account", "account": save_to,
                     "detail": f"drifted mount, unknown lineage — {why}; quarantined to {sidecar.name}"}
     # GH #77: never let an older live file clobber a fresher snapshot (e.g.
@@ -2557,12 +2566,23 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         except (json.JSONDecodeError, OSError):
             snap_exp = None
         if snap_exp is not None and live_exp is not None and snap_exp > live_exp:
+            _cred_audit("freshness-skip", "skipped-freshness", "snapshot fresher than live (GH #77)",
+                        slot=slot_name, mount=mount.name, account=save_to,
+                        token_fp=_audit_token_fp(live_creds))
             return {"action": "skipped", "account": save_to, "detail": "snapshot fresher than live (GH #77)"}
         if only_if_fresher and not (snap_exp is not None and live_exp is not None and live_exp > snap_exp):
             return {"action": "skipped", "account": save_to, "detail": "live not fresher than snapshot (periodic no-op)"}
     backup_credentials_file(snap)
     atomic_write_bytes(snap, json.dumps(live_creds, indent=2).encode(), mode=0o600)
     action = "saved_to_owner" if verdict == "foreign" else "saved"
+    # Audit the canonical-store write: incoming = the mount's own identity, existing
+    # = save_to's trusted anchor. In a clobber these disagree — the whole reason the
+    # line records both. `verdict` (expected/foreign/unknown) explains the routing.
+    _cred_audit("saveback", "wrote", f"snapshot save-back (verdict={verdict})",
+                slot=slot_name, mount=mount.name, account=save_to,
+                incoming_identity=_dir_identity_of_mount(mount), emit_identity=True,
+                existing_identity=account_identity_anchor(save_to)[0],
+                token_fp=_audit_token_fp(live_creds))
     return {"action": action, "account": save_to, "detail": detail}
 
 
@@ -4362,6 +4382,20 @@ def _dir_identity(account_name: str) -> dict:
         return {}
 
 
+def _dir_identity_of_mount(mount: Path) -> dict:
+    """Identity facets from a live MOUNT's .claude.json (a slot dir or the shared
+    ~/.claude). Used only by the CRED-AUDIT lines to record what identity the
+    incoming creds actually carry — a foreign identity here is the clobber signal.
+    Best-effort: an unreadable/absent mount file returns {} (rendered `none`)."""
+    p = mount_claude_json_path(mount)
+    if not p.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(p))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Wrong-account canonical-store clobber guard (2026-07-06 incident)
 #
@@ -4545,6 +4579,136 @@ def quarantine_rejected_canonical_write(dest_path: Path, incoming_bytes: bytes, 
     except OSError:
         pass
     return sidecar
+
+
+# ---------------------------------------------------------------------------
+# CRED-AUDIT — one greppable structured line per credential-store write/refuse
+#
+# WHY THIS EXISTS (the account-rayi1 clobber, verified from daemon.log): two
+# lanes shared ONE OAuth login family (divergence), so a lane's live mount
+# carried a FOREIGN account's rotated token, and a routine save-back wrote that
+# foreign token+identity into the WRONG account's canonical .claude.json /
+# .credentials.json. The GH #77 freshness guard passed it (the foreign token was
+# genuinely newer); only #172's identity guard now refuses it. daemon.log DID
+# capture enough to reconstruct the incident — but only across scattered,
+# differently-shaped human lines. The next incident should be ONE grep away.
+#
+# THE CONTRACT: every place that WRITES or REFUSES a credential/identity store
+# emits exactly one `CRED-AUDIT ...` line — same stream as the human-readable
+# daemon.log lines (click.echo, captured by systemd), ALONGSIDE (never instead
+# of) those lines. Grep `CRED-AUDIT` to see every store mutation the daemon ever
+# attempted; grep `CRED-AUDIT decision=refused` / `op=divergence-detected` to
+# see the near-misses and the preconditions that set them up.
+#
+# SCHEMA (fields are space-separated key=value; only non-empty fields appear,
+# but op and decision are always present so the line is stable to grep):
+#   op=            saveback | swap-install | family-claim | refresh |
+#                  freshness-skip | identity-refuse | family-collision-refuse |
+#                  divergence-detected
+#   slot= / mount= the SOURCE mount the creds came from (a lane slot dir or the
+#                  shared ~/.claude mount)
+#   account=       the TARGET store being written / refused
+#   incoming_identity=  uuid(short)/email of the creds about to be written
+#   existing_identity=  uuid(short)/email currently in the target store's anchor
+#                  — a mismatch between these two IS the clobber, visible at a glance
+#   login_family=  the login family involved (pool lease / claimed family)
+#   shared=        true/false — is this family already live on ANOTHER mount
+#                  (the divergence signal that precedes a clobber)
+#   token_fp=      short non-reversible fingerprint of the refresh token (never
+#                  the raw token) so two families can be told apart in the log
+#   decision=      wrote | skipped-freshness | refused-identity |
+#                  refused-collision | quarantined | detected
+#   reason=        short human phrase (quoted) explaining the decision
+#
+# NEVER log raw access/refresh token bytes — only identity facets (uuid/email)
+# and the short refresh-token fingerprint the rest of the module already uses.
+# ---------------------------------------------------------------------------
+
+CRED_AUDIT_PREFIX = "CRED-AUDIT"
+
+
+def _fmt_audit_identity(ident: dict | None) -> str:
+    """Render identity facets compactly for a CRED-AUDIT line as `uuid(short)/email`.
+
+    Only the account-identity facets (accountUuid + emailAddress) — never tokens.
+    A short uuid prefix keeps the line greppable without dumping the full 36-char
+    id; the email disambiguates. Empty/absent identity renders as `none` so the
+    field is always present and stable to grep."""
+    if not ident:
+        return "none"
+    uuid = ident.get("accountUuid")
+    email = ident.get("emailAddress")
+    short = uuid[:8] if isinstance(uuid, str) and uuid else "?"
+    return f"{short}/{email or '?'}"
+
+
+def _audit_token_fp(creds: Any) -> str:
+    """Short, non-reversible refresh-token fingerprint for a CRED-AUDIT line.
+
+    Reuses `_refresh_fingerprint` (the same sha256-prefix primitive #109 uses to
+    tell login families apart) so the audit log and the divergence detectors
+    speak the same fingerprint. Returns `none` when there is no refresh token to
+    fingerprint (blank/logout-shaped creds). NEVER emits the raw token."""
+    try:
+        rt = _credential_refresh_token(creds)
+    except (AttributeError, TypeError):
+        rt = None
+    return _refresh_fingerprint(rt) if rt else "none"
+
+
+def _cred_audit(op: str, decision: str, reason: str = "", *,
+                slot: str | None = None, mount: str | None = None,
+                account: str | None = None,
+                incoming_identity: dict | None = None,
+                existing_identity: dict | None = None,
+                emit_identity: bool = False,
+                login_family: str | None = None,
+                shared: bool | None = None,
+                token_fp: str | None = None,
+                extra: str | None = None) -> None:
+    """Emit ONE structured CRED-AUDIT line describing a credential-store
+    write/refuse/detection. See the schema block above.
+
+    Purely additive observability: this NEVER changes control flow and MUST
+    NEVER raise into its caller — a swap/save-back must not fail because a log
+    line couldn't be formatted, so the whole body is wrapped defensively. Uses
+    the same click.echo stream as the neighbouring human-readable daemon.log
+    lines (do not invent a new file); the human line stays, this rides alongside.
+
+    emit_identity=True forces the incoming/existing identity fields to appear
+    even when empty (rendered `none`) — used at write/refuse points where the
+    identity comparison is the load-bearing evidence. Detection lines (which name
+    mounts + a shared family instead of a single identity pair) leave it False.
+    """
+    try:
+        parts = [f"{CRED_AUDIT_PREFIX} op={op}"]
+        if slot:
+            parts.append(f"slot={slot}")
+        if mount:
+            parts.append(f"mount={mount}")
+        if account:
+            parts.append(f"account={account}")
+        if emit_identity or incoming_identity is not None:
+            parts.append(f"incoming_identity={_fmt_audit_identity(incoming_identity)}")
+        if emit_identity or existing_identity is not None:
+            parts.append(f"existing_identity={_fmt_audit_identity(existing_identity)}")
+        if login_family:
+            parts.append(f"login_family={login_family}")
+        if shared is not None:
+            parts.append(f"shared={'true' if shared else 'false'}")
+        if token_fp:
+            parts.append(f"token_fp={token_fp}")
+        if extra:
+            parts.append(extra)
+        parts.append(f"decision={decision}")
+        if reason:
+            # Quote + cap the reason so it stays one greppable field even though
+            # guard reasons embed dict reprs / '!=' with internal spaces.
+            r = reason if len(reason) <= 240 else reason[:237] + "..."
+            parts.append(f'reason="{r}"')
+        click.echo(" ".join(parts))
+    except Exception:  # noqa: BLE001 — observability must never break a swap
+        pass
 
 
 def _recover_pending_swap() -> None:
@@ -5079,6 +5243,11 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                    f"The live mount has DRIFTED to another account; restart that session. If '{current}'s "
                    f"own canonical store looks wrong, re-login it: `cus relogin {current}`.")
             click.echo(f"creds-save-back: {msg}")
+            _cred_audit("identity-refuse", "refused-identity", _guard_reason,
+                        slot=slot, mount=(slot or "shared-mount"), account=current,
+                        incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                        existing_identity=account_identity_anchor(current)[0],
+                        extra="quarantined=" + sidecar.name)
             try:
                 append_inbox("wrong-account-guard",
                              f"identity save-back refused for '{current}' (drifted live mount)", msg)
@@ -5092,6 +5261,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 existing = {}
             existing.update(current_identity)
             write_json(current_dir / ".claude.json", existing)
+            # Canonical identity write accepted — record the incoming vs anchor
+            # identity so a future clobber (incoming != existing) is one grep away.
+            _cred_audit("saveback", "wrote", "identity save-back to canonical .claude.json",
+                        slot=slot, mount=(slot or "shared-mount"), account=current,
+                        incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                        existing_identity=account_identity_anchor(current)[0])
 
     # ---- GH #3: refresh-time drift detection on the credentials save-back ----
     # The live file is read into memory EXACTLY ONCE and those same bytes are
@@ -5143,8 +5318,14 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         if status_word == "skipped-stale":
             click.echo(f"creds-save-back: SKIPPED — stored family {current}/{_fam} is newer than "
                        f"the live file; kept the store entry (GH #77-style guard)")
+            _cred_audit("freshness-skip", "skipped-freshness", "family store fresher than live (#77)",
+                        slot=slot, account=current, login_family=f"{current}/{_fam}",
+                        token_fp=_audit_token_fp(live_creds))
         else:
             click.echo(f"creds-save-back: saved {slot} live tokens back to pooled login {current}/{_fam} (#109 pool)")
+            _cred_audit("saveback", "wrote", "pooled family store (#109)",
+                        slot=slot, account=current, login_family=f"{current}/{_fam}",
+                        token_fp=_audit_token_fp(live_creds))
     elif (live_creds is not None and slot is not None and current is not None
             and independent_logins_enabled(config) and has_independent_login(current, slot)):
         # Legacy per-(slot, account) store (superseded by the pool; retained
@@ -5153,8 +5334,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         if status_word == "skipped-stale":
             click.echo(f"creds-save-back: SKIPPED — stored login for ({slot}, {current}) is newer "
                        f"than the live file; kept the store entry (GH #77-style guard)")
+            _cred_audit("freshness-skip", "skipped-freshness", "legacy per-slot store fresher than live (#77)",
+                        slot=slot, account=current, token_fp=_audit_token_fp(live_creds))
         else:
             click.echo(f"creds-save-back: saved ({slot}, {current}) independent login back to its store entry (GH #109)")
+            _cred_audit("saveback", "wrote", "legacy per-slot independent login store (#109)",
+                        slot=slot, account=current, token_fp=_audit_token_fp(live_creds))
     elif live_creds is not None:
         # live_creds is only populated when current is not None (read a few lines
         # up), which in turn guarantees current_dir is a real path — assert it so
@@ -5198,6 +5383,10 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                        f"(If '{current}' polls as token_expired, run `cus relogin {current} --finish` "
                        f"before swapping back, or just swap to it — the snapshot is the fresh copy.)")
                 click.echo(f"creds-save-back: {msg}")
+                _cred_audit("freshness-skip", "skipped-freshness",
+                            f"snapshot fresher than live (#77): snap {int(snap_exp)} > live {int(live_exp)}",
+                            slot=slot, mount=(slot or "shared-mount"), account=current,
+                            token_fp=_audit_token_fp(live_creds))
                 try:
                     append_inbox("freshness-guard", f"save-back skipped — '{current}' snapshot fresher than live", msg)
                 except OSError:
@@ -5218,6 +5407,13 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                        f"was refused as foreign, so these rotation-shaped tokens are not trustworthy as "
                        f"'{current}'s. Kept the snapshot; quarantined to {sidecar.name}.")
                 click.echo(f"creds-save-back: {msg}")
+                _cred_audit("identity-refuse", "refused-identity",
+                            "drifted mount, unknown lineage — foreign identity refused",
+                            slot=slot, mount=(slot or "shared-mount"), account=current,
+                            incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                            existing_identity=account_identity_anchor(current)[0],
+                            token_fp=_audit_token_fp(live_creds),
+                            extra="quarantined=" + sidecar.name)
                 try:
                     append_inbox("wrong-account-guard",
                                  f"token save-back refused for '{current}' (drifted live mount)", msg)
@@ -5232,6 +5428,15 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 # token is recoverable via `cus restore-creds`.
                 backup_credentials_file(current_dir / ".credentials.json")
                 atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+                # Canonical credentials write accepted — incoming = the live mount's
+                # identity, existing = current's anchor. In the rayi1 clobber these
+                # disagreed while a #77-fresher foreign token slipped through; logging
+                # both here makes that exact shape one grep away.
+                _cred_audit("saveback", "wrote", f"snapshot credentials save-back (verdict={verdict})",
+                            slot=slot, mount=(slot or "shared-mount"), account=current,
+                            incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                            existing_identity=account_identity_anchor(current)[0],
+                            token_fp=_audit_token_fp(live_creds))
         elif verdict == "foreign":
             # THE GH #3 case: a drifted pane's refresh overwrote the live file
             # with a different account's tokens. Two actions:
@@ -5247,6 +5452,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             backup_credentials_file(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json")
             atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
                                live_creds_bytes, mode=0o600)
+            # Same-lineage owner-heal (GH #3): tokens routed to their TRUE owner,
+            # not `current`. account=owner records where they actually landed.
+            _cred_audit("saveback", "wrote", "GH#3 drift — routed foreign tokens to true owner",
+                        slot=slot, mount=(slot or "shared-mount"), account=owner,
+                        existing_identity=(account_identity_anchor(owner)[0] if owner else None),
+                        emit_identity=True, token_fp=_audit_token_fp(live_creds))
             msg = (f"DRIFT DETECTED at swap ({current} -> {target_name}): {detail}. "
                    f"Skipped save-back into '{current}' snapshot (kept its last-known-good tokens); "
                    f"routed live tokens to their true owner '{owner}' instead.")
@@ -5364,6 +5575,17 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     if (slot is not None and independent_logins_enabled(config)
             and _account_held_by_other_live_mount(state, target_name, slot, config)
             and _live_family_would_collide(target_name, install_src, slot, state, config)):
+        # The refusal that prevents the divergence-logout: this install source's
+        # token family is already live on another mount of `target_name`. shared=true
+        # is the whole reason we refuse; token_fp names the colliding family.
+        try:
+            _collide_fp = _audit_token_fp(read_json(install_src))
+        except (json.JSONDecodeError, OSError):
+            _collide_fp = "unreadable"
+        _cred_audit("family-collision-refuse", "refused-collision",
+                    "install source shares a live family on another mount (#104)",
+                    slot=slot, account=target_name, login_family=(claimed_family or "legacy/snapshot"),
+                    shared=True, token_fp=_collide_fp)
         raise RuntimeError(
             f"refusing to install '{target_name}' onto lane {slot}: the credentials about to be "
             f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
@@ -5396,6 +5618,18 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
             f"backup (`cus restore-creds {target_name}`).")
     atomic_copy(install_src, live_creds_path, mode=0o600)
+    # THE install-point: the target account's creds are now live on this mount.
+    # source = which store we copied from (claimed pool family / legacy / snapshot);
+    # existing = target's trusted anchor identity; token_fp names the family that is
+    # now live here — the fingerprint a later divergence-detected line would match.
+    _cred_audit("swap-install", "wrote",
+                ("claimed pooled family" if claimed_family is not None
+                 else "independent login (legacy)" if used_independent
+                 else "account snapshot"),
+                slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                existing_identity=_identity_fields(target_account_cj), emit_identity=True,
+                login_family=(f"{target_name}/{claimed_family}" if claimed_family else None),
+                token_fp=_audit_token_fp(_install_src_creds))
     if claimed_family is not None:
         click.echo(f"creds-install: claimed pooled login {target_name}/{claimed_family} for {slot} "
                    f"(distinct family, no clobber — #109 pool)")
@@ -8591,6 +8825,18 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # on the independent-logins pool feature + lane-serving mode and never flags a
     # lane that holds a distinct family.
     for _dv_slot, _dv_acct, _dv_expired in _divergence_risk_lanes(state, config):
+        # Log the clobber PRECONDITION the moment it exists — before any save-back
+        # can carry a foreign token into the wrong store. This lane's live family
+        # already runs on another live mount of `_dv_acct` (the divergence setup);
+        # shared=true is that signal. token_fp names the shared family.
+        try:
+            _dv_fp = _audit_token_fp(read_json(mount_creds_path(slot_path(_dv_slot))))
+        except (json.JSONDecodeError, OSError):
+            _dv_fp = "unreadable"
+        _cred_audit("divergence-detected", "detected",
+                    "lane shares one live token family with another mount (#104)"
+                    + ("; lane mount already blank/expired" if _dv_expired else ""),
+                    slot=_dv_slot, account=_dv_acct, shared=True, token_fp=_dv_fp)
         out.append(_lane_divergence_sos(_dv_slot, _dv_acct, _dv_expired))
 
     # Condition 1: token expired anywhere
@@ -9007,6 +9253,13 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     for dup in duplicate_live_mount_families(state):
         if len(dup.get("accounts", [])) <= 1:
             continue  # single-account double-book: the by-account check below reports it with phase detail
+        # One family live on 2+ mounts — the clobber precondition, naming BOTH
+        # mounts + their accounts + the shared family, logged the moment it exists.
+        _cred_audit("divergence-detected", "detected",
+                    "one login family live on multiple mounts (#104)",
+                    shared=True, token_fp=dup["refresh_fp"],
+                    extra=("mounts=" + ",".join(dup["mounts"]).replace(" ", "")
+                           + " accounts=" + ",".join(dup["accounts"])))
         out.append(SOSCondition(
             severity="urgent",
             summary=f"One login family live on {len(dup['mounts'])} mounts: {', '.join(dup['mounts'])}",
