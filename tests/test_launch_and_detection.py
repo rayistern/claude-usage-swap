@@ -240,6 +240,85 @@ def test_statusline_shows_slot_hardpin_badge():
         env.restore()
 
 
+def test_pick_launch_account_lane_share_fallback():
+    """Saturated regime (every healthy account on a live mount): lane_sharing
+    off preserves the #104 refusal (None); lane_sharing on returns the
+    lowest-usage live account so _launch_prepare can JOIN its lane
+    (2026-07-03 — `cus launch auto` used to be dead whenever slots saturated
+    the pool, even with a near-idle account joinable)."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        state["slots"] = {"slot-1": {"account": "alpha"}, "slot-2": {"account": "beta"}}
+        for s in ("slot-1", "slot-2"):
+            cus.slot_path(s).mkdir(parents=True, exist_ok=True)
+        live = {str(cus.slot_path("slot-1")), str(cus.slot_path("slot-2")), str(cus.CLAUDE_DIR)}
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+
+        config = cus.load_config()
+        assert cus.pick_launch_account(state, config) is None, \
+            "lane_sharing off: all-live pool still refuses (#104)"
+
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        config = cus.deep_merge(config, {"per_session": {"lane_sharing": True}})
+        t = cus.pick_launch_account(state, config)
+        # gamma (5%, the shared-mount active) is the lowest-usage live account.
+        assert t is not None and t.name == "gamma", t
+        assert "lane-share fallback" in t.reason
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_joins_shared_mount():
+    """Launching the shared-mount active with live bare sessions: lane_sharing
+    on JOINS the global pair (bare session — 'merkos should be a legal
+    target'); off keeps the #104 refusal."""
+    import click
+    env = _Env()
+    try:
+        live = {str(cus.CLAUDE_DIR)}
+        cus.mount_pids = lambda mount: [1] if str(mount) in live else []
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        state = cus.load_state()
+
+        config = cus.load_config()
+        try:
+            cus._launch_prepare("gamma", state, config)
+            raise AssertionError("expected ClickException with lane_sharing off")
+        except click.ClickException:
+            pass
+
+        config = cus.deep_merge(config, {"per_session": {"lane_sharing": True}})
+        slot_name, slot_dir, account = cus._launch_prepare("gamma", cus.load_state(), config)
+        assert slot_name == "shared"
+        assert slot_dir == cus.CLAUDE_DIR
+        assert account == "gamma"
+    finally:
+        env.restore()
+
+
+def test_launch_swap_does_not_arm_ladder_hysteresis():
+    """trigger='launch' bumps last_swap_ts (display) but NOT last_auto_swap_ts
+    (the ladder cooldown clock) — a launch isn't ladder churn (2026-07-03:
+    launches kept re-arming a 50-min cooldown, parking hot slots). A daemon
+    trigger arms both."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        name, _slot_dir = cus.create_slot(state)
+        cus.execute_swap("alpha", trigger="launch", slot=name)
+        st = cus.load_state()
+        assert st["accounts"]["alpha"].get("last_swap_ts")
+        assert "last_auto_swap_ts" not in st["accounts"]["alpha"]
+
+        cus.execute_swap("beta", trigger="auto-ladder", slot=name)
+        st = cus.load_state()
+        assert st["accounts"]["beta"].get("last_auto_swap_ts")
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -199,6 +199,49 @@ USAGE_API_BETA = os.environ.get("CUS_USAGE_BETA", "oauth-2025-04-20")
 USAGE_API_TIMEOUT_SECONDS = 10
 USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 
+# Anthropic messages endpoint — the clock_keepalive ping (2026-07-07) POSTs the
+# smallest possible model request here to START/keep an account's 5h usage
+# window ticking (see DEFAULT_CONFIG["clock_keepalive"] for the full WHY). We
+# authenticate with the account's OAuth (subscription) bearer token, exactly as
+# `claude -p` does; a subscription OAuth token is only accepted on this endpoint
+# when the request carries the Claude Code identity — the `anthropic-beta:
+# oauth-2025-04-20` header AND a leading Claude Code system prompt — so both are
+# sent below. Env-overridable for future endpoint/version shifts. A wrong
+# endpoint/shape degrades gracefully: the ping just fails, is logged
+# (CRED-AUDIT decision=failed), and the daemon moves on.
+MESSAGES_API_URL = os.environ.get("CUS_MESSAGES_ENDPOINT", "https://api.anthropic.com/v1/messages")
+ANTHROPIC_VERSION = os.environ.get("CUS_ANTHROPIC_VERSION", "2023-06-01")
+# The system-prompt marker Claude Code sends so a subscription OAuth token is
+# accepted on /v1/messages. Kept verbatim — the endpoint checks for it.
+KEEPALIVE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
+KEEPALIVE_TIMEOUT_SECONDS = 15
+
+# OAuth token endpoint + Claude Code's public client id. Shared by two callers:
+#   - the claim-time refresh-token liveness probe (#127), and
+#   - token_self_refresh (#96, 2026-07-02), which mints a fresh access token
+#     for an inactive account whose stored token aged out (the token_stale
+#     condition, GH #13) before poll_account_usage gives up.
+# Same well-known pair the ecosystem (cux, opencode, ...) uses for the refresh
+# grant Claude Code itself performs — extracted 2026-07-02 via `strings` on the
+# installed @anthropic-ai/claude-code binary's own OAuth client config (the
+# `Tys` prod object), not a published API. Verified live 2026-07-03 against a
+# known-dead branch: platform.claude.com (and api.anthropic.com) answer 400
+# {"error":"invalid_grant"}; the old console.anthropic.com path 404s, and
+# urllib's default User-Agent is Cloudflare-blocked (403 code 1010) — hence
+# OAUTH_USER_AGENT below, which BOTH callers must send. Env-overridable like the
+# usage endpoint above, for future shifts. A wrong endpoint degrades gracefully:
+# the #127 probe fails-open (verdict "unknown" → claim proceeds unverified, i.e.
+# pre-#127 behavior); the #96 refresh fails-silent (returns False → falls
+# through to the pre-existing token_stale flag) — never a hard failure.
+OAUTH_TOKEN_URL = os.environ.get("CUS_OAUTH_TOKEN_ENDPOINT", "https://platform.claude.com/v1/oauth/token")
+OAUTH_CLIENT_ID = os.environ.get("CUS_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+OAUTH_USER_AGENT = os.environ.get("CUS_OAUTH_USER_AGENT", "claude-cli/2.0.0 (external)")
+OAUTH_TOKEN_TIMEOUT_SECONDS = 15
+# token_self_refresh (#96) uses a slightly tighter timeout than the #127 probe —
+# it runs inline in the poll path where a slow endpoint delays every stale
+# account's poll, whereas the probe runs once at claim time.
+OAUTH_REFRESH_TIMEOUT_SECONDS = 10
+
 
 # --------------------------------------------------------------------------
 # Defaults — everything overridable via config.yaml
@@ -270,6 +313,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # per the non-breaking-by-default rule).
     "independent_logins": {
         "use_independent_logins": False,
+        # Per-account POOL depth (2026-07-03, login-pool model): how many
+        # INDEPENDENT backup login families to provision per account at
+        # onboarding (`cus login-mount <account>` run this many times). A lane
+        # that must swap onto an account another live mount already holds borrows
+        # a FREE family from this pool — a distinct refresh-token family, so no
+        # #104 clobber. pool_size does NOT hard-cap families (you may log in
+        # more); it only guides onboarding + the pool-exhaustion SOS "provision
+        # another" target. N backups ⇒ up to N+1 concurrent live mounts can
+        # safely share one account's quota (primary snapshot + N families).
+        "pool_size": 3,
         # Assumed OAuth refresh-token lifetime. UNCONFIRMED — the #109 Phase 0
         # to-CONFIRM list still owes a measured idle-expiry number; 30 days is
         # the community-reported figure and only drives the sos near-expiry
@@ -278,6 +331,84 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # sos warns this many days before a provisioned login's assumed expiry
         # so the operator can re-login before a swap would fall back to a copy.
         "warn_expiry_within_days": 5,
+        # Claim-time liveness (#127, 2026-07-03): before installing a pooled
+        # family, prove its refresh token is still ALIVE via a refresh-token
+        # grant (the ONLY definitive check — expired access tokens look
+        # identical on dead and live branches; rayi1/family-1 vs family-2
+        # incident). Dead stores are retired + the next family is tried;
+        # network/endpoint trouble FAILS OPEN to today's install-as-is.
+        # False ⇒ bit-for-bit pre-#127 claim behavior.
+        "verify_family_on_claim": True,
+    },
+    # PRE-EMPTIVE creds-health early-warning (2026-07-06). Separate from the
+    # REACTIVE blank-mount detection/auto-heal (GH #141 + lane follow-up), which
+    # fires an URGENT SOS AFTER a live mount's creds have already blanked/logged
+    # out. This layer scans every LIVE mount each cycle and emits a WARNING (not
+    # urgent) BEFORE failure — when a mount's OAuth access token is near expiry
+    # and not refreshing, or its refresh token is nearing its assumed TTL and
+    # will soon need a browser re-login. It NEVER makes a network grant to probe
+    # (refresh tokens are single-use — a probe would rotate/clobber the live
+    # family, GH #104); it judges purely from the stored expiresAt / token
+    # presence / provenance age. Backward-compatible: default-on but only ever
+    # adds soft WARNINGs, never a hard action, and the reactive path is untouched.
+    "creds_warn": {
+        # Master gate. False ⇒ the pre-emptive scan is skipped entirely and
+        # behavior is bit-for-bit the reactive-only pre-2026-07-06 daemon.
+        "enabled": True,
+        # Warn when a live mount's OAuth access token expiresAt is within this
+        # many MINUTES of now AND the mount isn't observed refreshing. A healthy
+        # session refreshes its own token well ahead of expiry (fresh tokens sit
+        # hours out), so a token this close to expiry that hasn't been rewritten
+        # recently is one that isn't self-maintaining — the state that precedes a
+        # stale/blank mount if a refresh later fails. Heads-up only (self-heals
+        # on next use); ~45 min gives lead time without noising on normal churn.
+        "access_expiry_minutes": 45,
+        # A mount whose creds file was (re)written within this many minutes is
+        # treated as "recently refreshed" and suppressed from the access-expiry
+        # warning — an actively-maintained mount that just rotated its token is
+        # not at risk even if we catch it momentarily near a stale expiresAt.
+        "recent_refresh_minutes": 10,
+        # ── Fix 1 (2026-07-07 blank-mount PREEMPT) ───────────────────────────
+        # The soft near-expiry-AND-idle WARNING above (condition 1) fires just
+        # BEFORE the classic blank-mount failure: Claude Code's OWN in-place
+        # OAuth refresh rewrites the mount's .credentials.json as the token
+        # nears expiry, and if that refresh fails mid-write it leaves the file
+        # BLANK (accessToken:"" / expiresAt:0) → the live session shows "Not
+        # logged in · Run /login" (the 2026-07-07 tabby-5/slot-7 incident). The
+        # reactive auto-heal restores the file but Claude Code just re-blanks on
+        # its next failed refresh, AND a file-heal can't un-stick a process that
+        # already cached the logged-out state. So instead of only WARNING when
+        # this condition holds, PROACTIVELY refresh the lane's mount token via
+        # cus's OWN refresh grant (_refresh_account_token) and rewrite fresh,
+        # valid creds into the mount BEFORE Claude Code's failure-prone in-place
+        # refresh can blank it — keeping the mount ahead of expiry so Claude
+        # Code never needs its (fragile) refresh. Degrades to the existing
+        # warn+heal on any failure; only ever touches a live lane's own mount.
+        "preempt": {
+            # Master gate. False ⇒ no proactive refresh; behavior is the
+            # warn+heal-only pre-2026-07-07 daemon (bit-for-bit).
+            "enabled": True,
+            # Poll-burnout backoff: at most one proactive-refresh ATTEMPT per
+            # lane per this many minutes, whether it succeeds or fails. Without
+            # it a persistently-failing grant would re-fire every poll (the
+            # 2026-06-19 burnout shape). A SUCCESSFUL refresh is naturally
+            # rate-limited far longer than this — a fresh token sits hours out,
+            # so the near-expiry-AND-idle trigger can't re-arm until it ages
+            # back down; the cooldown only bounds the FAILURE-retry cadence.
+            "cooldown_minutes": 15,
+        },
+        # ── Fix 2 (2026-07-07 STUCK-SESSION escalation) ──────────────────────
+        # A file-heal is SILENT success today even when the live session stays
+        # wedged in "not logged in" — the running process cached the logged-out
+        # state and only a RELAUNCH clears it (hot_swap disabled here, so nothing
+        # auto-relaunches). Detect the heal→blank→heal cycle: a lane healed
+        # >= heal_threshold times within window_minutes means the file-heal is
+        # NOT helping and the operator must relaunch. Emits a distinct URGENT
+        # SOS naming the exact relaunch command.
+        "stuck": {
+            "heal_threshold": 2,     # >= this many heals ...
+            "window_minutes": 30,    # ... within this rolling window → escalate
+        },
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -296,6 +427,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # logic ("below 100% is a judgment call" — user). 100 = only block truly
     # exhausted accounts; lower it to keep a wider safety margin.
     "never_swap_to_pct": 100,
+    # 72-hour seven_day reset detection (field finding 2026-07-05, gist:
+    # monperrus/3ac4b303a84946bbeaf2b1123ee99491). The Claude `seven_day`
+    # "weekly" cap actually REFRESHES every ~72h at a fixed UTC anchor
+    # (~04:50-05:00 UTC), NOT every 7 days — observed 72.0h ±0.6h over three
+    # cycles. The API's seven_day.resets_at is misleading: it reports ~7 days
+    # out (when the oldest tokens age off), not when you actually get fresh
+    # budget. We detect the REAL reset from its observable signature — a sharp
+    # DROP in current_7d_pct between two consecutive real observations — and
+    # project the next one 72h forward. Both knobs are exposed so they stay
+    # tunable if Anthropic changes the cadence.
+    "seven_day_reset_hours": 72,       # projected gap between real 7d refreshes
+    "seven_day_reset_drop_pct": 15,    # min pct-point drop that counts as a reset (not noise)
     "smart_strategy": {
         "hard_7d_cap_pct": 80,           # force-swap active when 7d crosses this; never SWAP TO an account above
         "burn_window_hours": 2,          # if 5h resets within N hours and clock is ticking, boost score
@@ -456,6 +599,86 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "repoll_buffer_seconds": 20,
         "min_repoll_seconds": 30,
     },
+    # token_self_refresh (2026-07-02, GH #13 follow-up): before flagging an
+    # inactive account token_stale, attempt a plain OAuth refresh_token grant
+    # against the same undocumented endpoint the `claude` CLI itself uses (see
+    # OAUTH_TOKEN_URL / _refresh_account_token). Costs no usage quota (a pure
+    # auth call, not an inference call) and creates no session. ANY failure —
+    # network, non-200, malformed response — falls straight through to the
+    # pre-existing token_stale flag; a successful refresh is a pure bonus,
+    # never a new failure mode. Set `enabled: false` to revert to the
+    # pre-2026-07-02 behavior (never talk to this endpoint) if Anthropic ever
+    # changes its shape and this starts erroring on every stale account.
+    "token_self_refresh": {
+        "enabled": True,
+        # Fix 4 (2026-07-07 un-stale idle accounts). An idle account whose stored
+        # access token aged out sits `token_stale` FOREVER even though its refresh
+        # token is still valid — nothing exercises it, so the poll-time
+        # _refresh_account_token above may never clear it (it's gated by `enabled`
+        # and folded into a poll). That causes (a) chronically wrong cus readings
+        # and (b) "stale snapshot → blank on install" when a lane swaps onto it.
+        # This mints a fresh access token via a DIRECT OAuth refresh grant
+        # (`_oauth_refresh_grant`, #127 — no session, no billed tokens), writes it
+        # back to the account SNAPSHOT, and clears token_stale.
+        #   * `unstale_idle_on_poll: True` — each daemon cycle, sweep accounts
+        #     still flagged token_stale (not token_expired) and un-stale them.
+        #     False ⇒ only `cus force-poll` un-stales (the operator's manual lever).
+        #   * `unstale_cooldown_minutes: 10` — poll-burnout backoff: at most one
+        #     grant attempt per account per this many minutes (force-poll bypasses
+        #     it — an operator explicitly asked). A DEAD refresh token
+        #     (invalid_grant) is left flagged and NOT retried tightly: it genuinely
+        #     needs a browser relogin.
+        "unstale_idle_on_poll": True,
+        "unstale_cooldown_minutes": 10,
+    },
+    # clock_keepalive (2026-07-07 operator directive) — keep every account's
+    # 5-hour usage window continuously TICKING by pinging DORMANT accounts.
+    #
+    # The mechanic being exploited: Claude's 5-hour usage window is a FIXED
+    # window that STARTS on an account's first model request after a dormant
+    # period and RESETS ~5h later. An account nothing exercises (no lane making
+    # requests) has a DORMANT clock — its 5h window is not running, so it will
+    # not reset on any predictable cadence and there is no "fresh capacity in
+    # ~5h" coming from it. If instead we keep every account's clock ticking, all
+    # accounts cycle through 5h windows continuously and reset on a rolling
+    # basis — so the fleet always has some account minutes-from-fresh, which is
+    # exactly the predictable rolling capacity the rotation daemon wants to pick
+    # from. The operator did this by hand today (CLAUDE_CONFIG_DIR=account-rayi4
+    # claude -p "hi" --model claude-haiku-4-5-20251001 started rayi4's clock);
+    # this block makes it a first-class, config-gated daemon feature.
+    #
+    # The ping is a MINIMAL model request (1 user token "hi", max_tokens=1, the
+    # cheapest model) sent DIRECTLY to the Anthropic messages endpoint with the
+    # account's OAuth bearer token — read-only w.r.t. every live mount/lane (it
+    # never writes any lane's .credentials.json), and wrapped so a failed ping
+    # only logs and moves on, never crashing the poll. After a successful ping
+    # the account is force-re-polled so `five_hour_resets_at` reflects the
+    # now-ticking window.
+    #
+    # Backward-compatible: an ABSENT block uses these defaults (feature ON, per
+    # the operator directive). Set `enabled: false` to revert to the
+    # pre-2026-07-07 behavior (dormant accounts stay dormant).
+    "clock_keepalive": {
+        # Master toggle. Operator wants it ON. False ⇒ the keepalive sweep is
+        # skipped entirely (bit-for-bit pre-feature behavior).
+        "enabled": True,
+        # The model id the ping uses — cheapest available so the keepalive costs
+        # as close to nothing as possible while still counting toward the 5h
+        # window (any model request starts/keeps the window).
+        "model": "claude-haiku-4-5-20251001",
+        # Cooldown: an account is pinged at most once per this many MINUTES.
+        # Default ~290 — just under the 5h / 300-min window — so a dormant
+        # account gets re-primed shortly after each reset (keeping the clock
+        # essentially always ticking) WITHOUT hammering the endpoint. Recorded
+        # per account as `last_keepalive_ping_ts` in state.json.
+        "min_ping_interval_minutes": 290,
+        # Optional account scoping. `accounts` (allowlist): when non-empty, ONLY
+        # these accounts are eligible for keepalive pings; empty/absent ⇒ all
+        # enabled, non-disabled, valid-creds accounts. `exclude` (denylist):
+        # accounts never pinged even if otherwise eligible. Both default empty.
+        "accounts": [],
+        "exclude": [],
+    },
     "subagent_skip": {
         "enabled": True,
         # If a subagent (or any in-flight tool) is detected, skip that pane's
@@ -476,6 +699,66 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "estimator": {
         "enabled": True,
         "max_extrapolation_minutes": 10,   # don't trust a measured rate beyond this many min past the last poll
+    },
+    # Near-threshold responsiveness (2026-07-06 rayi3 incident). rayi3 burned from
+    # UNDER its 95% ladder step to 100% 5h BETWEEN two ~180s daemon polls, so a
+    # live session hit Claude's native "usage limit" menu before the daemon swapped
+    # its lane off — the whole point of the 95% step is to swap BEFORE the cap, but
+    # the swap fired late because the daemon acted on a usage snapshot that lagged
+    # the real fast burn. Two complementary, config-gated fixes hang off this block:
+    #   Fix A — the ladder/cap swap TRIGGER decides on burn-EXTRAPOLATED usage
+    #     (last poll + burn_rate x time-to-next-poll), not the stale last-polled
+    #     value, so an account at 91%-last-poll but burning fast trips the 95% step
+    #     NOW instead of next cycle. Extrapolation only ever pushes the trigger
+    #     EARLIER (max() with the raw reading), never masks a real over-cap value.
+    #   Fix B — accounts whose extrapolated usage is within `within_pct_of_step` of
+    #     their next swap step (or projected to cross it before the next normal
+    #     poll) are polled on the fast `fast_interval_seconds` cadence instead of
+    #     the normal one, so the daemon SEES the fast burn in time to act on it.
+    # `enabled: False` reverts BOTH to prior behavior bit-for-bit. Only accounts
+    # actually near a step accelerate (the fleet is NOT blanket-fast-polled), and
+    # the 429 poll-backoff gate still wins — a throttled account is never fast-polled.
+    "poll_accel": {
+        "enabled": True,
+        "within_pct_of_step": 5,       # accelerate when extrapolated usage is within this many pts of the next step
+        "fast_interval_seconds": 45,   # near-threshold poll cadence (vs the normal active/inactive interval)
+        # Clustered-account compounded-burn allowance (2026-07-06 rayi4 incident).
+        # An account backing MULTIPLE live lanes climbs toward its cap ~N× faster
+        # than its per-account `burn_rate` (measured from single-lane poll-to-poll
+        # history) predicts, so the plain `within_pct_of_step` band fires too late:
+        # rayi4 sat at 84% 5h on the SLOW inactive cadence and rode past its 95%
+        # step before the daemon re-polled. Widen the fast-poll band by this many
+        # pts for each EXTRA lane an account backs (band = within + bonus*(lanes-1)),
+        # so a clustered near-cap account is fast-polled early enough to swap a lane
+        # off in time. 0 = off (prior single-band behavior). Only accounts backing
+        # >= 2 live lanes are affected, so under normal one-lane-per-account
+        # operation this is inert (no extra polling → no 429-budget cost).
+        "cluster_within_bonus_pct": 10,
+    },
+    # Anti-clustering lane spread (2026-07-06 incident: the daemon piled ALL live
+    # lanes onto ONE "best-scored" account — first rayi5, then rayi4 — instead of
+    # spreading them). Root cause: the smart/headroom scorers rank an account purely
+    # on usage/headroom/burn-proximity with NO awareness of how many live lanes it
+    # already backs, so the SAME burn-soon account is the top pick for every lane
+    # each cycle; combined with the #109 pool double-book escape hatch, several lanes
+    # STACK onto it (4 mounts on 3 families → the shared token diverged → recurring
+    # "mount blanked / not logged in" auto-heal loop), and they then all hit that one
+    # account's 5h cap simultaneously with no headroom to swap. Two coupled levers:
+    #   (1) cluster_penalty — a swap-target SCORE penalty of this many points per
+    #       live lane already backing the candidate (existing occupancy + this-cycle
+    #       claims), so an account that already holds a lane loses to a distinct empty
+    #       one. Prevents cross-cycle re-convergence onto the same magnet account.
+    #   (2) max_stack — the daemon will not pile a NON-urgent (deferrable, e.g.
+    #       burn-before-reset) move onto an account that already backs >= max_stack
+    #       lanes when it can instead HOLD the lane on its current account. Urgent
+    #       moves (hard-cap / reactive-429 escapes) may still stack via independent
+    #       login families when clean accounts are genuinely scarce — that path is a
+    #       last resort the #104/#109 family accounting still guards.
+    # `enabled: False` reverts BOTH levers to prior behavior bit-for-bit.
+    "spread_lanes": {
+        "enabled": True,
+        "cluster_penalty": 40.0,       # score pts deducted per live lane already backing a candidate target
+        "max_stack": 1,                # deferrable moves won't grow an account past this many lanes when it can hold
     },
     # Per-model WEEKLY tracking (2026-07-02). The usage API exposes per-model
     # usage only weekly (no per-model 5h window). `gate_enabled: False` by
@@ -1123,6 +1406,430 @@ def has_independent_login(account: str, slot: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Per-account login POOL (2026-07-03, supersedes per-(slot,account) keying).
+#
+# A pool is ~/claude-accounts/logins/<account>/family-<N>/ — one INDEPENDENT
+# OAuth login family per subdir. The account's canonical snapshot is the implicit
+# "primary" (used when the account isn't held anywhere); family-1..N are the
+# backups the operator mints once at onboarding. A lane needing to swap onto a
+# HELD account borrows a FREE family (one not currently leased to a live slot),
+# so the same account can back several live mounts without a shared token family
+# to clobber (#104). Lease = state.slots[<slot>].login_family = "<account>/family-<N>".
+#
+# This reuses the login_store_root() + fingerprint primitives above; the
+# per-(slot,account) helpers (login_store_dir, has_independent_login, …) remain
+# until the P5 cleanup but are no longer the swap-path source of truth.
+# ---------------------------------------------------------------------------
+
+LOGIN_FAMILY_PREFIX = "family-"
+
+
+def login_pool_dir(account: str) -> Path:
+    """Root of one account's independent-login pool: logins/<account>/."""
+    return login_store_root() / account
+
+
+def login_family_dir(account: str, family_id: str) -> Path:
+    """Dir holding one pooled family. `family_id` is the subdir name
+    (e.g. 'family-2')."""
+    return login_pool_dir(account) / family_id
+
+
+def login_family_creds_path(account: str, family_id: str) -> Path:
+    return login_family_dir(account, family_id) / ".credentials.json"
+
+
+def _family_creds_usable(account: str, family_id: str) -> bool:
+    """True iff this family's creds parse and carry a refresh token — the same
+    'usable' bar as has_independent_login (an access-token-only or logout-shaped
+    file can't seed a swap)."""
+    path = login_family_creds_path(account, family_id)
+    if not path.exists():
+        return False
+    try:
+        return _credential_refresh_token(read_json(path)) is not None
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def list_login_families(account: str) -> list[str]:
+    """Usable family ids in an account's pool, sorted by numeric index.
+
+    Only families with parseable creds carrying a refresh token count — a
+    half-scaffolded dir (mid-`login-mount`, no `/login` yet) is not usable."""
+    d = login_pool_dir(account)
+    if not d.exists():
+        return []
+    fams = [p.name for p in d.iterdir()
+            if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)
+            and _family_creds_usable(account, p.name)]
+    return sorted(fams, key=_family_index)
+
+
+def _family_index(family_id: str) -> int:
+    """Numeric index of 'family-<N>' for deterministic lowest-free ordering;
+    unparseable names sort last."""
+    try:
+        return int(family_id.removeprefix(LOGIN_FAMILY_PREFIX))
+    except ValueError:
+        return 1 << 30
+
+
+def next_family_id(account: str) -> str:
+    """The family id `cus login-mount <account>` should scaffold next: one past
+    the highest EXISTING family index (usable or not, so a half-finished mint
+    isn't reused). Pools start at family-1."""
+    d = login_pool_dir(account)
+    existing = [p.name for p in d.iterdir()
+                if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)] if d.exists() else []
+    hi = max((_family_index(f) for f in existing), default=0)
+    return f"{LOGIN_FAMILY_PREFIX}{hi + 1}"
+
+
+def slot_leased_family(state: dict, slot: str) -> tuple[str, str] | None:
+    """(account, family_id) a slot currently leases, or None. Stored as
+    'account/family-N' on state.slots[slot].login_family."""
+    entry = (state.get("slots", {}) or {}).get(slot, {}) or {}
+    ref = entry.get("login_family")
+    if not ref or "/" not in ref:
+        return None
+    account, family_id = ref.split("/", 1)
+    return (account, family_id)
+
+
+def leased_families(account: str, state: dict) -> set[str]:
+    """Family ids of `account` currently leased by a LIVE slot — the in-use set
+    a claim must avoid. Idle slots don't count: with no session refreshing the
+    token, their lease can't clobber, and the family is reclaimable."""
+    live = set(occupied_slot_accounts(state).get(account, []))
+    out: set[str] = set()
+    for slot in live:
+        lease = slot_leased_family(state, slot)
+        if lease and lease[0] == account:
+            out.add(lease[1])
+    return out
+
+
+def free_login_family(account: str, state: dict) -> str | None:
+    """Lowest-index usable family of `account` not leased to a live slot, or None
+    if the pool is empty or fully leased (exhausted). This is the family a rescue
+    swap claims."""
+    leased = leased_families(account, state)
+    for fam in list_login_families(account):  # already sorted lowest-first
+        if fam not in leased:
+            return fam
+    return None
+
+
+def has_free_login_family(account: str, state: dict) -> bool:
+    """True iff a rescue swap onto `account` could claim a distinct login family
+    (so double-booking it would not clobber). The pool-model replacement for the
+    per-slot has_independent_login predicate.
+
+    Deliberately does NOT probe liveness (#127): this is the cheap decision-
+    layer predicate, called many times per cycle. The claim itself
+    (claim_verified_login_family, execution layer) does the definitive
+    refresh-grant probe and skips dead stores; an optimistic True here at
+    worst becomes a failed move logged by _execute_slot_moves."""
+    return free_login_family(account, state) is not None
+
+
+def _free_family_count(account: str, state: dict) -> int:
+    """How many usable pooled families of `account` are NOT leased to a live slot
+    — i.e. how many ADDITIONAL live mounts the pool can back without a clobber,
+    beyond the ones already covered. The counting twin of free_login_family
+    (which returns just the lowest free one)."""
+    leased = leased_families(account, state)
+    return sum(1 for fam in list_login_families(account) if fam not in leased)
+
+
+def _distinct_family_capacity(account: str, state: dict, config: dict | None, slot: str | None) -> int:
+    """Max concurrent live mounts `account` can back WITHOUT a GH #104 token-family
+    clobber: one plain-snapshot 'primary' mount IF the account isn't already live
+    anywhere, PLUS one per FREE pooled login family (plus a legacy per-slot
+    independent login for this slot, if present).
+
+    This is the invariant EVERY daemon swap path must respect: never create more
+    live mounts of an account than it has distinct login families to cover them,
+    or the mounts share one single-use OAuth refresh token and the next rotation
+    logs one out. Both the proactive ladder and the reactive-429 path consult this
+    before committing a same-cycle move (see decide_slot_swaps /
+    check_rate_limit_reactive_per_session) so an over-subscription is HELD at the
+    decision layer with a clear log line, not left to the execution layer's
+    downstream 'pool exhausted' refusal (which strands the lane just the same,
+    only noisier). Incident 2026-07-05: the reactive path piled 6 lanes onto rayi1
+    (2 families) because nothing counted families before committing.
+
+    Gate off (default, no pool): capacity is 1 (or 0 if the account is already
+    live on a mount) — i.e. 'never double-book', the pre-pool #104 rule, bit-for-
+    bit unchanged."""
+    cap = 0 if _account_held_by_other_live_mount(state, account, slot, config) else 1
+    if independent_logins_enabled(config):
+        cap += _free_family_count(account, state)
+        if slot is not None and has_independent_login(account, slot):
+            cap += 1
+    return cap
+
+
+def _oauth_refresh_grant(refresh_token: str) -> tuple[str, dict | None]:
+    """Probe a refresh token's liveness via the OAuth refresh grant (#127).
+
+    Returns ("alive", token_response) — WHICH ROTATES THE TOKEN: the caller
+    MUST persist the response's new refresh token immediately or the family
+    is lost; ("dead", None) on a definitive invalid_grant (the branch was
+    rotated away elsewhere — the poisoned-store signature); ("unknown", None)
+    on anything else (network, 5xx, endpoint drift) so callers can FAIL OPEN.
+
+    Why a rotation is the check: access-token expiry cannot distinguish dead
+    from live branches — in the 2026-07-03 incident, dead rayi1/family-1 and
+    live family-2 both sat at expired access tokens; only the grant told them
+    apart. Rotating a FREE family is safe: free ⇒ no live mount holds it, so
+    nobody else's chain is invalidated, and the claimant's session would have
+    refreshed immediately anyway."""
+    body = json.dumps({"grant_type": "refresh_token",
+                       "refresh_token": refresh_token,
+                       "client_id": OAUTH_CLIENT_ID}).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json",
+                                          # urllib's default UA is Cloudflare-blocked
+                                          # (403 code 1010) at this endpoint.
+                                          "User-Agent": OAUTH_USER_AGENT}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=OAUTH_TOKEN_TIMEOUT_SECONDS) as resp:
+            return ("alive", json.loads(resp.read(USAGE_API_RESPONSE_LIMIT_BYTES)))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = e.read(USAGE_API_RESPONSE_LIMIT_BYTES).decode(errors="replace")
+        except OSError:
+            payload = ""
+        # Only invalid_grant is a death certificate; any other 4xx/5xx could be
+        # throttling, schema drift, or a wrong endpoint — treat as unknown.
+        if e.code in (400, 401) and "invalid_grant" in payload:
+            return ("dead", None)
+        return ("unknown", None)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return ("unknown", None)
+
+
+def claim_verified_login_family(account: str, state: dict, config: dict | None = None) -> str | None:
+    """Pick a free family to claim, PROVEN alive (#127) — the execution-layer
+    twin of free_login_family.
+
+    Walks free families lowest-first. Per family: refresh-grant probe.
+      - alive  → persist the rotated tokens into the store (the old refresh
+                 token is invalid the moment the grant succeeds), return it.
+      - dead   → retire the store (rename creds to .dead-<date>, so
+                 list_login_families stops offering it and SOS/doctor can
+                 count retirements), try the next family. This is how the
+                 2026-07-03 poisoned stores (pre-PR#126 save-back bug) get
+                 swept out lazily instead of logging out a live session.
+      - unknown→ FAIL OPEN: return the family unverified (pre-#127 behavior).
+                 A network blip must not turn a working pool into a refused
+                 claim; worst case is exactly the old behavior.
+
+    Config gate independent_logins.verify_family_on_claim (default True);
+    False short-circuits to plain free_login_family."""
+    cfg = config if config is not None else load_config()
+    if not cfg.get("independent_logins", {}).get("verify_family_on_claim", True):
+        return free_login_family(account, state)
+    leased = leased_families(account, state)
+    for fam in list_login_families(account):  # lowest-first
+        if fam in leased:
+            continue
+        path = login_family_creds_path(account, fam)
+        try:
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue  # unusable store; next
+        rt = _credential_refresh_token(creds)
+        if not rt:
+            continue
+        verdict, tok = _oauth_refresh_grant(rt)
+        if verdict == "dead":
+            dead_name = f"{path.name}.dead-{datetime.now(timezone.utc):%Y%m%d}"
+            path.rename(path.with_name(dead_name))
+            click.echo(f"claim-verify: {account}/{fam} refresh token DEAD (invalid_grant) — "
+                       f"retired store to {dead_name}; trying next family (#127)")
+            continue
+        if verdict == "alive":
+            # Persist the rotation BEFORE returning — after the grant, the
+            # store's old refresh token is a dead branch by definition.
+            oauth = dict(creds.get("claudeAiOauth") or {})
+            oauth["accessToken"] = tok.get("access_token") or oauth.get("accessToken")
+            oauth["refreshToken"] = tok.get("refresh_token") or rt
+            if tok.get("expires_in"):
+                oauth["expiresAt"] = int((time.time() + float(tok["expires_in"])) * 1000)
+            creds = dict(creds)
+            creds["claudeAiOauth"] = oauth
+            backup_credentials_file(path)
+            atomic_write_bytes(path, json.dumps(creds, indent=2).encode(), mode=0o600)
+            click.echo(f"claim-verify: {account}/{fam} proven alive (refresh grant OK; "
+                       f"store updated with rotated tokens — #127)")
+            return fam
+        click.echo(f"claim-verify: {account}/{fam} unverifiable (network/endpoint) — "
+                   f"claiming unverified, fail-open (#127)")
+        return fam
+    return None
+
+
+def login_family_provenance_path(account: str, family_id: str) -> Path:
+    return login_family_dir(account, family_id) / "provenance.json"
+
+
+def scaffold_login_family_dir(account: str, family_id: str) -> Path:
+    """Create (idempotently) a minimal CLAUDE_CONFIG_DIR to `/login` into for one
+    pooled family, and return it. Mirrors scaffold_login_store_dir (empty
+    .claude.json + shared symlinks) but keyed by family, not slot."""
+    dst = login_family_dir(account, family_id)
+    dst.mkdir(parents=True, exist_ok=True)
+    if not (dst / ".claude.json").exists():
+        write_json(dst / ".claude.json", {})
+    for sub in SHARED_SYMLINK_SUBDIRS:
+        link = dst / sub
+        target = CLAUDE_DIR / sub
+        if target.exists() and not link.exists():
+            link.symlink_to(target)
+    return dst
+
+
+def latest_family_id(account: str) -> str | None:
+    """Highest-index family subdir for an account (usable or not) — the one a
+    just-completed `cus login-mount <account>` scaffolded, for `--finish` to
+    verify. None if the pool has no family dirs yet."""
+    d = login_pool_dir(account)
+    fams = [p.name for p in d.iterdir()
+            if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)] if d.exists() else []
+    return max(fams, key=_family_index) if fams else None
+
+
+def family_identity(account: str, family_id: str) -> dict:
+    """Identity facets `/login` recorded in a family dir's .claude.json."""
+    path = login_family_dir(account, family_id) / ".claude.json"
+    if not path.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(path))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _shared_mount_holds(account: str, state: dict, config: dict | None = None) -> bool:
+    """True iff the shared ~/.claude mount is a live holder of `account`.
+
+    The shared mount holds state["active"] as a live account in `global` and
+    `hybrid` mode — every bare (non-slot) session rides it. This is the second
+    live-mount surface a slot swap can clobber (#104): a plain snapshot copy of
+    the shared account into a slot puts one OAuth token family on TWO live mounts.
+
+    Why NOT gated on mount_in_use(CLAUDE_DIR): bare sessions launch with the
+    DEFAULT config dir and set no CLAUDE_CONFIG_DIR env var, so mount_pids can't
+    see them and mount_in_use(CLAUDE_DIR) reads False even with dozens of live
+    bare sessions. That false-negative is exactly the 2026-07-05 slot-move
+    clobber (issue #141): `cus slot move slot-5 merkos --dry-run` said "not live
+    on any other mount / plain snapshot" while merkos held the shared mount with
+    ~30 bare sessions. So in global/hybrid mode the shared mount is treated as
+    UNCONDITIONALLY holding state["active"] — mirroring the daemon, whose
+    _hybrid_cycle excludes state["active"] from every slot target unconditionally
+    (exclude_for_slots), never via a mount_in_use probe.
+
+    In `per_session` mode the shared ~/.claude mount is observe-only (the daemon
+    never manages it for bare sessions and never excludes state["active"] from
+    slot decisions), so we preserve the pre-existing, detectable-only behavior
+    there rather than newly blocking per_session slot moves onto state["active"].
+    """
+    if state.get("active") != account:
+        return False
+    mode = (config if config is not None else load_config()).get("mode", "global")
+    if mode in ("global", "hybrid"):
+        return True
+    # per_session: honor only a detectable live holder (unchanged behavior).
+    return mount_in_use(CLAUDE_DIR)
+
+
+def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None,
+                                      config: dict | None = None) -> bool:
+    """True iff `account` is currently live on a mount OTHER than `this_slot` — a
+    live slot or the shared ~/.claude mount.
+
+    Installing a plain snapshot COPY of an account onto a SECOND live mount is
+    the #104 clobber (both refresh the one shared token family). So this gates
+    whether a swap must claim a DISTINCT pooled family instead of copying.
+
+    max_age_seconds=0 bypasses the occupancy cache: this is a credential-safety
+    guard, and the 5s TTL is exactly one daemon cycle's fan-out window. Incident
+    2026-07-03 16:10Z: slot-2 and slot-7 moved onto rayi3 back-to-back in one
+    cycle; slot-7's guard read the cached map from before slot-2's install,
+    judged rayi3 unheld, and copied the snapshot — two live mounts on one token
+    family, and the next refresh logged slot-2 out (empty refreshToken on its
+    live creds). Ground truth costs one /proc scan per swap; swaps are rare.
+
+    `config` selects the mode used to judge the shared-mount holder (see
+    _shared_mount_holds). Optional/back-compat: None re-loads it. The daemon's
+    slot targets never include state["active"] (it's in exclude_for_slots), so
+    the shared-mount clause is a no-op there — it only bites the manual
+    `cus slot move` path, which has no such exclusion (issue #141)."""
+    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+        if s != this_slot:
+            return True
+    # The shared mount counts too: a slot copying merkos while the shared mount
+    # is live on merkos double-books it exactly the same way (issue #141).
+    return _shared_mount_holds(account, state, config)
+
+
+def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: str | None,
+                               state: dict, config: dict | None = None) -> bool:
+    """True iff the refresh-token FAMILY in `candidate_creds` already runs on
+    ANOTHER live mount of `account` — the shared ~/.claude mount or another live
+    lane. That is the GH #104 clobber itself: two live mounts on one refresh-token
+    family, and the next rotation on either side logs the other out.
+
+    Why compare ACTUAL token bytes (not login_family / has_independent_login
+    state): the 2026-07-07 chats1a incident's legacy per-slot store PASSED
+    `has_independent_login` (it carried *a* refresh token) yet that token was a
+    STALE COPY of the account's shared snapshot family — so trusting the state
+    flag judged it "safe" while installing it double-booked the shared family and
+    logged the session out. Conversely a GENUINELY independent legacy login
+    (distinct token, the supported Track-B case) is clobber-safe and must NOT be
+    refused. Only the bytes distinguish the two, so this reads them — the same
+    fingerprint primitive `duplicate_live_mount_families` uses.
+
+    Closes the bare-session blind spot too: the existing live-mount detectors
+    gate the shared mount on `mount_in_use(CLAUDE_DIR)`, which reads False for
+    bare sessions (they set no CLAUDE_CONFIG_DIR — issue #141), so a lane sharing
+    the shared-mount account was invisible to them. Here the shared mount is
+    counted UNCONDITIONALLY in global/hybrid via `_shared_mount_holds`, exactly
+    like the swap-time clobber guard.
+
+    max_age_seconds=0 (ground-truth occupancy) for the same reason as
+    `_account_held_by_other_live_mount`: this is a credential-safety check on the
+    rare swap path, so it must not read a stale cache mid-fan-out.
+    """
+    try:
+        cand_rt = _credential_refresh_token(read_json(candidate_creds))
+    except (json.JSONDecodeError, OSError):
+        return False  # unreadable candidate: not a family-collision (the #141
+                      # install-point guard handles blank/unreadable sources)
+    if not cand_rt:
+        return False
+    cand_fp = _refresh_fingerprint(cand_rt)
+    other_mounts: list[Path] = []
+    if _shared_mount_holds(account, state, config):
+        other_mounts.append(CREDS_JSON)  # ~/.claude/.credentials.json (bare sessions)
+    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+        if s != this_slot:
+            other_mounts.append(mount_creds_path(slot_path(s)))
+    for p in other_mounts:
+        try:
+            rt = _credential_refresh_token(read_json(p))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if rt and _refresh_fingerprint(rt) == cand_fp:
+            return True
+    return False
+
+
 def read_login_provenance(account: str, slot: str) -> dict | None:
     """Provenance record for a provisioned login, or None if unreadable."""
     path = login_store_provenance_path(account, slot)
@@ -1227,6 +1934,100 @@ def duplicate_login_families() -> list[dict]:
             for fp, pairs in by_fp.items() if len(pairs) > 1]
 
 
+def duplicate_live_mount_families(state: dict) -> list[dict]:
+    """One refresh-token family live on TWO+ mounts — the #104 clobber itself,
+    measured at the LIVE mounts (slot dirs + the global ~/.claude pair) rather
+    than the independent-login store (duplicate_login_families only sees
+    provisioned logins). Catches double-books however they arose: the daemon's
+    pre-2026-07-03 fan-out double-up (slot-3/slot-4 incident — `cus sos` said
+    all-clear while one token refresh away from a forced logout), `cus launch
+    --force`, or hand-copied credential files. Idle mounts are skipped: with
+    no session to refresh the token, a duplicate can't clobber yet.
+    Returns [{"refresh_fp", "mounts": ["slot-3 (rayi2)", ...]}]."""
+    by_fp: dict[str, list[str]] = {}
+    mounts: list[tuple[str, Path, str | None]] = [
+        (d.name, d, state.get("slots", {}).get(d.name, {}).get("account"))
+        for d in list_slot_dirs()
+    ]
+    mounts.append(("shared-mount", CLAUDE_DIR, state.get("active")))
+    for name, path, acct in mounts:
+        if not mount_in_use(path):
+            continue
+        try:
+            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if rt:
+            by_fp.setdefault(_refresh_fingerprint(rt), []).append((f"{name} ({acct or '?'})", acct))
+    return [{"refresh_fp": fp,
+             "mounts": sorted(label for label, _ in ms),
+             "accounts": sorted({a for _, a in ms if a})}
+            for fp, ms in sorted(by_fp.items()) if len(ms) > 1]
+
+
+def double_booked_live_accounts(state: dict) -> list[dict]:
+    """Accounts live on 2+ mounts without enough independent logins to make
+    the extra mounts safe — the #104 condition tracked by ACCOUNT, catching
+    both phases of the clobber that duplicate_live_mount_families (same-family)
+    only sees before the first rotation:
+
+      phase "will_clobber":   families still identical — the next token
+                              refresh on either mount logs the other out;
+      phase "already_rotated": families diverged — one mount already refreshed,
+                              so the mount(s) still on the old family hold a
+                              DEAD refresh token and fail at next refresh (the
+                              2026-07-01 duplicate-identity incident shape;
+                              seen again on slot-3/slot-4, 2026-07-03).
+
+    Lane sharing is one mount hosting many sessions, so 2+ live MOUNTS on one
+    account is never lane sharing; it's safe only when each extra mount has
+    its own independent login (distinct family, GH #109). Slots with a
+    provisioned login are subtracted before flagging.
+    Returns [{"account", "phase", "mounts": ["slot-3", ...]}]."""
+    mounts: list[tuple[str, Path, str | None]] = [
+        (d.name, d, state.get("slots", {}).get(d.name, {}).get("account"))
+        for d in list_slot_dirs()
+    ]
+    mounts.append(("shared-mount", CLAUDE_DIR, state.get("active")))
+    by_account: dict[str, list[tuple[str, str | None]]] = {}
+    for name, path, acct in mounts:
+        if not acct or not mount_in_use(path):
+            continue
+        try:
+            rt = read_json(path / ".credentials.json").get("claudeAiOauth", {}).get("refreshToken")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            rt = None
+        by_account.setdefault(acct, []).append((name, _refresh_fingerprint(rt) if rt else None))
+    out: list[dict] = []
+    for acct, ms in sorted(by_account.items()):
+        # A mount is SAFE (has a distinct token family) if it holds a pooled
+        # LEASE (2026-07-03 pool model) or a legacy per-slot login; the shared
+        # mount can have neither, so it always counts as unsafe. Only 2+ UNSAFE
+        # mounts on one account are a clobber — a single uncovered mount (the
+        # primary) alongside covered families is exactly the intended pool
+        # arrangement (primary + N families). Without the lease check this
+        # false-flagged a correct pool rescue as an URGENT "diverged" clobber
+        # (slot-1 leased 03/family-1 while slot-7 held 03's primary — distinct
+        # families, no clobber, but flagged).
+        def _covered(n: str) -> bool:
+            if n == "shared-mount":
+                return False
+            if has_independent_login(acct, n):
+                return True
+            lease = slot_leased_family(state, n)
+            return lease is not None and lease[0] == acct
+        unsafe = [(n, fp) for n, fp in ms if not _covered(n)]
+        if len(unsafe) < 2:
+            continue
+        fps = {fp for _, fp in unsafe if fp}
+        out.append({
+            "account": acct,
+            "phase": "will_clobber" if len(fps) <= 1 else "already_rotated",
+            "mounts": sorted(n for n, _ in unsafe),
+        })
+    return out
+
+
 def login_age_days(account: str, slot: str) -> float | None:
     """Days since this login was minted (per provenance), or None if unknown."""
     prov = read_login_provenance(account, slot)
@@ -1240,13 +2041,21 @@ def login_age_days(account: str, slot: str) -> float | None:
     return (datetime.now(timezone.utc) - minted_dt).total_seconds() / 86400.0
 
 
-def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, float | None]:
-    """Classify a provisioned login's freshness against the ASSUMED refresh-token
-    lifetime. Returns (state, days_left) where state is one of:
+def _expiry_state_from_age(age_days: float | None, config: dict) -> tuple[str, float | None]:
+    """Classify a refresh token's remaining life from its age in days against the
+    ASSUMED refresh-token lifetime. Returns (state, days_left) where state is:
       "ok"      — comfortably within lifetime
       "near"    — within warn_expiry_within_days of assumed expiry
       "expired" — past the assumed lifetime (a swap would fall back to a copy)
-      "unknown" — no provenance timestamp to judge by
+      "unknown" — no age to judge by (age_days is None)
+
+    Factored out of login_expiry_state (2026-07-06) so the SAME assumed-TTL math
+    can be reused by the pre-emptive live-mount creds-health scan, which needs to
+    classify base-account-snapshot / shared-mount / lane refresh tokens — not just
+    provisioned login families. login_expiry_state remains the login-family entry
+    point (it feeds this the provenance-derived age); the new scan feeds it an age
+    resolved per-mount (`_mount_refresh_age_days`). Keeping one classifier means
+    the "near"/"expired" thresholds can never drift between the two callers.
 
     The lifetime is a config assumption (refresh_token_ttl_days), NOT a measured
     fact — #109 Phase 0 still owes the real number. This only drives a soft sos
@@ -1254,15 +2063,22 @@ def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, floa
     cfg = config.get("independent_logins", {}) if isinstance(config, dict) else {}
     ttl = cfg.get("refresh_token_ttl_days", 30)
     warn_within = cfg.get("warn_expiry_within_days", 5)
-    age = login_age_days(account, slot)
-    if age is None:
+    if age_days is None:
         return ("unknown", None)
-    days_left = ttl - age
+    days_left = ttl - age_days
     if days_left <= 0:
         return ("expired", days_left)
     if days_left <= warn_within:
         return ("near", days_left)
     return ("ok", days_left)
+
+
+def login_expiry_state(account: str, slot: str, config: dict) -> tuple[str, float | None]:
+    """Classify a provisioned login's freshness against the ASSUMED refresh-token
+    lifetime. Returns (state, days_left) — see `_expiry_state_from_age` for the
+    state vocabulary. Thin wrapper: resolves the login family's provenance age
+    (`login_age_days`) and hands it to the shared classifier."""
+    return _expiry_state_from_age(login_age_days(account, slot), config)
 
 
 def list_provisioned_logins() -> list[dict]:
@@ -1297,18 +2113,21 @@ def list_provisioned_logins() -> list[dict]:
 
 
 def _slots_missing_logins(state: dict) -> list[tuple[str, str]]:
-    """(slot, account) pairs where the slot currently holds an account but has
-    NO independent login provisioned — the lazy-provisioning to-do list.
+    """(slot, account) pairs whose account has NO login coverage — neither a
+    pooled family (2026-07-03 pool model) nor a legacy per-(slot,account) login.
 
-    Under the Phase 2 gate, each such pair would fall back to the shared-snapshot
-    copy (the clobber path) on its next swap, so these are exactly the pairs an
-    operator should `cus login-mount`. Ordered by slot index."""
+    Coverage means the account can back a second live mount without a clobber:
+    a slot on such an account can borrow a free family at swap time. An account
+    with a pool is covered for ALL its slots, so we key the "missing" test on the
+    account's pool first, then the legacy per-slot login. Ordered by slot index."""
     slots = state.get("slots", {}) if isinstance(state, dict) else {}
     out: list[tuple[str, str]] = []
     for slot_name, entry in slots.items():
         account = entry.get("account") if isinstance(entry, dict) else None
         if not account:
             continue  # empty slot — nothing to host yet
+        if list_login_families(account):
+            continue  # account has a pool → this slot can borrow; no per-slot login needed
         if not has_independent_login(account, slot_name):
             out.append((slot_name, account))
     def _idx(pair: tuple[str, str]) -> int:
@@ -1343,9 +2162,16 @@ def swap_install_source(target_name: str, slot: str | None, snapshot_creds: Path
     return (snapshot_creds, False)
 
 
-def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_bytes: bytes) -> str:
-    """Save a slot's live creds back into its (account, slot) independent-login
-    store entry, instead of the shared account snapshot (Phase 3a, #109).
+def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_bytes: bytes,
+                            dest_path: Path | None = None) -> str:
+    """Save a slot's live creds back into its independent-login store entry,
+    instead of the shared account snapshot (Phase 3a, #109).
+
+    `dest_path` (2026-07-03 pool model): the exact store file to write. When
+    given (the pool case) it targets the LEASED family's creds
+    (login_family_creds_path); when omitted it falls back to the legacy
+    per-(account, slot) path. Either way the freshness guard + backup are the
+    same — only the destination differs.
 
     WHY this must NOT go through classify_live_creds_owner: an independent login
     deliberately carries a refresh token that matches NO account snapshot, so the
@@ -1357,7 +2183,7 @@ def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_byte
 
     Carries the GH #77 freshness guard (never overwrite a newer stored login,
     e.g. one just re-provisioned) and the GH #79 backup. Returns a status word."""
-    store_path = login_store_creds_path(account, slot)
+    store_path = dest_path if dest_path is not None else login_store_creds_path(account, slot)
     live_exp = _creds_expires_at(live_creds)
     if store_path.exists() and live_exp is not None:
         try:
@@ -1484,11 +2310,19 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
 
     Spreading: accounts on ANOTHER mount are excluded on the first pass so N
     sessions land on N accounts. The fallback narrows to only LIVE-mount
-    accounts as the hard floor — an account on a live mount is NEVER returned
-    (two live mounts on one account rotate its single-use token and log one
-    out — GH #104), but an IDLE slot's account is fair game to reuse (no live
-    mount holds it). If even that leaves nothing, returns None so the caller
-    reports "all healthy accounts are in use" instead of double-booking.
+    accounts as the hard floor — an account on a live mount is never returned
+    as a NEW mount (two live mounts on one account rotate its single-use token
+    and log one out — GH #104), but an IDLE slot's account is fair game to
+    reuse (no live mount holds it).
+
+    Lane-share final fallback (2026-07-03, supersedes the pre-lanes "never
+    return a live-mount account" hard floor): with per_session.lane_sharing on,
+    a live-mounted account IS a legal target — the launch JOINS its existing
+    mount (same dir, same login family, no second mount, no clobber) instead
+    of minting a new one. So when every healthy account is live (the saturated
+    regime that used to refuse), return the lowest-estimated-usage live
+    account and let _launch_prepare route it to the join path. Returns None
+    only when every account is expired/erroring (or lane_sharing is off).
     """
     # Spread preference: any account a slot entry names, plus the shared active.
     spread_occupied = {e.get("account") for e in state.get("slots", {}).values() if e.get("account")}
@@ -1510,40 +2344,34 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         except Exception:
             return None
 
+    # Operator-disabled accounts are out of rotation for launches too — and
+    # these two raw fallbacks below BYPASS pick_swap_target's universal
+    # filters, so they need the exclusion explicitly (2026-07-03).
+    disabled = _disabled_accounts(config)
+
     # First: spread across all mounts. Fallback: allow reusing idle-slot
     # accounts, but still never a live-mount account.
     target = _try(spread_occupied) or _try(live_occupied)
     if target is None:
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
-                 if not a.get("token_expired") and not a.get("poll_error") and n not in live_occupied]
+                 if not a.get("token_expired") and not a.get("poll_error")
+                 and n not in live_occupied and n not in disabled]
         if cands:
             n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
+    # Lane-share final fallback (GH #109 lanes, 2026-07-03): every healthy
+    # account is on a live mount. Joining a live mount is safe (shared dir,
+    # shared login family), so pick the healthiest live account rather than
+    # refusing — the refusal predates lanes and left `cus launch auto` dead
+    # whenever slots saturated the pool, even with a 4%-used account joinable.
+    if target is None and config.get("per_session", {}).get("lane_sharing", False):
+        cands = [(n, a) for n, a in state.get("accounts", {}).items()
+                 if not a.get("token_expired") and not a.get("poll_error")
+                 and n in live_occupied and n not in disabled]
+        if cands:
+            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+            target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
     return target
-
-
-def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, Path]:
-    """Find a free slot for a launch (create one if none). Caller save_state()s.
-
-    Preference order: a free slot ALREADY holding prefer_account (no swap
-    needed — cheapest launch), then any free slot, then a new slot. A slot
-    dir on disk with no state entry (orphan) is adopted rather than ignored.
-    """
-    slots_state = state.setdefault("slots", {})
-    free: list[Path] = []
-    for d in list_slot_dirs():
-        if mount_in_use(d):
-            continue
-        if d.name not in slots_state:
-            slots_state[d.name] = {"account": None, "created_ts": now_iso()}
-        free.append(d)
-    if prefer_account:
-        for d in free:
-            if slots_state[d.name].get("account") == prefer_account:
-                return d.name, d
-    if free:
-        return free[0].name, free[0]
-    return create_slot(state)
 
 
 def mount_in_use(mount: Path) -> bool:
@@ -1754,6 +2582,45 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
     except (json.JSONDecodeError, OSError) as e:
         return {"action": "skipped", "account": expected_account, "detail": f"unreadable live creds: {e}"}
 
+    # Pool model (#109): a LEASED mount's live tokens belong to its claimed
+    # login family, not the account snapshot — route the save-back to the
+    # family dir, mirroring the swap-path save-back in _execute_swap_locked.
+    # Regression fixed 2026-07-03: this shared function (periodic save-back +
+    # slot gc) lacked the branch, so minutes after slot-2 claimed
+    # rayi3/family-1 the PERIODIC save-back stomped account-rayi3's snapshot
+    # with the family's tokens — leaving the snapshot family's freshest
+    # tokens existing only on slot-7's live mount, and any future
+    # snapshot-install double-booking family-1 with slot-2 (#104). Bypasses
+    # classify_live_creds_owner by design: a pooled family's refresh token
+    # matches no snapshot, so classification can only mis-route it.
+    slot_name = mount.name if mount.name.startswith(SLOT_PREFIX) else None
+    lease = slot_leased_family(state, slot_name) if slot_name else None
+    if (lease is not None and expected_account and lease[0] == expected_account
+            and independent_logins_enabled()):
+        fam_path = login_family_creds_path(*lease)
+        live_exp = _creds_expires_at(live_creds)
+        fam_exp = None
+        if fam_path.exists():
+            try:
+                fam_exp = _creds_expires_at(read_json(fam_path))
+            except (json.JSONDecodeError, OSError):
+                fam_exp = None
+        # Same GH #77 freshness guards as the snapshot path below, applied to
+        # the family store file instead.
+        if fam_exp is not None and live_exp is not None and fam_exp > live_exp:
+            return {"action": "skipped", "account": expected_account,
+                    "detail": f"family store fresher than live ({lease[0]}/{lease[1]})"}
+        if only_if_fresher and not (fam_exp is not None and live_exp is not None and live_exp > fam_exp):
+            return {"action": "skipped", "account": expected_account,
+                    "detail": "live not fresher than family store (periodic no-op)"}
+        backup_credentials_file(fam_path)
+        atomic_write_bytes(fam_path, json.dumps(live_creds, indent=2).encode(), mode=0o600)
+        _cred_audit("saveback", "wrote", "pooled family store (#109)",
+                    slot=slot_name, mount=mount.name, account=expected_account,
+                    login_family=f"{lease[0]}/{lease[1]}", token_fp=_audit_token_fp(live_creds))
+        return {"action": "saved", "account": expected_account, "family": lease[1],
+                "detail": f"pooled login {lease[0]}/{lease[1]} (#109 pool)"}
+
     verdict, owner, detail = classify_live_creds_owner(live_creds, expected_account or "", state)
     if verdict in ("invalid", "conflict"):
         return {"action": "skipped", "account": expected_account, "detail": f"{verdict}: {detail}"}
@@ -1764,6 +2631,33 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         return {"action": "skipped", "account": None, "detail": f"no owner resolvable ({verdict}: {detail})"}
 
     snap = ACCOUNTS_DIR / f"account-{save_to}" / ".credentials.json"
+    # ---- 2026-07-06 wrong-account clobber guard (periodic/gc credentials) ----
+    # For an "unknown" verdict (no refresh-token lineage — rotation-shaped) cross-
+    # check the MOUNT's own .claude.json identity against save_to's trusted anchor
+    # (meta.yaml + login families). A drifted mount whose identity disagrees is not
+    # a rotation; saving its tokens into save_to's snapshot is the same clobber the
+    # swap path guards. "expected"/"foreign" verdicts are lineage-proven and bypass
+    # this. Degrades to allow when there is no anchor (unchanged legacy behavior).
+    if verdict == "unknown":
+        mount_cj = mount_claude_json_path(mount)
+        mount_ident = {}
+        if mount_cj.exists():
+            try:
+                mount_ident = _identity_fields(read_json(mount_cj))
+            except (json.JSONDecodeError, OSError):
+                mount_ident = {}
+        ok, why = guard_canonical_identity_write(save_to, mount_ident)
+        if not ok:
+            sidecar = quarantine_rejected_canonical_write(
+                snap, json.dumps(live_creds, indent=2).encode(), why)
+            _cred_audit("identity-refuse", "refused-identity", why,
+                        slot=slot_name, mount=mount.name, account=save_to,
+                        incoming_identity=mount_ident, emit_identity=True,
+                        existing_identity=account_identity_anchor(save_to)[0],
+                        token_fp=_audit_token_fp(live_creds),
+                        extra="quarantined=" + sidecar.name)
+            return {"action": "refused_wrong_account", "account": save_to,
+                    "detail": f"drifted mount, unknown lineage — {why}; quarantined to {sidecar.name}"}
     # GH #77: never let an older live file clobber a fresher snapshot (e.g.
     # the account was re-logged-in out-of-band while this mount sat idle).
     live_exp = _creds_expires_at(live_creds)
@@ -1773,12 +2667,23 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         except (json.JSONDecodeError, OSError):
             snap_exp = None
         if snap_exp is not None and live_exp is not None and snap_exp > live_exp:
+            _cred_audit("freshness-skip", "skipped-freshness", "snapshot fresher than live (GH #77)",
+                        slot=slot_name, mount=mount.name, account=save_to,
+                        token_fp=_audit_token_fp(live_creds))
             return {"action": "skipped", "account": save_to, "detail": "snapshot fresher than live (GH #77)"}
         if only_if_fresher and not (snap_exp is not None and live_exp is not None and live_exp > snap_exp):
             return {"action": "skipped", "account": save_to, "detail": "live not fresher than snapshot (periodic no-op)"}
     backup_credentials_file(snap)
     atomic_write_bytes(snap, json.dumps(live_creds, indent=2).encode(), mode=0o600)
     action = "saved_to_owner" if verdict == "foreign" else "saved"
+    # Audit the canonical-store write: incoming = the mount's own identity, existing
+    # = save_to's trusted anchor. In a clobber these disagree — the whole reason the
+    # line records both. `verdict` (expected/foreign/unknown) explains the routing.
+    _cred_audit("saveback", "wrote", f"snapshot save-back (verdict={verdict})",
+                slot=slot_name, mount=mount.name, account=save_to,
+                incoming_identity=_dir_identity_of_mount(mount), emit_identity=True,
+                existing_identity=account_identity_anchor(save_to)[0],
+                token_fp=_audit_token_fp(live_creds))
     return {"action": action, "account": save_to, "detail": detail}
 
 
@@ -2052,6 +2957,10 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     inactive interval and defeating the adaptive repoll entirely.
     """
     interval = _account_poll_interval(state, config, account_name)
+    # Preserve the un-shortened class cadence: Fix B's "will it cross the step by
+    # the next poll" projection horizon must be the NORMAL interval, not one
+    # already shrunk by the token_stale fast-track below.
+    normal_interval = interval
     acct = state.get("accounts", {}).get(account_name, {})
     last = acct.get("last_poll_ts")
     if not last:
@@ -2061,6 +2970,53 @@ def _account_poll_due(state: dict, config: dict, account_name: str) -> tuple[boo
     except (ValueError, AttributeError):
         return True, "unparseable last_poll_ts"
     role = "active" if _account_on_fast_cadence(state, config, account_name) else "inactive"
+    # token_stale fast-track (2026-07-05 incident): a token_stale account
+    # (stored access token aged out, refresh token still valid) must be
+    # re-polled PROMPTLY, not left sitting on a stale cached % for hours.
+    # poll_account_usage()'s self-refresh preflight (_refresh_account_token)
+    # can only mint a fresh token and re-fetch REAL usage when the account is
+    # actually polled — but Branch 0 restamps last_poll_ts every stale cycle,
+    # so an INACTIVE spare then waits the full slow inactive_interval before
+    # the next attempt, leaving its cached value looking authoritative. Force
+    # such accounts onto the FAST (active) cadence so a valid refresh token
+    # clears token_stale within one active interval instead of a whole slow
+    # cycle. Graceful-degrade preserved: a genuinely dead refresh token stays
+    # token_stale and simply retries at the fast (NOT every-cycle) cadence — no
+    # crash, no busy-loop, and the 429 poll-backoff gate still runs first in
+    # the daemon loop. Only ever SHORTENS the interval (min()), so a stale
+    # account already on the fast cadence is unaffected.
+    if acct.get("token_stale"):
+        polling_cfg = config.get("polling", {})
+        flat = config.get("poll_interval_seconds", 300)
+        fast_interval = polling_cfg.get("active_interval_seconds") or flat
+        if fast_interval < interval:
+            interval = fast_interval
+            role = f"{role}/token_stale-fast"
+    # Fix B — near-threshold acceleration (2026-07-06 rayi3 incident). An account
+    # whose burn-extrapolated usage is within poll_accel.within_pct_of_step of its
+    # next swap step (or projected to cross it before the next NORMAL poll) is
+    # polled on the fast `fast_interval_seconds` cadence, so the daemon sees a fast
+    # burn toward the cap in time to swap BEFORE it. `normal_interval` (the class
+    # cadence computed above, before any token_stale shortening) is the projection
+    # horizon for the "will it cross by next poll" test. Bounded by design: only
+    # accounts actually near a step accelerate — the fleet is NOT blanket-fast-
+    # polled (that is the 2026-06-19 429-burnout trap). The 429 poll-backoff gate
+    # still wins: an account in reactive backoff is skipped in the daemon loop
+    # BEFORE this function, and we re-check `account_in_backoff` here so the
+    # status-preview / any other caller never fast-polls a throttled account.
+    # Only ever SHORTENS the interval (min via the `<` guard), never lengthens it.
+    if _poll_accel_enabled(config):
+        in_backoff, _ = account_in_backoff(state, account_name)
+        # Lane count feeds the clustered-account band widening (2026-07-06): an
+        # account backing several live lanes must fast-poll EARLIER because its
+        # compounded burn outruns the single-lane burn_rate the estimator measured.
+        lane_count = len(occupied_slot_accounts(state).get(account_name, []))
+        if not in_backoff and _account_near_step(acct, config, normal_interval,
+                                                 lane_count=lane_count):
+            fast = float(config.get("poll_accel", {}).get("fast_interval_seconds", 45))
+            if fast < interval:
+                interval = fast
+                role = f"{role}/near-step-fast"
     # GH #59 composition: a 5h window that reset AFTER our last poll means the
     # stored usage is pre-reset garbage — poll now regardless of cadence class,
     # so the adaptive early wake actually refreshes the account it woke for.
@@ -2076,28 +3032,601 @@ def _read_access_token_with_expiry(account_name: str) -> tuple[str | None, int |
     """Like _read_access_token but also returns the stored expiresAt timestamp.
 
     expiresAt is the Unix milliseconds at which the stored access token
-    expires (per the OAuth flow). Returns (None, None) if the file can't be
+    expires (per the OAuth flow). Returns (None, None) if no file can be
     read. The expiresAt is used to detect "token stale, not actually expired"
     (GH #13) — when an inactive account's stored access token has aged out
     but its refresh token is still valid, polling will 401 even though the
     account is fully usable.
+
+    Credential source preference (2026-07-03 token-stale blindness incident,
+    GH #130). We poll with the FRESHEST credential we can find for this
+    account, in order:
+      1. the live shared mount (CREDS_JSON) when this account is the
+         shared-active one — Claude Code refreshes it transparently on use;
+      2. any SLOT that backs this account whose dir exists — a live LANE's
+         own `.credentials.json` is kept fresh by the running Claude Code
+         session on top of it, so it is the best token to poll with and it
+         exists precisely when the primary account store is most likely to be
+         stale (the exact condition that blinded `rayi2` for 3.7h). Live slots
+         (a session actually running, `mount_in_use`) are preferred over idle
+         ones; among live slots order is arbitrary (any live token is fresh);
+      3. the account's primary store (`account_creds_path`) — the historical
+         fallback.
+    We return the FIRST candidate whose access token is not already past its
+    expiresAt (same 30s-grace staleness convention the caller in
+    poll_account_usage applies). If EVERY candidate is stale, we return the
+    primary store's pair exactly as before so `token_stale` detection still
+    fires downstream (and, if the primary is missing, the first stale pair we
+    did find, so an active account still reads as token_stale rather than
+    "no access_token").
+
+    READ-ONLY by contract: this NEVER writes, refreshes, or rotates a token.
+    OAuth refresh tokens are single-use — refreshing the wrong file here would
+    log a live session out (GH #104). We only CHOOSE which existing file to
+    read; the return contract stays (accessToken, expiresAt).
     """
     try:
         state = load_state() if STATE_JSON.exists() else {}
     except Exception:
         state = {}
+
+    def _read_pair(path: Path) -> tuple[str | None, int | None]:
+        """(accessToken, expiresAt) from a creds file, or (None, None).
+
+        Missing/corrupt files are swallowed silently (same try/except style as
+        the historical single-path read) so one bad slot creds file never
+        blocks the daemon from finding a good one — the whole point of having
+        multiple candidates. GH #130 failure mode: a slot whose
+        `.credentials.json` is absent or half-written must simply be skipped.
+        """
+        try:
+            if not path.exists():
+                return None, None
+            creds = read_json(path)
+            oauth = creds.get("claudeAiOauth", {})
+            return oauth.get("accessToken"), oauth.get("expiresAt")
+        except (json.JSONDecodeError, OSError):
+            return None, None
+
+    def _is_fresh(expires_at) -> bool:
+        """Mirror poll_account_usage's staleness test: fresh iff expiresAt is
+        not more than 30s in the past. An unknown/unparseable expiresAt counts
+        as fresh — we can't prove it stale, and the live HTTP call will still
+        surface a real 401 as token_expired if the token is actually dead."""
+        if expires_at is None:
+            return True
+        try:
+            now_ms = int(time.time() * 1000)
+            return int(expires_at) >= now_ms - 30_000
+        except (TypeError, ValueError):
+            return True
+
+    # Assemble candidate creds paths in preference order (see docstring).
+    candidates: list[Path] = []
+    # (1) live shared mount, only when this account is the shared-active one.
     if state.get("active") == account_name and CREDS_JSON.exists():
-        creds_path = CREDS_JSON
-    else:
+        candidates.append(CREDS_JSON)
+    # (2) slots backing this account; live slots first, idle slots after. A
+    # live slot's creds are refreshed by the session running on it, so they
+    # beat both an idle slot and (usually) the primary store for freshness.
+    live_slot_creds: list[Path] = []
+    idle_slot_creds: list[Path] = []
+    for slot_name, entry in state.get("slots", {}).items():
+        if (entry or {}).get("account") != account_name:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists():
+            continue
+        cred = d / ".credentials.json"
+        if not cred.exists():
+            continue
+        try:
+            # mount_in_use walks /proc; occupied_slot_accounts caches it for 5s
+            # per cycle, but a direct call here is cheap enough (one slot) and
+            # a few seconds of staleness only picks idle-vs-live ordering, not
+            # correctness — both get tried.
+            (live_slot_creds if mount_in_use(d) else idle_slot_creds).append(cred)
+        except Exception:
+            idle_slot_creds.append(cred)
+    candidates.extend(live_slot_creds)
+    candidates.extend(idle_slot_creds)
+    # (3) primary account store — historical fallback, always last.
+    primary = account_creds_path(account_name)
+    candidates.append(primary)
+
+    # First non-stale candidate wins. Track the primary's pair (task contract:
+    # all-stale returns the primary) and the first present-but-stale pair (so a
+    # missing primary still yields token_stale rather than a false "no token").
+    primary_pair: tuple[str | None, int | None] = (None, None)
+    first_stale_pair: tuple[str | None, int | None] = (None, None)
+    for path in candidates:
+        token, expires_at = _read_pair(path)
+        if path == primary:
+            primary_pair = (token, expires_at)
+        if token is None:
+            continue
+        if _is_fresh(expires_at):
+            return token, expires_at
+        if first_stale_pair[0] is None:
+            first_stale_pair = (token, expires_at)
+    return primary_pair if primary_pair[0] is not None else first_stale_pair
+
+
+def _refresh_account_token(account_name: str, creds_path: Path | None = None) -> bool:
+    """Best-effort OAuth refresh_token grant for an inactive account whose
+    stored access token has aged out (the token_stale condition, GH #13).
+
+    Talks to the SAME undocumented endpoint the `claude` CLI itself uses to
+    silently refresh a live account's token every ~hour — extracted
+    2026-07-02 via `strings` on the installed @anthropic-ai/claude-code
+    binary's own OAuth client config (OAUTH_TOKEN_URL / OAUTH_CLIENT_ID
+    above). It is NOT a published API. Costs no usage quota (a pure
+    token-mint call, not a `/v1/messages` inference call) and creates no
+    session — unlike spawning a real `claude` probe session, which was
+    considered and rejected for exactly those two reasons.
+
+    Returns True only on a CONFIRMED successful refresh (new access token
+    written back to the account's stored `.credentials.json`). Returns False
+    on ANY failure — disabled via `token_self_refresh.enabled`, missing or
+    unreadable creds, missing refresh token, network error, non-200, or a
+    malformed response. Callers MUST treat False as "fall back to the
+    pre-existing token_stale behavior", never as an error to surface —
+    Anthropic can change the client_id/URL/response shape without notice,
+    so silent, total fallback on any surprise is the only safe posture.
+
+    2026-07-07 (blank-mount preempt, Fix 1): `creds_path` optionally targets a
+    SPECIFIC credentials file instead of the account snapshot. The default
+    (None → the account's snapshot at `account_creds_path`) is the pre-existing
+    behavior every prior caller relies on. The preempt path passes a live LANE
+    mount's own `.credentials.json` so the fresh access token lands directly in
+    the file the running session reads — exactly what Claude Code's own in-place
+    refresh does, but driven reliably by cus ahead of expiry. Using the mount's
+    OWN refresh token (read from that file) and writing back only to that file
+    keeps it family-safe (#104): no other mount/store is touched, and the daemon's
+    existing save-back propagates the fresh token to the canonical store on the
+    next cycle, just as it does after a Claude Code refresh.
+    """
+    if not load_config().get("token_self_refresh", {}).get("enabled", True):
+        return False
+
+    if creds_path is None:
         creds_path = account_creds_path(account_name)
     if not creds_path.exists():
-        return None, None
+        return False
     try:
         creds = read_json(creds_path)
-        oauth = creds.get("claudeAiOauth", {})
-        return oauth.get("accessToken"), oauth.get("expiresAt")
+    except (OSError, json.JSONDecodeError):
+        return False
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    refresh_token = oauth.get("refreshToken")
+    if not refresh_token:
+        return False
+
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+        "scope": " ".join(oauth.get("scopes") or []),
+    }).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            # Must use OAUTH_USER_AGENT, not a project-branded string: #127
+            # verified 2026-07-03 that platform.claude.com sits behind Cloudflare,
+            # which 403s (code 1010) urllib's default UA. The #127 claim-time
+            # probe hits this same endpoint with this same header; reuse it so
+            # both callers present the one User-Agent known to pass the WAF.
+            "User-Agent": OAUTH_USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OAUTH_REFRESH_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode())
+    # OSError is the umbrella for socket/SSL/connection failures that aren't
+    # always wrapped in URLError (e.g. ssl.SSLError, ConnectionResetError);
+    # catching it keeps the fail-silent contract total, per the docstring —
+    # any surprise from this undocumented endpoint must degrade to the
+    # pre-existing token_stale flag, never crash the poll.
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError,
+            json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+    access_token = data.get("access_token")
+    expires_in = data.get("expires_in")
+    if not isinstance(access_token, str) or not access_token or not isinstance(expires_in, (int, float)):
+        return False
+
+    oauth["accessToken"] = access_token
+    oauth["refreshToken"] = data.get("refresh_token") or refresh_token
+    oauth["expiresAt"] = int(time.time() * 1000) + int(expires_in * 1000)
+    scope = data.get("scope")
+    if isinstance(scope, str) and scope:
+        oauth["scopes"] = scope.split(" ")
+    creds["claudeAiOauth"] = oauth
+
+    try:
+        backup_credentials_file(creds_path)
+        write_json(creds_path, creds, mode=0o600)
+    except OSError:
+        return False
+    return True
+
+
+def _unstale_account_snapshot(account: str, state: dict, config: dict | None = None,
+                              *, force: bool = False) -> bool:
+    """Un-stale an idle `token_stale` account by minting a fresh access token via a
+    DIRECT OAuth refresh grant and writing it back to the account SNAPSHOT (Fix 4,
+    2026-07-07). Clears the `token_stale` flag on `state.accounts[account]` (caller
+    persists). Returns True only on a confirmed refresh+writeback.
+
+    The bug it fixes (verified live: `cus force-poll merkos` left token_stale set):
+    an idle account whose stored access token expired — nothing exercises it — sits
+    `token_stale` forever even though its REFRESH token is still valid. That yields
+    (a) chronically wrong cus readings and (b) "stale snapshot → blank on install"
+    when a lane swaps onto it (the chats1a-on-merkos blank). The poll-time
+    `_refresh_account_token` is gated by `token_self_refresh.enabled` and folded
+    into a poll, so it may never clear a stale flag; this is the explicit,
+    ungated-by-that-flag un-stale.
+
+    Uses `_oauth_refresh_grant` (#127) — a pure token-mint call: no session, no
+    haiku, no billed tokens. Recoverable case only (a valid stored refresh token):
+      * grant `alive`   → persist the rotated tokens into the snapshot (the old
+                          refresh token is dead the instant the grant succeeds),
+                          clear token_stale, audit `decision=refreshed`, return True.
+      * grant `dead`    → invalid_grant: the refresh token genuinely needs a
+                          browser relogin. Leave token_stale flagged, audit
+                          `decision=failed`, return False — and DON'T retry tightly.
+      * grant `unknown` → network/endpoint drift: fail-open, leave flagged, retry
+                          later (bounded by the cooldown).
+
+    Poll-burnout backoff: at most one attempt per account per
+    `token_self_refresh.unstale_cooldown_minutes`, unless `force` (force-poll is
+    operator-invoked, so it bypasses the cooldown). Never raises into the caller."""
+    cfg = config if config is not None else load_config()
+    acct = state.get("accounts", {}).get(account) if isinstance(state, dict) else None
+    if not isinstance(acct, dict):
+        return False
+    # Only the recoverable idle case: stale but NOT hard-expired (a real 401 on a
+    # non-expired stored token is token_expired — that needs a browser relogin, not
+    # a refresh grant).
+    if not acct.get("token_stale") or acct.get("token_expired"):
+        return False
+    # Poll-burnout backoff (per account, success OR fail), bypassed by force.
+    now = time.time()
+    cooldown_min = cfg.get("token_self_refresh", {}).get("unstale_cooldown_minutes", 10)
+    if not force:
+        last = _UNSTALE_ATTEMPT_MS.get(account)
+        if last is not None and (now - last) < cooldown_min * 60:
+            return False
+    _UNSTALE_ATTEMPT_MS[account] = now
+
+    snap = account_creds_path(account)
+    if not snap.exists():
+        _cred_audit("unstale-refresh", "failed", "no account snapshot on disk",
+                    account=account, token_fp="none")
+        return False
+    try:
+        creds = read_json(snap)  # dict — narrowed so the writeback below is type-clean
     except (json.JSONDecodeError, OSError):
-        return None, None
+        return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # No usable refresh token in the snapshot → genuinely needs a relogin.
+        _cred_audit("unstale-refresh", "failed", "no usable refresh token in account snapshot",
+                    account=account, token_fp="none")
+        return False
+
+    verdict, tok = _oauth_refresh_grant(rt)
+    if verdict != "alive" or not isinstance(tok, dict):
+        # A definitive invalid_grant is the "dead snapshot" signal (2026-07-07 merkos
+        # incident): flag it on the account so the swap-target picker excludes it and
+        # the SOS surfaces it (no extra network call — this probe already ran). An
+        # "unknown" (network/endpoint) verdict is NOT recorded as dead — that would be
+        # a transient masquerading as a death certificate.
+        if verdict == "dead":
+            acct["snapshot_refresh_dead"] = True
+        _cred_audit("unstale-refresh", "failed",
+                    f"refresh grant {verdict} (dead ⇒ browser relogin; unknown ⇒ retry later)",
+                    account=account, token_fp=_audit_token_fp(creds))
+        return False
+
+    # Persist the rotation BEFORE clearing the flag — after a successful grant the
+    # snapshot's OLD refresh token is a dead branch (single-use rotation, #104), so
+    # the fresh pair must land on disk or we'd lose the family. Whole assembly is
+    # guarded so a malformed grant response can never crash the caller.
+    try:
+        access = tok.get("access_token")
+        if not isinstance(access, str) or not access:
+            _cred_audit("unstale-refresh", "failed", "grant returned no access_token",
+                        account=account, token_fp=_audit_token_fp(creds))
+            return False
+        oauth = dict(creds.get("claudeAiOauth") or {})
+        oauth["accessToken"] = access
+        oauth["refreshToken"] = tok.get("refresh_token") or rt
+        expires_in = tok.get("expires_in")
+        if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+            oauth["expiresAt"] = int((time.time() + float(expires_in)) * 1000)
+        new_creds = dict(creds)
+        new_creds["claudeAiOauth"] = oauth
+        backup_credentials_file(snap)
+        write_json(snap, new_creds, mode=0o600)
+    except (OSError, TypeError, ValueError):
+        return False
+
+    # Clear the stale flag in state (caller saves). token_expired stays cleared too
+    # — a working refresh grant proves the account is reachable. Clear any prior
+    # dead-snapshot flag too: the grant just proved the snapshot's refresh token is
+    # ALIVE (e.g. after a relogin restored it), so it must no longer be excluded.
+    acct.pop("token_stale", None)
+    acct.pop("snapshot_refresh_dead", None)
+    acct["token_expired"] = False
+    _cred_audit("unstale-refresh", "refreshed",
+                "minted fresh access token via direct OAuth grant; cleared token_stale",
+                account=account, token_fp=_audit_token_fp(new_creds),
+                extra=f"new_expiry={_expiry_repr(new_creds)}")
+    return True
+
+
+def _sweep_unstale_idle_accounts(state: dict, config: dict) -> list[str]:
+    """Each daemon cycle, un-stale every account still flagged token_stale (Fix 4).
+
+    Cheap self-healing pass over the accounts the poll just left token_stale (and
+    not token_expired): a direct refresh grant per account, cooldown-bounded so it
+    can't burn out, snapshot-writeback + flag-clear on success. Gated by
+    `token_self_refresh.unstale_idle_on_poll` (default True). Returns the list of
+    un-staled account names. Even if the caller never persists the cleared flag,
+    the snapshot writeback is durable — next cycle's poll reads the fresh token and
+    clears token_stale via the normal success path — so this can only help."""
+    if not config.get("token_self_refresh", {}).get("unstale_idle_on_poll", True):
+        return []
+    out: list[str] = []
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict):
+            continue
+        if acct.get("token_stale") and not acct.get("token_expired"):
+            if _unstale_account_snapshot(name, state, config):
+                out.append(name)
+    return out
+
+
+# --------------------------------------------------------------------------
+# clock_keepalive (2026-07-07 operator directive) — keep every account's 5h
+# usage window ticking. See DEFAULT_CONFIG["clock_keepalive"] for the full WHY.
+# --------------------------------------------------------------------------
+
+def _5h_clock_dormant(acct: dict, now_dt: datetime) -> bool:
+    """Is this account's 5-hour usage window NOT currently running?
+
+    Claude's 5h window is a FIXED window: it starts on the account's first model
+    request after a dormant period and resets ~5h later. While it runs, the poll
+    stores its end as `five_hour_resets_at` (an ISO timestamp in the FUTURE). So
+    the window is:
+      * RUNNING (not dormant) ⇔ `five_hour_resets_at` parses and is in the future
+        — something (a live lane, or a recent keepalive ping) started the clock
+        and it is still ticking down.
+      * DORMANT ⇔ there is no future reset: the field is absent, unparseable, or
+        already in the past (the window lapsed and nothing restarted it).
+
+    A dormant clock is the state clock_keepalive exists to break — it will not
+    reset on a predictable cadence, so no "fresh in ~5h" capacity is coming from
+    this account until something pings it. This is a pure predicate (no I/O) so
+    it stays unit-testable apart from the sweep's creds/HTTP side effects."""
+    reset_at = acct.get("five_hour_resets_at")
+    if reset_at:
+        try:
+            reset_dt = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+            if reset_dt > now_dt:
+                return False  # window still ticking → NOT dormant
+        except (TypeError, ValueError):
+            pass  # unparseable ⇒ treat as no known running window ⇒ dormant
+    return True
+
+
+def _keepalive_token_for(account: str, acct: dict, state: dict,
+                         config: dict) -> tuple[str | None, str]:
+    """Resolve a VALID OAuth access token to send the keepalive ping with, or
+    (None, reason) to skip. NEVER pings with dead creds.
+
+    Two cases:
+      * canonical snapshot is refresh-DEAD (`snapshot_refresh_dead`, from the
+        un-stale sweep / seed-from-family PR): the account's own snapshot token
+        can't be trusted, so only ping if a VALID login family is available.
+        `claim_verified_login_family` proves a free family's refresh token alive
+        (rotating+persisting it) and we read that family's fresh access token.
+        No free/verifiable family ⇒ skip and leave the account for relogin.
+      * normal account: use the freshest snapshot/live token
+        (`_read_access_token_with_expiry`); if it has aged out, mint a fresh one
+        via `_refresh_account_token` (a direct refresh grant that writes back to
+        the SNAPSHOT only — never a live lane's .credentials.json) and re-read."""
+    if acct.get("snapshot_refresh_dead"):
+        if not has_free_login_family(account, state):
+            return None, "snapshot refresh-dead and no free login family — leave for relogin"
+        fam = claim_verified_login_family(account, state, config)
+        if not fam:
+            return None, "snapshot refresh-dead; no verified-alive login family available"
+        try:
+            fam_creds = read_json(login_family_creds_path(account, fam))
+            tok = (fam_creds.get("claudeAiOauth") or {}).get("accessToken")
+        except (OSError, json.JSONDecodeError):
+            tok = None
+        if not tok:
+            return None, f"login family {fam} yielded no usable access token"
+        return tok, f"using verified login family {fam} (snapshot refresh-dead)"
+
+    token, expires_at = _read_access_token_with_expiry(account)
+    now_ms = int(time.time() * 1000)
+    fresh = bool(token) and (expires_at is None or _int_or_none(expires_at, now_ms) >= now_ms - 30_000)
+    if not fresh:
+        # Aged out — mint a fresh access token via a direct refresh grant
+        # (writes back to the snapshot only) then re-read. Best-effort: on
+        # failure we fall through and skip below rather than ping a stale token.
+        if _refresh_account_token(account):
+            token, expires_at = _read_access_token_with_expiry(account)
+    if not token:
+        return None, "no usable access token (and refresh grant did not yield one)"
+    return token, "using account snapshot/live token"
+
+
+def _int_or_none(val, default: int) -> int:
+    """Best-effort int() for a stored expiresAt; `default` when unparseable so a
+    malformed timestamp is treated as fresh (the live HTTP call still surfaces a
+    real auth failure)."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _keepalive_ping(access_token: str, model: str) -> tuple[bool, str]:
+    """Send the MINIMAL keepalive model request that starts/keeps an account's
+    5h usage window ticking. Returns (ok, detail); NEVER raises.
+
+    The request is the smallest thing that still counts toward the window: one
+    user token "hi", `max_tokens=1`, the cheapest model. It is authenticated
+    with the account's OAuth (subscription) bearer token exactly as `claude -p`
+    is — hence the Claude Code system-prompt marker + the oauth beta header,
+    which the endpoint requires before it accepts a subscription token on
+    /v1/messages. This is the one seam tests mock — no real network in tests.
+
+    A 429 is reported as SUCCESS-for-our-purposes: an account Anthropic is
+    actively rate-limiting necessarily has a running 5h window, which is exactly
+    the ticking clock we wanted — nothing to do but record it and move on."""
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 1,
+        "system": KEEPALIVE_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        MESSAGES_API_URL, data=body,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "anthropic-beta": USAGE_API_BETA,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": OAUTH_USER_AGENT,
+        }, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=KEEPALIVE_TIMEOUT_SECONDS) as resp:
+            resp.read(USAGE_API_RESPONSE_LIMIT_BYTES)  # drain; body is irrelevant
+            return True, f"HTTP {getattr(resp, 'status', 200)}"
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return True, "HTTP 429 (already rate-limited; window is ticking)"
+        detail = ""
+        try:
+            detail = e.read(512).decode(errors="replace")[:200] if e.fp else ""
+        except OSError:
+            pass
+        return False, f"HTTP {e.code}: {detail}"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _sweep_clock_keepalive(state: dict, config: dict) -> list[str]:
+    """Each daemon cycle, keep every DORMANT account's 5h clock ticking (Fix,
+    2026-07-07 operator directive). Returns the names actually pinged this cycle.
+
+    For each ENABLED, non-`disabled`, in-scope account whose 5h window is DORMANT
+    (`_5h_clock_dormant`) and that is not being kept alive by a live lane, send a
+    single cheap keepalive ping (`_keepalive_ping`) — cooldown-bounded by
+    `clock_keepalive.min_ping_interval_minutes` (recorded as `last_keepalive_ping_ts`
+    per account) and skipping accounts in poll-backoff or needing relogin. On a
+    successful ping, force a usage re-poll of that account so `five_hour_resets_at`
+    reflects the now-ticking window. Every step is wrapped so a single account's
+    failure only logs (CRED-AUDIT) and moves on — never crashes the poll.
+
+    Routine non-candidates (out of scope, disabled, live lane, still-ticking) are
+    skipped SILENTLY to avoid flooding the log every cycle; only dormant accounts
+    we deliberately decline to ping (cooldown, backoff, dead creds, relogin) or
+    actually ping/fail get a CRED-AUDIT line."""
+    kcfg = config.get("clock_keepalive", {})
+    if not kcfg.get("enabled", True):
+        return []
+    interval_min = kcfg.get("min_ping_interval_minutes", 290)
+    model = kcfg.get("model", "claude-haiku-4-5-20251001")
+    allow = set(kcfg.get("accounts") or [])
+    deny = set(kcfg.get("exclude") or [])
+    now_dt = datetime.now(timezone.utc)
+    pinged: list[str] = []
+
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict):
+            continue
+        # ── silent, routine non-candidates (would flood the log every cycle) ──
+        if allow and name not in allow:
+            continue
+        if name in deny:
+            continue
+        if acct.get("disabled"):
+            continue  # disabled accounts are out of rotation — never ping
+        # A live lane actively making requests already keeps this account's clock
+        # ticking; pinging it would be wasteful. `_account_on_fast_cadence` is the
+        # existing "is this account burning right now" predicate (live slot, or the
+        # shared-active mount in use).
+        if _account_on_fast_cadence(state, config, name):
+            continue
+        if not _5h_clock_dormant(acct, now_dt):
+            continue  # window still ticking — nothing to keep alive
+
+        # ── dormant candidate: from here a decline/ping is worth one audit line ──
+        in_backoff, until = account_in_backoff(state, name)
+        if in_backoff:
+            _cred_audit("clock-keepalive-ping", "skipped",
+                        f"in poll-backoff until {until}", account=name)
+            continue
+        if acct.get("token_expired"):
+            _cred_audit("clock-keepalive-ping", "skipped",
+                        "token_expired — needs browser relogin", account=name)
+            continue
+        # Cooldown: at most one ping per account per min_ping_interval_minutes.
+        last_ping = acct.get("last_keepalive_ping_ts")
+        if last_ping:
+            try:
+                last_dt = datetime.fromisoformat(str(last_ping).replace("Z", "+00:00"))
+                if (now_dt - last_dt).total_seconds() < interval_min * 60:
+                    _cred_audit("clock-keepalive-ping", "skipped",
+                                f"within cooldown ({interval_min}m since last ping)",
+                                account=name)
+                    continue
+            except (TypeError, ValueError):
+                pass  # unparseable stamp ⇒ treat as no cooldown, proceed
+
+        token, why = _keepalive_token_for(name, acct, state, config)
+        if not token:
+            _cred_audit("clock-keepalive-ping", "skipped", why, account=name)
+            continue
+
+        try:
+            ok, detail = _keepalive_ping(token, model)
+        except Exception as e:  # noqa: BLE001 — a ping must never crash the poll
+            _cred_audit("clock-keepalive-ping", "failed",
+                        f"unexpected {type(e).__name__}: {e}", account=name)
+            continue
+
+        if not ok:
+            _cred_audit("clock-keepalive-ping", "failed", f"{why}; {detail}", account=name)
+            continue
+
+        # Success — stamp the cooldown, audit, then force a usage re-poll so
+        # `five_hour_resets_at` reflects the now-ticking window (caller persists).
+        acct["last_keepalive_ping_ts"] = now_iso()
+        _cred_audit("clock-keepalive-ping", "pinged", f"{why}; {detail}", account=name)
+        try:
+            update_state_with_usage(state, {name: poll_account_usage(name)})
+        except Exception as e:  # noqa: BLE001 — re-poll is a nicety, not required
+            _cred_audit("clock-keepalive-ping", "pinged",
+                        f"re-poll after ping failed ({type(e).__name__}); "
+                        f"next cycle will refresh five_hour_resets_at", account=name)
+        pinged.append(name)
+
+    return pinged
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -2118,6 +3647,12 @@ def poll_account_usage(account_name: str) -> AccountUsage:
     out (>1 hour since the last swap-to-this-account), because we wrote
     the access token to storage at swap-time but only the LIVE creds file
     gets the periodic refresh.
+
+    2026-07-02 (token_self_refresh): before falling back to token_stale, try
+    a self-refresh via _refresh_account_token. On success this re-reads a
+    fresh token/expiry and falls through to the normal HTTP poll below,
+    exactly as if the account had never gone stale. On any failure it's
+    unchanged from the pre-2026-07-02 behavior.
     """
     token, expires_at = _read_access_token_with_expiry(account_name)
     if not token:
@@ -2136,13 +3671,17 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             now_ms = int(time.time() * 1000)
             # 30s grace — don't fire on tokens that are about to expire mid-flight
             if int(expires_at) < now_ms - 30_000:
-                u = AccountUsage.empty()
-                u.token_stale = True
-                u.raw = {
-                    "error": "stored access token expired (refresh token still valid)",
-                    "expired_minutes_ago": (now_ms - int(expires_at)) // 60_000,
-                }
-                return u
+                stale_expires_at = expires_at
+                if _refresh_account_token(account_name):
+                    token, expires_at = _read_access_token_with_expiry(account_name)
+                if not token or expires_at is None or int(expires_at) < now_ms - 30_000:
+                    u = AccountUsage.empty()
+                    u.token_stale = True
+                    u.raw = {
+                        "error": "stored access token expired (refresh token still valid)",
+                        "expired_minutes_ago": (now_ms - int(stale_expires_at)) // 60_000,
+                    }
+                    return u
         except (TypeError, ValueError):
             pass
 
@@ -2287,10 +3826,37 @@ def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
 def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
     per_model_weekly_pct from state.json. Used to fold per-model weekly caps
-    into swap-target selection (_account_effective_pct)."""
+    into swap-target selection (_account_effective_pct).
+
+    Stale-guard (2026-07-05 incident): a token_stale (or otherwise un-observable
+    — rate_limited / token_expired / poll_error) account's cached
+    per_model_weekly_pct is last-known-good, possibly HOURS old or even
+    post-rollover — it is NOT a current reading. Treat it as UNKNOWN (return
+    0.0), never as a hard cap. Per-model weekly is a 7-day-window concept, so it
+    shares current_7d_pct's staleness fate (`_pct_is_unknown`).
+
+    Why this direction is the safe one: returning 0.0 for a stale account means
+    a STALE per-model % neither (a) EXCLUDES the account from swap-target
+    selection via pick_swap_target's `_max_model_weekly_from_acct(a) < model_cap`
+    filter (the "refused a target on a stale reading" error), nor (b) makes the
+    hard-cap anti-pingpong guard treat a chosen target as "still capped" on a
+    number we couldn't reconfirm. The incident: an operator+agent trusted a
+    token_stale account's cached `Fable=100%` as authoritative and moved a live
+    Fable session off it — but the account actually had Fable headroom.
+
+    The swap-AWAY force (decide_swap Trigger 1) is already safe WITHOUT this
+    guard: it reads FRESH usage via `_max_model_weekly_from_usage`, which is 0.0
+    for a token_stale account (its AccountUsage this cycle is empty), so a stale
+    per-model can never force a live lane OFF an account. This guard only closes
+    the CACHED-dict path used by target selection / the pingpong guard.
+    """
     enabled, allow = _per_model_weekly_gate(config)
     pm = acct.get("per_model_weekly_pct") or {}
     if not enabled or not pm:
+        return 0.0
+    # Per-model shares the 7d window's staleness: if we can't trust current_7d
+    # for this account, we can't trust its per-model weekly numbers either.
+    if _pct_is_unknown(acct, "current_7d_pct"):
         return 0.0
     vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
     return max(vals) if vals else 0.0
@@ -2356,6 +3922,22 @@ def _model_weekly_cap_for_config(config: dict) -> float:
     return float(cap) if cap is not None else _hard_7d_cap_for_config(config)
 
 
+def _model_weekly_target_cap_for_config(config: dict) -> float:
+    """Target-side bar for the per-model weekly gate (2026-07-03, user request).
+
+    The gate's two uses want DIFFERENT thresholds: swapping AWAY should wait
+    for cap_pct (drain the week's allotment you already have — evacuating a
+    lane at 87% wastes the last 10%), but swapping ONTO an account should stop
+    much earlier — arriving work immediately burns the model's remaining
+    headroom, so landing a fresh lane on an 87%-Fable account (the `default`
+    case: severity already "warning" upstream) just schedules the next
+    depletion. `per_model_weekly.target_cap_pct` sets the target-side bar;
+    unset falls back to cap_pct — symmetric, byte-identical pre-change
+    behavior."""
+    cap = config.get("per_model_weekly", {}).get("target_cap_pct")
+    return float(cap) if cap is not None else _model_weekly_cap_for_config(config)
+
+
 def _account_effective_pct(acct: dict, config: dict) -> float:
     """Apply thresholds.{five_hour,seven_day} config when computing an
     account's "effective" usage % — i.e. the value the ladder logic actually
@@ -2417,13 +3999,20 @@ def estimate_window_pct(acct: dict, window: str, config: dict, now=None) -> floa
     if not est_cfg.get("enabled", True):
         return polled
     rate = acct.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
-    last_poll = acct.get("last_poll_ts")
-    if rate <= 0 or not last_poll:
+    # Extrapolate forward from the last real OBSERVATION of `polled`, not the
+    # last poll ATTEMPT (2026-07-03 token-stale blindness incident, GH #130).
+    # `polled` (current_{window}_pct) is only refreshed on a successful poll;
+    # anchoring dt at an error-branch-restamped last_poll_ts would make the
+    # value look freshly-observed and UNDER-extrapolate (picker less
+    # conservative than reality). `or last_poll_ts` preserves today's behavior
+    # for legacy state that predates the field.
+    last_observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    if rate <= 0 or not last_observed:
         return polled
     if now is None:
         now = datetime.now(timezone.utc)
     try:
-        t0 = datetime.fromisoformat(last_poll.replace("Z", "+00:00"))
+        t0 = datetime.fromisoformat(last_observed.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return polled
     # Cap how far we trust a stale rate: a burn rate measured one interval ago
@@ -2433,10 +4022,26 @@ def estimate_window_pct(acct: dict, window: str, config: dict, now=None) -> floa
     return min(100.0, polled + rate * dt_min)
 
 
-def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> float:
+def _account_estimated_effective_pct(acct: dict, config: dict, now=None,
+                                     look_ahead_seconds: float = 0.0) -> float:
     """Like _account_effective_pct, but using extrapolated per-window values (C).
     Used by the target-fullness judgments (saturation filter + would-re-trip) so
-    a fast-climbing account near the line is treated as already-full."""
+    a fast-climbing account near the line is treated as already-full.
+
+    `look_ahead_seconds` (Fix A, 2026-07-06 rayi3 incident): project the burn
+    FORWARD past `now` by this many seconds — i.e. estimate where usage will be
+    by the time the daemon can next observe/act on this account (its poll
+    interval), not just where it is right now. The swap TRIGGER passes the
+    account's poll interval here so a fast burn that would blow past the ladder
+    step / cap in the unobserved gap between polls trips the swap THIS cycle
+    (default 0.0 = extrapolate-to-now, the original behavior for all existing
+    callers). Implemented by shifting the `now` passed to estimate_window_pct,
+    which already clamps to 100 and never returns below the polled value, so a
+    look-ahead only ever moves the result UP."""
+    if look_ahead_seconds:
+        if now is None:
+            now = datetime.now(timezone.utc)
+        now = now + timedelta(seconds=max(0.0, look_ahead_seconds))
     thr_cfg = config.get("thresholds", {})
     vals = []
     if thr_cfg.get("five_hour", True):
@@ -2449,6 +4054,189 @@ def _account_estimated_effective_pct(acct: dict, config: dict, now=None) -> floa
     # exhausted account is still excluded as a target by pick_swap_target's
     # explicit model-cap filter, so it can never be picked.
     return max(vals) if vals else 0.0
+
+
+# --------------------------------------------------------------------------
+# Near-threshold acceleration + extrapolation-aware trigger (2026-07-06 rayi3
+# incident). See DEFAULT_CONFIG["poll_accel"] for the full WHY. These are pure
+# helpers (usage dict + config + now → number / bool) so the swap-timing logic
+# is unit-testable apart from the poll I/O.
+# --------------------------------------------------------------------------
+
+def _poll_accel_enabled(config: dict) -> bool:
+    """Master gate for both near-threshold fixes. False ⇒ prior behavior
+    bit-for-bit (trigger reads raw polled %, no fast cadence)."""
+    return bool(config.get("poll_accel", {}).get("enabled", True))
+
+
+def _next_ladder_step(acct: dict, config: dict) -> float:
+    """The usage % this account's ladder will next trip at — its persisted
+    `next_swap_at_pct`, resolved against configured steps with the SAME
+    end-of-ladder sentinel handling decide_swap's Trigger 2 uses (a value >= 100
+    means the ladder ran off the end, so treat it as the last configured step —
+    the most aggressive but bounded threshold). Kept as a standalone pure helper
+    so Fix A (trigger) and Fix B (fast poll) agree on exactly which step matters.
+    """
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    step = acct.get("next_swap_at_pct", steps[0])
+    try:
+        step = float(step)
+    except (TypeError, ValueError):
+        step = float(steps[0])
+    if step >= 100:
+        step = float(steps[-1])
+    return step
+
+
+def _account_near_step(acct: dict, config: dict, normal_interval_seconds: float,
+                       now=None, lane_count: int = 0) -> bool:
+    """Is this account close enough to its next ladder step to warrant fast
+    polling (Fix B)? True when EITHER:
+      (1) its burn-extrapolated usage (to now) is within `within_pct_of_step`
+          points of the step — we're in the danger zone and want frequent
+          confirmation; OR
+      (2) its measured burn rate projects it CROSSING the step before the next
+          NORMAL poll (`normal_interval_seconds` out) — a fast climber that is
+          still numerically below the band but won't be for long.
+    Pure predicate over the account dict + config; `normal_interval_seconds` is
+    passed in (not read from state) precisely to keep it I/O-free and testable.
+    Returns False when poll_accel is disabled, so the gate reverts cleanly.
+
+    `lane_count` (2026-07-06 rayi4 incident): how many LIVE lanes this account
+    backs. An account under N concurrent live sessions climbs ~N× faster than its
+    per-account `burn_rate` (measured before those lanes piled on) predicts, so
+    the near-step band is widened by `poll_accel.cluster_within_bonus_pct` per
+    EXTRA lane. Default 0 ⇒ single-lane behavior (band unchanged). This is why
+    clustered rayi4 sat at 84% on the slow cadence and rode past its 95% step —
+    the plain 5-pt band never triggered until it was already too late."""
+    if not _poll_accel_enabled(config):
+        return False
+    pa = config.get("poll_accel", {})
+    within = float(pa.get("within_pct_of_step", 5))
+    if lane_count > 1:
+        within += float(pa.get("cluster_within_bonus_pct", 10)) * (lane_count - 1)
+    step = _next_ladder_step(acct, config)
+    # (1) already inside the band on the extrapolated NOW value.
+    if _account_estimated_effective_pct(acct, config, now) >= step - within:
+        return True
+    # (2) projected to cross the step by the next normal poll.
+    projected = _account_estimated_effective_pct(
+        acct, config, now, look_ahead_seconds=normal_interval_seconds)
+    return projected >= step
+
+
+def _burn_extrapolation_delta(acct: dict, window: str, config: dict, now=None,
+                              look_ahead_seconds: float = 0.0) -> float:
+    """Pct-points a window is projected to climb from its last OBSERVATION to
+    now+look_ahead at the measured burn rate. 0.0 when the estimator is off, no
+    rate has been measured, or the anchor timestamp is missing/unparseable.
+
+    Exists for the per-model weekly projection: per-model weekly rides the 7d
+    window and cus tracks no per-model burn rate of its own, so Fix A projects
+    the per-model % forward on the 7d rate (a shared-window proxy). Mirrors the
+    dt/cap math inside estimate_window_pct but returns just the DELTA so it can
+    be added to a per-model base that estimate_window_pct doesn't know about.
+    Conservative: rate is only ever positive (see _compute_burn_rate), so the
+    delta only pushes the projected value UP."""
+    est_cfg = config.get("estimator", {})
+    if not est_cfg.get("enabled", True):
+        return 0.0
+    rate = acct.get(f"burn_rate_{window}_pct_per_min", 0.0) or 0.0
+    last_observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    if rate <= 0 or not last_observed:
+        return 0.0
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        t0 = datetime.fromisoformat(last_observed.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return 0.0
+    proj = now + timedelta(seconds=max(0.0, look_ahead_seconds))
+    max_min = est_cfg.get("max_extrapolation_minutes", 10)
+    dt_min = max(0.0, min((proj - t0).total_seconds() / 60.0, max_min))
+    return rate * dt_min
+
+
+def _is_seven_day_reset_drop(prev_pct, new_pct, config: dict) -> bool:
+    """True when a poll-over-poll change in current_7d_pct is a REAL 72h reset.
+
+    Field finding 2026-07-05 (gist: monperrus/3ac4b303a84946bbeaf2b1123ee99491):
+    the `seven_day` "weekly" budget actually refreshes every ~72h at a fixed UTC
+    anchor, not every 7 days. We can't read that boundary from the API (its
+    resets_at points ~7 days out, when the oldest tokens age off), so we infer
+    the reset from its only observable signature: utilization dropping SHARPLY
+    between two consecutive real observations.
+
+    Pure + side-effect-free so it's trivially testable in isolation from the
+    poll I/O. Guards against noise: a small downward fluctuation (measurement
+    jitter, or the gradual oldest-tokens-age-off trickle) is NOT a reset — only
+    a drop of at least `seven_day_reset_drop_pct` points counts. Cold start
+    (either value missing) returns False so the caller falls back to the API
+    timestamp until a real drop is observed.
+    """
+    if prev_pct is None or new_pct is None:
+        return False
+    drop_threshold = float(config.get("seven_day_reset_drop_pct", 15))
+    try:
+        return (float(prev_pct) - float(new_pct)) >= drop_threshold
+    except (TypeError, ValueError):
+        return False
+
+
+def projected_seven_day_reset(acct: dict, config: dict, now=None) -> str | None:
+    """Best estimate (ISO-8601 str) of when this account's 7d budget REALLY
+    refreshes — the value display + reset-proximity logic should prefer over the
+    raw API `seven_day_resets_at`.
+
+    Field finding 2026-07-05 (gist: monperrus/3ac4b303a84946bbeaf2b1123ee99491):
+    the real ~72h refresh lands BEFORE the API's ~7-day boundary, and the
+    earlier moment is the one operators care about — that's when budget frees up
+    and when a near-cap account becomes usable again.
+
+    Resolution order:
+      1. If we've OBSERVED a reset drop (`seven_day_last_reset_ts` is set),
+         project forward by `seven_day_reset_hours` (default 72). Because the
+         cadence is a FIXED anchor, a stale last-reset spanning several missed
+         cycles is rolled forward by whole 72h periods until the projection is
+         in the future.
+      2. Fall back to the API `seven_day_resets_at` on cold start (no drop seen
+         yet) — preserving pre-change behavior until we learn the real anchor.
+      3. When BOTH a projection and the API value exist, return the EARLIER of
+         the two (the real refresh precedes the oldest-tokens boundary).
+
+    Pure helper (reads state, no writes) so it's testable and safe to call from
+    any display/scoring path.
+    """
+    reset_hours = float(config.get("seven_day_reset_hours", 72))
+    api_ts = acct.get("seven_day_resets_at")
+    last_reset = acct.get("seven_day_last_reset_ts")
+
+    projected_ts: str | None = None
+    if last_reset:
+        try:
+            t0 = datetime.fromisoformat(str(last_reset).replace("Z", "+00:00"))
+            if now is None:
+                now = datetime.now(timezone.utc)
+            nxt = t0 + timedelta(hours=reset_hours)
+            # Fixed-anchor cadence: advance whole periods until future, so a
+            # last_reset_ts left behind by several missed polls still yields the
+            # NEXT upcoming refresh rather than a stale past timestamp.
+            while nxt <= now:
+                nxt = nxt + timedelta(hours=reset_hours)
+            projected_ts = nxt.isoformat()
+        except (ValueError, AttributeError, TypeError):
+            projected_ts = None
+
+    candidates = [c for c in (projected_ts, api_ts) if c]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Both present → return the earlier (the real refresh comes first).
+    try:
+        return min(candidates, key=lambda c: datetime.fromisoformat(str(c).replace("Z", "+00:00")))
+    except (ValueError, AttributeError, TypeError):
+        return projected_ts or api_ts
 
 
 def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
@@ -2477,6 +4265,53 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
 
 
+def _disabled_accounts(config: dict) -> set:
+    """Accounts the operator marked `disabled: true` in config.yaml's accounts
+    list — a hard out-of-rotation switch (2026-07-03, user request: `default`
+    depleted its Fable weekly while the polled per-model number still read 87%,
+    under the 97% gate — the operator knows things the poll doesn't).
+
+    Semantics: NEVER a swap/launch target, no degraded-pool fallback (an
+    operator mandate outranks "swap somewhere rather than sit on a hot
+    active"). Polling continues (so the operator can see when its windows
+    reset) and a lane already ON the account keeps running — the flag only
+    stops NEW placements. Re-enable by deleting the key or setting false."""
+    return {a.get("name") for a in config.get("accounts", [])
+            if isinstance(a, dict) and a.get("disabled")}
+
+
+def _spread_lanes_enabled(config: dict) -> bool:
+    """Master gate for the anti-clustering lane-spread levers (2026-07-06).
+    False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
+    behavior bit-for-bit."""
+    return bool(config.get("spread_lanes", {}).get("enabled", True))
+
+
+def _lane_load_penalty(name: str, state: dict, config: dict) -> float:
+    """Anti-clustering swap-target score penalty for candidate account `name`
+    (2026-07-06 clustering incident).
+
+    Returns `spread_lanes.cluster_penalty` points for EACH live lane already
+    backing `name` — read from `state["_lane_load"]`, a caller-supplied
+    account→lane-count map (existing /proc occupancy PLUS this-cycle's queued
+    claims; see decide_slot_swaps). The picker subtracts this from a candidate's
+    strategy score so an account that already holds one or more lanes loses to a
+    distinct EMPTY one, breaking the "every lane's best pick is the same magnet
+    account" attractor that piled all lanes onto rayi5 then rayi4.
+
+    0.0 when the feature is off, when no load map was supplied (every non-lane
+    caller — SOS probes, `cus switch`, global mode — passes no `_lane_load`, so
+    their scoring is untouched), or when the candidate backs no lanes. Scales
+    linearly with lane count, so a magnet that has already accreted 2-3 lanes is
+    penalized 2-3× and the fleet disperses within a cycle or two."""
+    if not _spread_lanes_enabled(config):
+        return 0.0
+    load = (state.get("_lane_load") or {}).get(name, 0)
+    if not load:
+        return 0.0
+    return float(config.get("spread_lanes", {}).get("cluster_penalty", 40.0)) * load
+
+
 def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     """Pick which account to swap to, based on configured strategy.
 
@@ -2492,6 +4327,8 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
     Universal filters applied across ALL strategies (GH #17 — strategy audit
     2026-05-24):
+      0. operator-disabled (`disabled: true` in config accounts) always
+         excluded, no fallback — see _disabled_accounts (2026-07-03).
       1. token_expired / poll_error always excluded.
       2. rate_limited excluded unless smart_strategy.allow_rate_limited_targets.
       3. hard_7d_cap: never pick an account at/above the user-stated 80%
@@ -2505,13 +4342,57 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         return None
 
     # Hard filter: never pick an account with no working tokens / can't poll
-    # at all. token_expired and poll_error always exclude.
+    # at all. token_expired and poll_error always exclude, as does an
+    # operator `disabled: true` (out-of-rotation mandate — no fallback tier
+    # below ever re-admits these, unlike the cap/headroom soft filters).
+    disabled = _disabled_accounts(config)
     candidates: list[tuple[str, dict]] = [
         (name, acct) for name, acct in accounts.items()
         if name != current
+        and name not in disabled
         and not acct.get("token_expired", False)
         and not acct.get("poll_error")
     ]
+
+    # ---- Poisoned-canonical-store exclusion (2026-07-06, this PR) ----
+    # HARD filter, NO fallback: never select an account whose canonical
+    # .claude.json identity contradicts its trusted anchor (meta.yaml + login
+    # families). Installing such an account's snapshot copies the WRONG account's
+    # identity/token onto the live mount — the exact wrong-account-clobber this PR
+    # guards, now spreading OUTWARD. Unlike the cap/headroom SOFT filters below
+    # there is deliberately no degraded re-admit: a poisoned target is never a
+    # lesser-evil option, only a vector for propagating the corruption. If this
+    # empties the pool the picker returns None and SOS surfaces the poisoned
+    # account (Condition 10.5) pointing the operator at `cus relogin`.
+    candidates = [(name, acct) for name, acct in candidates
+                  if not account_canonical_store_poisoned(name)[0]]
+    if not candidates:
+        return None
+
+    # ---- Dead-snapshot exclusion (2026-07-07 merkos incident, this PR) ----
+    # HARD filter, NO fallback (mirrors the poisoned-store exclusion above): never
+    # select an account whose canonical snapshot is DEAD (its OAuth refresh grant
+    # returns invalid_grant — flagged `snapshot_refresh_dead` by the idle-account
+    # un-stale sweep) AND that has NO free login family to seed a lane from instead.
+    # Installing such an account's snapshot blanks the target mount on Claude Code's
+    # first refresh — the merkos blank-on-install that logged chats1a out.
+    #
+    # Why the `has_free_login_family` carve-out: an account that is dead-snapshot BUT
+    # has a claimable family is STILL a valid target — the swap install-point seeds
+    # the lane from that family (CRED-AUDIT op=snapshot-dead-family-fallback) instead
+    # of the dead snapshot, so the account can host the new lane after all. Only when
+    # there's ALSO no family does the account genuinely become un-hostable.
+    #
+    # We read the state FLAG here (set by the sweep's refresh-grant probe), NOT a
+    # fresh probe: the picker runs every cycle and must stay cheap + side-effect-free
+    # (the probe rotates a token). The swap install-point does the DEFINITIVE re-probe
+    # (`_account_snapshot_dead`) — decision layer optimistic, execution layer
+    # authoritative, the same split as has_free_login_family / claim_verified_login_family.
+    # If this empties the pool the picker returns None and the dead-snapshot SOS fires.
+    candidates = [(name, acct) for name, acct in candidates
+                  if not (acct.get("snapshot_refresh_dead") and not has_free_login_family(name, state))]
+    if not candidates:
+        return None
 
     # Rate-limited is a SOFT filter by default — try non-rate-limited first,
     # but fall back to rate-limited candidates if nothing else is available.
@@ -2551,24 +4432,72 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         return None
     candidates = not_saturated
 
+    # ---- Per-model weekly (Fable) gate: HARD for premium, NO fallback ----
+    # (fix 2026-07-05, this PR; the per-model analog of PR #139's hard-cap
+    # anti-pingpong HOLD.) Split OUT of the aggregate-7d SOFT filter below —
+    # before 2026-07-05 both conditions lived in one `safe_7d` list — because the
+    # two want OPPOSITE degraded-mode behavior:
+    #
+    #   • aggregate 7d over-cap → SOFT: if EVERY candidate is over the weekly
+    #     ceiling the whole system is degraded, and "swap somewhere rather than
+    #     sit on a hot active" wins (cap_fallback re-admits them, annotated
+    #     DEGRADED). Landing on a 7d-heavy account still lets work through.
+    #   • per-model Fable over-cap for a PREMIUM lane → HARD: a premium lane's
+    #     whole purpose is Fable-clean placement. Landing it on a Fable-DEAD
+    #     account breaks its Fable work outright — strictly WORSE than holding on
+    #     the (5h-hot) account it's already on, which can still do Fable and can
+    #     move next cycle when a clean target frees (e.g. after a 5h reset). So
+    #     if the per-model gate is active and EVERY candidate is at/over the
+    #     model cap, we HOLD (return None) instead of degrading onto one.
+    #
+    # The bug this closes (live 2026-07-05, decisions.jsonl): rayi4 hit its 5h
+    # LADDER step with three premium Fable lanes stacked on it; the daemon fanned
+    # all three off at once. The first two took the clean Fable targets; the
+    # third had none left and fell into the aggregate cap_fallback, which —
+    # because per-model was folded INTO that same soft filter — re-admitted a
+    # Fable-capped account (rayi2, Fable 100%) and landed the premium lane on it.
+    # PR #139's hard-cap HOLD did NOT fire because the FORCING gate here was the
+    # 5h ladder, not a hard cap, so its guard never ran. Making the per-model
+    # gate its own HARD filter fixes BOTH the primary pick AND the fan-out
+    # re-pick (decide_slot_swaps), since both route through this function.
+    #
+    # Standard pool is UNCHANGED: _config_for_pool forces gate_enabled=False for
+    # it (GH #99), so _per_model_weekly_gate is (False, …) and
+    # _max_model_weekly_from_acct returns 0.0 for every candidate → model_safe ==
+    # candidates, the HOLD never fires, and a standard lane may still land on a
+    # Fable-capped account by design.
+    #
+    # Stale-guard preserved (2026-07-05, GH #161): a token_stale / unobservable
+    # account reads per-model 0.0 via _max_model_weekly_from_acct → stays
+    # ELIGIBLE here. Only a FRESH at/over-cap reading excludes a candidate, so we
+    # never refuse a target on a number we couldn't reconfirm.
+    #
+    # Cap used is the TARGET-side one (target_cap_pct, falling back to cap_pct,
+    # falling back to hard_7d) — identical to the pre-split primary filter:
+    # arrivals stop earlier than swap-away drains. See _model_weekly_target_cap_for_config.
+    gate_enabled, _ = _per_model_weekly_gate(config)
+    model_cap = _model_weekly_target_cap_for_config(config)
+    model_safe = [(n, a) for n, a in candidates
+                  if _max_model_weekly_from_acct(a, config) < model_cap]
+    if gate_enabled and not model_safe:
+        # Premium lane, every reachable target Fable-capped → HOLD. Returning
+        # None keeps this picker SILENT like every other no-target return (it is
+        # also driven from SOS / what-if probes, e.g. _candidate_is_valid_premium_target,
+        # where an echo per capped candidate would be pure noise); the swap
+        # callers (decide_swap's "no valid swap target" branch, decide_slot_swaps'
+        # fan-out HOLD) emit the operator-facing daemon.log line.
+        return None
+    if model_safe:
+        candidates = model_safe
+
     # Universal filter (GH #17, all strategies): exclude candidates above
-    # the user-stated weekly ceiling. Previously only headroom/smart applied
-    # this — lowest_usage/drain/round_robin would happily pick an exhausted
-    # account. Falls back to "any candidate" if ALL are above cap (system
-    # is degraded; swap somewhere rather than stay on a hot active).
+    # the user-stated AGGREGATE weekly ceiling. Previously only headroom/smart
+    # applied this — lowest_usage/drain/round_robin would happily pick an
+    # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
+    # (system is degraded; swap somewhere rather than stay on a hot active). Runs
+    # on the per-model-safe survivors from the HARD gate above.
     hard_7d = _hard_7d_cap_for_config(config)
-    # The weekly ceiling applies to the aggregate 7d AND (when the gate is on)
-    # to any tracked per-model weekly — so we never swap ONTO an account whose
-    # Fable/Sonnet weekly cap is exhausted. _max_model_weekly_from_acct is 0.0
-    # when the gate is off, so this is exactly the old aggregate-7d filter then.
-    # The per-model comparison uses its own cap (per_model_weekly.cap_pct,
-    # falling back to hard_7d) so the two ceilings can differ.
-    model_cap = _model_weekly_cap_for_config(config)
-    safe_7d = [
-        (n, a) for n, a in candidates
-        if a.get("current_7d_pct", 0) < hard_7d
-        and _max_model_weekly_from_acct(a, config) < model_cap
-    ]
+    safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
         candidates = safe_7d
@@ -2599,8 +4528,12 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     if strategy == "lowest_usage":
         # cux balanced. Sort by the user's effective threshold metric
         # (honors thresholds.{five_hour,seven_day}), then secondary tiebreak
-        # by 5h for stability.
-        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config), kv[1].get("current_5h_pct", 0.0)))
+        # by 5h for stability. Anti-cluster (2026-07-06): a lane-load penalty is
+        # ADDED to the effective-util sort key (higher util = sorted later), so a
+        # candidate already backing live lanes is deprioritized vs an empty one.
+        candidates.sort(key=lambda kv: (_account_effective_pct(kv[1], config)
+                                        + _lane_load_penalty(kv[0], state, config),
+                                        kv[1].get("current_5h_pct", 0.0)))
         chosen, _ = candidates[0]
         return SwapTarget(name=chosen, reason=_annotate("lowest_usage: lowest effective util"))
 
@@ -2670,9 +4603,11 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         def score(acct: dict) -> float:
             return (100 - acct.get("current_5h_pct", 0.0)) * w5 + (100 - acct.get("current_7d_pct", 0.0)) * w7
 
-        candidates.sort(key=lambda kv: -score(kv[1]))
+        # Anti-cluster (2026-07-06): subtract the lane-load penalty so an account
+        # already backing live lanes scores below a distinct empty one.
+        candidates.sort(key=lambda kv: -(score(kv[1]) - _lane_load_penalty(kv[0], state, config)))
         chosen, chosen_acct = candidates[0]
-        s = score(chosen_acct)
+        s = score(chosen_acct) - _lane_load_penalty(chosen, state, config)
         return SwapTarget(name=chosen, reason=_annotate(f"headroom: 5h={chosen_acct.get('current_5h_pct', 0):.0f}% 7d={chosen_acct.get('current_7d_pct', 0):.0f}% score={s:.1f}"))
 
     if strategy == "smart":
@@ -2748,7 +4683,22 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
 
             return s, " ".join(reasons) if reasons else "(headroom only)"
 
-        scored = [(n, a, *smart_score(a)) for n, a in candidates]
+        # Anti-cluster (2026-07-06 rayi5/rayi4 pile-up): after the usage/burn
+        # score, subtract cluster_penalty per live lane already backing each
+        # candidate. Without this the burn-soon bonus (+~98) made the ONE
+        # about-to-reset account the runaway #1 pick for EVERY lane, so they all
+        # migrated onto it cycle after cycle. The penalty scales with lane count,
+        # so a magnet that has already accreted lanes falls behind a distinct
+        # empty account and the fleet disperses. Inert when spread_lanes is off or
+        # no _lane_load map was supplied (non-lane callers).
+        scored = []
+        for n, a in candidates:
+            sc, rz = smart_score(a)
+            pen = _lane_load_penalty(n, state, config)
+            if pen:
+                sc -= pen
+                rz = (rz + f" cluster-penalty(-{pen:.0f})").strip()
+            scored.append((n, a, sc, rz))
         scored.sort(key=lambda x: -x[2])
         chosen, chosen_acct, chosen_score, chosen_reasons = scored[0]
         return SwapTarget(
@@ -2895,11 +4845,22 @@ def _clear_swap_journal() -> None:
 
 
 def _identity_fields(cj: Any) -> dict:
-    """Extract the comparable identity facets of a .claude.json payload.
+    """Extract the comparable ACCOUNT-identity facets of a .claude.json payload.
 
-    Used by crash recovery to determine which account the live files belong
-    to. Only non-empty fields participate, so a sparse file still matches on
-    whatever evidence it has.
+    Used by crash recovery, doctor, SOS, and login-mount verification to decide
+    which Anthropic ACCOUNT a set of live files belongs to. Only non-empty
+    fields participate, so a sparse file still matches on whatever evidence it
+    has.
+
+    Correction 2026-07-03: `userID` (top-level) was REMOVED from the facets.
+    It is a per-LOGIN-SESSION / per-config-dir client id, NOT a per-account id —
+    two independent `/login`s of the SAME account carry different `userID`s
+    (proven live: account 'rayi3' snapshot and its pooled family-1 login shared
+    accountUuid `b9c92e39…` + email `rayi3@trisso.com` but differed on `userID`
+    `93e1fc34…` vs `5d3df3e8…`). Comparing it made `_identities_match` FALSE-
+    reject a correct same-account login (the independent-login-pool onboarding
+    error). The authoritative account identity is `oauthAccount.accountUuid`
+    (globally unique per account) plus `emailAddress`; those are what we compare.
     """
     if not isinstance(cj, dict):
         return {}
@@ -2907,8 +4868,7 @@ def _identity_fields(cj: Any) -> dict:
     oa = oa if isinstance(oa, dict) else {}
     out: dict = {}
     for key, val in (("accountUuid", oa.get("accountUuid")),
-                     ("emailAddress", oa.get("emailAddress")),
-                     ("userID", cj.get("userID"))):
+                     ("emailAddress", oa.get("emailAddress"))):
         if val:
             out[key] = val
     return out
@@ -2931,6 +4891,335 @@ def _dir_identity(account_name: str) -> dict:
         return _identity_fields(read_json(p))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _dir_identity_of_mount(mount: Path) -> dict:
+    """Identity facets from a live MOUNT's .claude.json (a slot dir or the shared
+    ~/.claude). Used only by the CRED-AUDIT lines to record what identity the
+    incoming creds actually carry — a foreign identity here is the clobber signal.
+    Best-effort: an unreadable/absent mount file returns {} (rendered `none`)."""
+    p = mount_claude_json_path(mount)
+    if not p.exists():
+        return {}
+    try:
+        return _identity_fields(read_json(p))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Wrong-account canonical-store clobber guard (2026-07-06 incident)
+#
+# THE INCIDENT (verified live 2026-07-06, recurring over two days): an account's
+# CANONICAL credential store — account-<X>/.claude.json (identity) and
+# account-<X>/.credentials.json (tokens) — was silently overwritten with a
+# DIFFERENT account's identity + token. Concretely, account-rayi1/.claude.json's
+# oauthAccount was rayi2's and its .credentials.json polled identically to rayi2,
+# even though account-rayi1/meta.yaml AND the independent-login families under
+# logins/rayi1/family-* still correctly held rayi1's identity. So the sources the
+# swap/save-back path does NOT rewrite (meta.yaml at `cus init` time, the login
+# families at browser-`/login` time) stayed CORRECT while the canonical store —
+# which the save-back path DOES write — got clobbered.
+#
+# THE WRITE VECTOR: _execute_swap_locked's OUTGOING-account save-back copies the
+# live mount's identity keys into account-<current>/.claude.json with NO identity
+# check (the GH #3 guard only covered the CREDENTIALS refresh-token lineage, never
+# the paired .claude.json identity write). When a bare/slot session had drifted to
+# another account, its live .claude.json carried the wrong oauthAccount, and the
+# save-back persisted it over current's canonical identity. The credentials clobber
+# rides the "unknown" verdict (a rotation-shaped token that matches no snapshot is
+# assumed to be current's and saved back) on the same fully-drifted mount.
+#
+# THE FIX: meta.yaml + the login families are the TRUSTED ANCHOR precisely because
+# the buggy path never writes them. Before any save-back into a canonical store we
+# verify the incoming identity against that anchor; a mismatch is REFUSED and the
+# rejected bytes are quarantined to a sidecar instead of overwriting the good store.
+# ---------------------------------------------------------------------------
+
+def _meta_anchor_identity(account: str) -> dict:
+    """Identity facets from an account's meta.yaml — a TRUSTED anchor source.
+
+    meta.yaml records oauth_account_uuid + oauth_email at `cus init` time and is
+    NOT rewritten by the swap/save-back path, so in the 2026-07-06 clobber it
+    stayed correct (rayi1) while the canonical .claude.json lied (rayi2). That
+    write-path asymmetry is the whole reason meta anchors and .claude.json is the
+    suspect. 'unknown'/'unknown (run /login)' placeholders (a freshly `cus add`ed
+    account that never logged in) count as ABSENT — there is no identity to
+    enforce yet, so we must not treat the placeholder as an anchor."""
+    meta = account_meta(account)
+    out: dict = {}
+    uuid = meta.get("oauth_account_uuid")
+    if isinstance(uuid, str) and uuid and uuid != "unknown":
+        out["accountUuid"] = uuid
+    email = meta.get("oauth_email")
+    if isinstance(email, str) and email and not email.startswith("unknown"):
+        out["emailAddress"] = email
+    return out
+
+
+def _family_anchor_identities(account: str) -> list[dict]:
+    """Identity facets recorded by every independent-login family for `account`
+    (GH #109) — a second TRUSTED anchor witness. Each family dir's .claude.json
+    was written by a real browser `/login` AS that account, a path the buggy
+    save-back never touches, so in the incident the families held rayi1's true
+    identity while the canonical store was clobbered."""
+    out: list[dict] = []
+    for fam in list_login_families(account):
+        ident = family_identity(account, fam)
+        if ident:
+            out.append(ident)
+    return out
+
+
+def account_identity_anchor(account: str) -> tuple[dict | None, str]:
+    """The AUTHORITATIVE identity for `account`, reconciled ONLY from sources the
+    swap/save-back path does not write (so the clobber bug cannot poison the
+    anchor itself): meta.yaml (`cus init`-time) and the independent-login families
+    (browser-`/login`-time). Deliberately does NOT trust
+    account-<X>/.claude.json — that is the exact file 2026-07-06 showed can be
+    overwritten with a WRONG account's oauthAccount while meta + families stay
+    correct.
+
+    Returns (identity | None, source):
+      - (identity, "meta+families")  meta and every family agree — strongest.
+      - (identity, "meta")           meta present, no families to cross-check.
+      - (identity, "families")       meta absent/placeholder, families agree.
+      - (None, "ambiguous: ...")     the witnesses CONTRADICT each other. The
+        account is already inconsistent; callers must refuse the write and raise
+        SOS rather than pick a side and compound the damage (task's meta-missing/
+        ambiguous → refuse rule).
+      - (None, "no-anchor: ...")     no trustworthy evidence at all (never logged
+        in / feature unused). Callers treat this as "cannot prove a mismatch" and
+        fall through to prior behavior — refusing here would break legitimate
+        onboarding / no-op writes and every existing test that has no meta.yaml.
+    """
+    meta = _meta_anchor_identity(account)
+    fams = _family_anchor_identities(account)
+    # Hard contradiction between meta and any family → the account's own trusted
+    # witnesses disagree; don't guess which is right.
+    for fam in fams:
+        if meta and _identities_match(meta, fam) is False:
+            return (None, f"ambiguous: meta.yaml {meta} disagrees with a login family {fam}")
+    # Families disagreeing among themselves is the same don't-guess situation.
+    for i in range(1, len(fams)):
+        if _identities_match(fams[0], fams[i]) is False:
+            return (None, f"ambiguous: login families disagree ({fams[0]} vs {fams[i]})")
+    if meta and fams:
+        # Merge so the anchor carries every facet either witness knows (e.g.
+        # meta has the uuid, a family also supplies the email).
+        merged = dict(meta)
+        for fam in fams:
+            for k, v in fam.items():
+                merged.setdefault(k, v)
+        return (merged, "meta+families")
+    if meta:
+        return (meta, "meta")
+    if fams:
+        merged_f: dict = {}
+        for fam in fams:
+            for k, v in fam.items():
+                merged_f.setdefault(k, v)
+        return (merged_f, "families")
+    return (None, "no-anchor: meta.yaml has no oauth uuid/email and no login families")
+
+
+def guard_canonical_identity_write(account: str, incoming_identity: dict) -> tuple[bool, str]:
+    """Single choke-point: may `incoming_identity` be written into
+    account-<account>'s canonical store? Returns (allow, reason).
+
+    Closes the 2026-07-06 wrong-account clobber (see the block comment above).
+    Policy — the anchor is account_identity_anchor(account):
+      - anchor present + incoming MATCHES anchor  → allow.
+      - anchor present + incoming MISMATCH        → REFUSE (the incident).
+      - anchor present + no shared fields          → allow: cannot disprove (e.g.
+        meta carries only a uuid and the incoming payload only an email).
+      - anchor AMBIGUOUS (witnesses disagree)     → REFUSE: the account is
+        already poisoned; writing more only compounds it.
+      - no anchor at all / empty incoming          → allow: nothing to prove a
+        mismatch against, and refusing would break legitimate onboarding /
+        no-op writes (and every test with no meta.yaml). Degrade-to-allow keeps
+        the guard strictly non-breaking where there is no evidence.
+    """
+    if not incoming_identity:
+        return (True, "no identity in incoming payload — nothing to verify")
+    anchor, source = account_identity_anchor(account)
+    if anchor is None:
+        if source.startswith("ambiguous"):
+            return (False, f"'{account}' identity anchor is self-inconsistent ({source})")
+        return (True, f"no trustworthy anchor for '{account}' ({source}) — cannot prove a mismatch")
+    if _identities_match(incoming_identity, anchor) is False:
+        return (False,
+                f"incoming identity {incoming_identity} != '{account}' trusted anchor {anchor} ({source})")
+    return (True, f"incoming identity matches '{account}' anchor ({source})")
+
+
+def account_canonical_store_poisoned(account: str) -> tuple[bool, str]:
+    """True iff account-<X>'s canonical .claude.json identity CONTRADICTS its
+    trusted anchor (meta.yaml + login families) — the 2026-07-06 clobber shape,
+    where the canonical store is the WRONG side and meta/families are right.
+
+    Returns (poisoned, detail). Used by (a) the swap-target picker, to HARD-
+    exclude a poisoned account (installing its snapshot would spread the wrong
+    creds onto the live mount) and (b) SOS, to name the CANONICAL store as the
+    clobbered side and point at `cus relogin`. Conservative: an absent anchor or
+    absent canonical file is NOT poisoned (nothing to contradict) — only a live,
+    hard disagreement counts."""
+    anchor, source = account_identity_anchor(account)
+    if anchor is None:
+        return (False, f"no trustworthy anchor to check against ({source})")
+    canonical = account_canonical_identity(account)  # reads account-<X>/.claude.json
+    if not canonical:
+        return (False, "canonical .claude.json absent or carries no identity")
+    if _identities_match(canonical, anchor) is False:
+        return (True,
+                f"canonical .claude.json {canonical} != trusted anchor {anchor} ({source})")
+    return (False, f"canonical store matches anchor ({source})")
+
+
+def quarantine_rejected_canonical_write(dest_path: Path, incoming_bytes: bytes, why: str) -> Path:
+    """Divert a REFUSED canonical-store write to a sidecar next to the target
+    file instead of overwriting it: the good canonical store is left untouched
+    and the wrong-account bytes are preserved for forensics rather than lost.
+    Returns the sidecar path. Best-effort — a failed sidecar write still means
+    the overwrite was refused (the load-bearing half)."""
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    tag = hashlib.sha256((why + ts).encode()).hexdigest()[:8]
+    sidecar = dest_path.with_name(dest_path.name + f".rejected-{tag}-{ts}")
+    try:
+        atomic_write_bytes(sidecar, incoming_bytes, mode=0o600)
+    except OSError:
+        pass
+    return sidecar
+
+
+# ---------------------------------------------------------------------------
+# CRED-AUDIT — one greppable structured line per credential-store write/refuse
+#
+# WHY THIS EXISTS (the account-rayi1 clobber, verified from daemon.log): two
+# lanes shared ONE OAuth login family (divergence), so a lane's live mount
+# carried a FOREIGN account's rotated token, and a routine save-back wrote that
+# foreign token+identity into the WRONG account's canonical .claude.json /
+# .credentials.json. The GH #77 freshness guard passed it (the foreign token was
+# genuinely newer); only #172's identity guard now refuses it. daemon.log DID
+# capture enough to reconstruct the incident — but only across scattered,
+# differently-shaped human lines. The next incident should be ONE grep away.
+#
+# THE CONTRACT: every place that WRITES or REFUSES a credential/identity store
+# emits exactly one `CRED-AUDIT ...` line — same stream as the human-readable
+# daemon.log lines (click.echo, captured by systemd), ALONGSIDE (never instead
+# of) those lines. Grep `CRED-AUDIT` to see every store mutation the daemon ever
+# attempted; grep `CRED-AUDIT decision=refused` / `op=divergence-detected` to
+# see the near-misses and the preconditions that set them up.
+#
+# SCHEMA (fields are space-separated key=value; only non-empty fields appear,
+# but op and decision are always present so the line is stable to grep):
+#   op=            saveback | swap-install | family-claim | refresh |
+#                  freshness-skip | identity-refuse | family-collision-refuse |
+#                  divergence-detected
+#   slot= / mount= the SOURCE mount the creds came from (a lane slot dir or the
+#                  shared ~/.claude mount)
+#   account=       the TARGET store being written / refused
+#   incoming_identity=  uuid(short)/email of the creds about to be written
+#   existing_identity=  uuid(short)/email currently in the target store's anchor
+#                  — a mismatch between these two IS the clobber, visible at a glance
+#   login_family=  the login family involved (pool lease / claimed family)
+#   shared=        true/false — is this family already live on ANOTHER mount
+#                  (the divergence signal that precedes a clobber)
+#   token_fp=      short non-reversible fingerprint of the refresh token (never
+#                  the raw token) so two families can be told apart in the log
+#   decision=      wrote | skipped-freshness | refused-identity |
+#                  refused-collision | quarantined | detected
+#   reason=        short human phrase (quoted) explaining the decision
+#
+# NEVER log raw access/refresh token bytes — only identity facets (uuid/email)
+# and the short refresh-token fingerprint the rest of the module already uses.
+# ---------------------------------------------------------------------------
+
+CRED_AUDIT_PREFIX = "CRED-AUDIT"
+
+
+def _fmt_audit_identity(ident: dict | None) -> str:
+    """Render identity facets compactly for a CRED-AUDIT line as `uuid(short)/email`.
+
+    Only the account-identity facets (accountUuid + emailAddress) — never tokens.
+    A short uuid prefix keeps the line greppable without dumping the full 36-char
+    id; the email disambiguates. Empty/absent identity renders as `none` so the
+    field is always present and stable to grep."""
+    if not ident:
+        return "none"
+    uuid = ident.get("accountUuid")
+    email = ident.get("emailAddress")
+    short = uuid[:8] if isinstance(uuid, str) and uuid else "?"
+    return f"{short}/{email or '?'}"
+
+
+def _audit_token_fp(creds: Any) -> str:
+    """Short, non-reversible refresh-token fingerprint for a CRED-AUDIT line.
+
+    Reuses `_refresh_fingerprint` (the same sha256-prefix primitive #109 uses to
+    tell login families apart) so the audit log and the divergence detectors
+    speak the same fingerprint. Returns `none` when there is no refresh token to
+    fingerprint (blank/logout-shaped creds). NEVER emits the raw token."""
+    try:
+        rt = _credential_refresh_token(creds)
+    except (AttributeError, TypeError):
+        rt = None
+    return _refresh_fingerprint(rt) if rt else "none"
+
+
+def _cred_audit(op: str, decision: str, reason: str = "", *,
+                slot: str | None = None, mount: str | None = None,
+                account: str | None = None,
+                incoming_identity: dict | None = None,
+                existing_identity: dict | None = None,
+                emit_identity: bool = False,
+                login_family: str | None = None,
+                shared: bool | None = None,
+                token_fp: str | None = None,
+                extra: str | None = None) -> None:
+    """Emit ONE structured CRED-AUDIT line describing a credential-store
+    write/refuse/detection. See the schema block above.
+
+    Purely additive observability: this NEVER changes control flow and MUST
+    NEVER raise into its caller — a swap/save-back must not fail because a log
+    line couldn't be formatted, so the whole body is wrapped defensively. Uses
+    the same click.echo stream as the neighbouring human-readable daemon.log
+    lines (do not invent a new file); the human line stays, this rides alongside.
+
+    emit_identity=True forces the incoming/existing identity fields to appear
+    even when empty (rendered `none`) — used at write/refuse points where the
+    identity comparison is the load-bearing evidence. Detection lines (which name
+    mounts + a shared family instead of a single identity pair) leave it False.
+    """
+    try:
+        parts = [f"{CRED_AUDIT_PREFIX} op={op}"]
+        if slot:
+            parts.append(f"slot={slot}")
+        if mount:
+            parts.append(f"mount={mount}")
+        if account:
+            parts.append(f"account={account}")
+        if emit_identity or incoming_identity is not None:
+            parts.append(f"incoming_identity={_fmt_audit_identity(incoming_identity)}")
+        if emit_identity or existing_identity is not None:
+            parts.append(f"existing_identity={_fmt_audit_identity(existing_identity)}")
+        if login_family:
+            parts.append(f"login_family={login_family}")
+        if shared is not None:
+            parts.append(f"shared={'true' if shared else 'false'}")
+        if token_fp:
+            parts.append(f"token_fp={token_fp}")
+        if extra:
+            parts.append(extra)
+        parts.append(f"decision={decision}")
+        if reason:
+            # Quote + cap the reason so it stays one greppable field even though
+            # guard reasons embed dict reprs / '!=' with internal spaces.
+            r = reason if len(reason) <= 240 else reason[:237] + "..."
+            parts.append(f'reason="{r}"')
+        click.echo(" ".join(parts))
+    except Exception:  # noqa: BLE001 — observability must never break a swap
+        pass
 
 
 def _recover_pending_swap() -> None:
@@ -3126,6 +5415,36 @@ def _creds_expires_at(creds: Any) -> int | float | None:
     oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
     exp = oauth.get("expiresAt") if isinstance(oauth, dict) else None
     return exp if isinstance(exp, (int, float)) else None
+
+
+def _live_mount_creds_invalid(creds: Any) -> bool:
+    """True when a credentials payload carries no usable OAuth token.
+
+    This is the detector for the 2026-07-05 blanked-live-mount incident: the
+    live ~/.claude/.credentials.json was found with `expiresAt: 0` and an empty
+    `accessToken` while the active account's snapshot stayed healthy, so a bare
+    session on the shared mount showed "not logged in" and nothing else in
+    diagnose() noticed. A file is "invalid" when it is unreadable / not a dict,
+    or its OAuth block has an empty/missing accessToken OR a missing / <= 0
+    expiresAt (the epoch/blank signature).
+
+    Shape tolerance: the token block is usually nested under `claudeAiOauth`
+    (the shape every other reader in this file assumes), but we fall back to a
+    flat top-level shape so a differently-serialized file isn't misread as
+    valid. `bool` is excluded from the numeric expiresAt check because it is an
+    `int` subclass — a stray `expiresAt: true` must not read as a positive
+    epoch.
+    """
+    if not isinstance(creds, dict):
+        return True  # missing / corrupt / non-dict → unusable
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        oauth = creds  # tolerate a flat top-level OAuth shape
+    token = oauth.get("accessToken")
+    exp = oauth.get("expiresAt")
+    token_ok = isinstance(token, str) and token.strip() != ""
+    exp_ok = isinstance(exp, (int, float)) and not isinstance(exp, bool) and exp > 0
+    return not (token_ok and exp_ok)
 
 
 def _snapshot_fresher_than_live(account_name: str) -> bool:
@@ -3335,6 +5654,39 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     if not target_cj.exists():
         raise FileNotFoundError(f"{target_cj} missing — re-run `cus init --force`")
 
+    # ---- GH #141 root-cause guard (early / no-partial-state path) ----
+    # The 2026-07-05 blanked-live-mount incident (3× in one day) traced to a
+    # swap installing the TARGET account's snapshot into the live mount even
+    # when that snapshot itself was BLANK — empty accessToken + expiresAt<=0
+    # (hypothesis a). A blanked live ~/.claude/.credentials.json logs out every
+    # bare session on the shared mount. Refusing HERE — before the swap journal,
+    # save-back, or any live write below — leaves the live mount bit-for-bit
+    # untouched (its current, valid creds survive), which is exactly the
+    # "keep the current valid creds rather than install a blank" contract. The
+    # daemon's picker moves to a different target on the next cycle.
+    #
+    # Scoped to the DEFAULT (non-pool) path: with independent logins off the
+    # install source below is always `target_creds` (the snapshot), so checking
+    # it here is precise. When the pool gate is on the install source is chosen
+    # later (a claimed login family, possibly valid even if the snapshot is not),
+    # so that path relies on the definitive guard right before the atomic_copy.
+    # Reuses `_live_mount_creds_invalid` — the same predicate the detector/SOS use.
+    if not independent_logins_enabled(config):
+        try:
+            _target_snapshot_creds = read_json(target_creds)
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(
+                f"refusing to swap to '{target_name}': its snapshot {target_creds} is unreadable "
+                f"({e}) — installing it would blank the live mount and lock out bare sessions "
+                f"(GH #141). Re-login (`cus relogin {target_name}`) or restore a backup "
+                f"(`cus restore-creds {target_name}`).")
+        if _live_mount_creds_invalid(_target_snapshot_creds):
+            raise RuntimeError(
+                f"refusing to swap to '{target_name}': its snapshot credentials are blank/expired "
+                f"(empty accessToken or expiresAt<=0) — installing them would blank the live mount "
+                f"and lock out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or "
+                f"restore a backup (`cus restore-creds {target_name}`).")
+
     if live_cj_path.exists():
         # Read the live .claude.json when present — its non-account keys (MCP
         # registrations, per-project state, sync'd from canonical) must survive
@@ -3371,15 +5723,61 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # save, nowhere to save it). We update the ENTIRE .claude.json in the
     # source dir (not just account-bound keys) so that any per-account state
     # Claude writes there persists.
+    #
+    # ---- 2026-07-06 wrong-account clobber guard (identity save-back) ----
+    # The live mount's identity is verified against current's TRUSTED anchor
+    # (meta.yaml + login families — see guard_canonical_identity_write) BEFORE
+    # it is persisted. A drifted mount (a session that logged in as / drifted to
+    # another account) carries a wrong oauthAccount in its live .claude.json;
+    # writing it here is exactly how account-rayi1/.claude.json ended up holding
+    # rayi2's identity. `identity_saveback_ok` is also consumed by the credentials
+    # save-back below: a mount whose IDENTITY is foreign is not a place we trust an
+    # "unknown"-verdict token from either.
+    identity_saveback_ok = True
     if current is not None:
+        assert current_dir is not None  # narrowed: current_dir is set iff current is
         current_identity = {k: live_cj[k] for k in ACCOUNT_BOUND_KEYS if k in live_cj}
-        # Read existing per-account .claude.json (if any), overlay current account-bound keys
-        if (current_dir / ".claude.json").exists():
-            existing = read_json(current_dir / ".claude.json")
+        identity_saveback_ok, _guard_reason = guard_canonical_identity_write(
+            current, _identity_fields(live_cj))
+        if not identity_saveback_ok:
+            # REFUSE: keep current's existing canonical .claude.json untouched and
+            # quarantine the rejected (wrong-account) identity next to it. Losing
+            # the outgoing account's own state-key updates for this one swap is far
+            # cheaper than clobbering its identity with another account's.
+            sidecar = quarantine_rejected_canonical_write(
+                current_dir / ".claude.json",
+                json.dumps({k: live_cj.get(k) for k in ACCOUNT_BOUND_KEYS}, indent=2).encode(),
+                _guard_reason)
+            msg = (f"WRONG-ACCOUNT GUARD at swap ({current} -> {target_name}): refused to save the live "
+                   f"mount's identity into '{current}' canonical .claude.json — {_guard_reason}. "
+                   f"Kept the existing canonical identity; quarantined the rejected one to {sidecar.name}. "
+                   f"The live mount has DRIFTED to another account; restart that session. If '{current}'s "
+                   f"own canonical store looks wrong, re-login it: `cus relogin {current}`.")
+            click.echo(f"creds-save-back: {msg}")
+            _cred_audit("identity-refuse", "refused-identity", _guard_reason,
+                        slot=slot, mount=(slot or "shared-mount"), account=current,
+                        incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                        existing_identity=account_identity_anchor(current)[0],
+                        extra="quarantined=" + sidecar.name)
+            try:
+                append_inbox("wrong-account-guard",
+                             f"identity save-back refused for '{current}' (drifted live mount)", msg)
+            except OSError:
+                pass  # inbox is best-effort observability; never fail a swap over it
         else:
-            existing = {}
-        existing.update(current_identity)
-        write_json(current_dir / ".claude.json", existing)
+            # Read existing per-account .claude.json (if any), overlay current account-bound keys
+            if (current_dir / ".claude.json").exists():
+                existing = read_json(current_dir / ".claude.json")
+            else:
+                existing = {}
+            existing.update(current_identity)
+            write_json(current_dir / ".claude.json", existing)
+            # Canonical identity write accepted — record the incoming vs anchor
+            # identity so a future clobber (incoming != existing) is one grep away.
+            _cred_audit("saveback", "wrote", "identity save-back to canonical .claude.json",
+                        slot=slot, mount=(slot or "shared-mount"), account=current,
+                        incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                        existing_identity=account_identity_anchor(current)[0])
 
     # ---- GH #3: refresh-time drift detection on the credentials save-back ----
     # The live file is read into memory EXACTLY ONCE and those same bytes are
@@ -3418,15 +5816,46 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # below never sees it, verdicts "unknown", and clobbers current's shared
     # snapshot with the independent family (handoff §5.5). Gated: with the gate
     # off this branch is never taken and behavior is unchanged.
+    _lease = slot_leased_family(state, slot) if slot is not None else None
     if (live_creds is not None and slot is not None and current is not None
+            and independent_logins_enabled(config) and _lease is not None and _lease[0] == current):
+        # Pool model: this mount runs a LEASED family for the outgoing account.
+        # Its live refresh token belongs to that family (not the account
+        # snapshot), so save it straight back to the family dir — never through
+        # classify_live_creds_owner, which would clobber the shared snapshot.
+        _fam = _lease[1]
+        status_word = saveback_to_login_store(current, slot, live_creds, live_creds_bytes,
+                                              dest_path=login_family_creds_path(current, _fam))
+        if status_word == "skipped-stale":
+            click.echo(f"creds-save-back: SKIPPED — stored family {current}/{_fam} is newer than "
+                       f"the live file; kept the store entry (GH #77-style guard)")
+            _cred_audit("freshness-skip", "skipped-freshness", "family store fresher than live (#77)",
+                        slot=slot, account=current, login_family=f"{current}/{_fam}",
+                        token_fp=_audit_token_fp(live_creds))
+        else:
+            click.echo(f"creds-save-back: saved {slot} live tokens back to pooled login {current}/{_fam} (#109 pool)")
+            _cred_audit("saveback", "wrote", "pooled family store (#109)",
+                        slot=slot, account=current, login_family=f"{current}/{_fam}",
+                        token_fp=_audit_token_fp(live_creds))
+    elif (live_creds is not None and slot is not None and current is not None
             and independent_logins_enabled(config) and has_independent_login(current, slot)):
+        # Legacy per-(slot, account) store (superseded by the pool; retained
+        # until the P5 cleanup so nothing that still keys per-slot regresses).
         status_word = saveback_to_login_store(current, slot, live_creds, live_creds_bytes)
         if status_word == "skipped-stale":
             click.echo(f"creds-save-back: SKIPPED — stored login for ({slot}, {current}) is newer "
                        f"than the live file; kept the store entry (GH #77-style guard)")
+            _cred_audit("freshness-skip", "skipped-freshness", "legacy per-slot store fresher than live (#77)",
+                        slot=slot, account=current, token_fp=_audit_token_fp(live_creds))
         else:
             click.echo(f"creds-save-back: saved ({slot}, {current}) independent login back to its store entry (GH #109)")
+            _cred_audit("saveback", "wrote", "legacy per-slot independent login store (#109)",
+                        slot=slot, account=current, token_fp=_audit_token_fp(live_creds))
     elif live_creds is not None:
+        # live_creds is only populated when current is not None (read a few lines
+        # up), which in turn guarantees current_dir is a real path — assert it so
+        # the snapshot writes below type-check.
+        assert current_dir is not None
         verdict, owner, detail = classify_live_creds_owner(live_creds, current, state)
         if verdict in ("expected", "unknown"):
             # "expected": provably current's tokens — the normal save-back.
@@ -3465,10 +5894,42 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                        f"(If '{current}' polls as token_expired, run `cus relogin {current} --finish` "
                        f"before swapping back, or just swap to it — the snapshot is the fresh copy.)")
                 click.echo(f"creds-save-back: {msg}")
+                _cred_audit("freshness-skip", "skipped-freshness",
+                            f"snapshot fresher than live (#77): snap {int(snap_exp)} > live {int(live_exp)}",
+                            slot=slot, mount=(slot or "shared-mount"), account=current,
+                            token_fp=_audit_token_fp(live_creds))
                 try:
                     append_inbox("freshness-guard", f"save-back skipped — '{current}' snapshot fresher than live", msg)
                 except OSError:
                     pass  # inbox is best-effort observability; never fail a swap over it
+            elif verdict == "unknown" and not identity_saveback_ok:
+                # ---- 2026-07-06 wrong-account clobber guard (credentials) ----
+                # "unknown" = no refresh-token lineage evidence (rotation-shaped),
+                # so the historical behavior assumes the tokens are current's. But
+                # when the SAME mount's .claude.json identity was just refused as
+                # foreign (identity_saveback_ok False), this is a fully-DRIFTED
+                # mount, not a rotation — its tokens belong to another account, and
+                # saving them into current's snapshot is the credentials half of
+                # the recurring clobber. Refuse + quarantine instead of guessing.
+                sidecar = quarantine_rejected_canonical_write(
+                    current_dir / ".credentials.json", live_creds_bytes, "drifted mount, unknown lineage")
+                msg = (f"WRONG-ACCOUNT GUARD at swap ({current} -> {target_name}): refused to save "
+                       f"unattributable live tokens into '{current}' snapshot — the live mount's identity "
+                       f"was refused as foreign, so these rotation-shaped tokens are not trustworthy as "
+                       f"'{current}'s. Kept the snapshot; quarantined to {sidecar.name}.")
+                click.echo(f"creds-save-back: {msg}")
+                _cred_audit("identity-refuse", "refused-identity",
+                            "drifted mount, unknown lineage — foreign identity refused",
+                            slot=slot, mount=(slot or "shared-mount"), account=current,
+                            incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                            existing_identity=account_identity_anchor(current)[0],
+                            token_fp=_audit_token_fp(live_creds),
+                            extra="quarantined=" + sidecar.name)
+                try:
+                    append_inbox("wrong-account-guard",
+                                 f"token save-back refused for '{current}' (drifted live mount)", msg)
+                except OSError:
+                    pass
             else:
                 # ---- end GH #77 freshness guard ----
                 if verdict == "unknown":
@@ -3478,6 +5939,15 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 # token is recoverable via `cus restore-creds`.
                 backup_credentials_file(current_dir / ".credentials.json")
                 atomic_write_bytes(current_dir / ".credentials.json", live_creds_bytes, mode=0o600)
+                # Canonical credentials write accepted — incoming = the live mount's
+                # identity, existing = current's anchor. In the rayi1 clobber these
+                # disagreed while a #77-fresher foreign token slipped through; logging
+                # both here makes that exact shape one grep away.
+                _cred_audit("saveback", "wrote", f"snapshot credentials save-back (verdict={verdict})",
+                            slot=slot, mount=(slot or "shared-mount"), account=current,
+                            incoming_identity=_identity_fields(live_cj), emit_identity=True,
+                            existing_identity=account_identity_anchor(current)[0],
+                            token_fp=_audit_token_fp(live_creds))
         elif verdict == "foreign":
             # THE GH #3 case: a drifted pane's refresh overwrote the live file
             # with a different account's tokens. Two actions:
@@ -3493,6 +5963,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             backup_credentials_file(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json")
             atomic_write_bytes(ACCOUNTS_DIR / f"account-{owner}" / ".credentials.json",
                                live_creds_bytes, mode=0o600)
+            # Same-lineage owner-heal (GH #3): tokens routed to their TRUE owner,
+            # not `current`. account=owner records where they actually landed.
+            _cred_audit("saveback", "wrote", "GH#3 drift — routed foreign tokens to true owner",
+                        slot=slot, mount=(slot or "shared-mount"), account=owner,
+                        existing_identity=(account_identity_anchor(owner)[0] if owner else None),
+                        emit_identity=True, token_fp=_audit_token_fp(live_creds))
             msg = (f"DRIFT DETECTED at swap ({current} -> {target_name}): {detail}. "
                    f"Skipped save-back into '{current}' snapshot (kept its last-known-good tokens); "
                    f"routed live tokens to their true owner '{owner}' instead.")
@@ -3538,12 +6014,196 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # backup of the live file itself makes the install step independently
     # recoverable.
     backup_credentials_file(live_creds_path)
-    # Phase 2 (#109): pick the install source — the (target, slot) independent
-    # login when the gate is on and one is provisioned, else the shared snapshot
-    # (today's copy path). See swap_install_source for the full rationale.
-    install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # Install source. Pool model (2026-07-03): if the gate is on and the target
+    # is ALREADY live on another mount, a plain snapshot copy would clobber its
+    # shared token family (#104) — so CLAIM a free pooled family (a distinct
+    # family) instead. If the pool is exhausted (no free family AND no legacy
+    # per-slot login), REFUSE rather than clobber: raise, and _execute_slot_moves
+    # logs it as a failed move (SOS surfaces the exhaustion). When the target is
+    # NOT double-booked, fall through to swap_install_source — the shared
+    # snapshot (today's copy path) or a legacy per-slot login. Gate off ⇒ the
+    # whole claim block is skipped, so behavior is bit-for-bit unchanged.
+    claimed_family = None
+    install_src = None
+    used_independent = False
+    if (slot is not None and independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config)):
+        # #127: liveness-verified claim — probes each free family's refresh
+        # token, retires dead stores (the pre-PR#126 poisoning landmines), and
+        # persists the rotation into the store this install copies from.
+        claimed_family = claim_verified_login_family(target_name, state, config)
+        if claimed_family is not None:
+            install_src = login_family_creds_path(target_name, claimed_family)
+            used_independent = True
+        elif has_independent_login(target_name, slot):
+            # Legacy per-slot family (superseded; retained until P5).
+            install_src = login_store_creds_path(target_name, slot)
+            used_independent = True
+        else:
+            raise RuntimeError(
+                f"pool exhausted for '{target_name}': it is live on another mount and has no free "
+                f"independent login family to claim — refusing to install a clobbering copy. "
+                f"Provision another: `cus login-mount {target_name}`.")
+    if install_src is None:
+        install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # ---- 2026-07-07 dead-snapshot family-seed (merkos incident) ----
+    # At this point, if neither the claimed-pool-family block above nor
+    # swap_install_source picked a distinct login family, install_src is the account
+    # SNAPSHOT (target_creds) — the default copy path. That snapshot can be DEAD: its
+    # refresh token fails the OAuth refresh grant with invalid_grant even though the
+    # account is perfectly usable through a live login family. merkos was exactly this
+    # (the un-stale sweep logs `op=unstale-refresh account=merkos decision=failed
+    # reason="refresh grant dead"` while lane tabby-2 ran on merkos via a valid
+    # family). Installing the dead snapshot blanks the mount on Claude Code's first
+    # refresh — the "not logged in" that blanked chats1a when it was swapped onto
+    # merkos. The #141 blank-SHAPE guards below do NOT catch it: a dead snapshot can
+    # be well-shaped (an expired-but-present access token, a positive-but-past
+    # expiresAt) yet still be dead.
+    #
+    # So: when we're about to install the snapshot and it probes DEAD, seed the lane
+    # from a VALID login family instead — claim a FREE family (its own distinct
+    # family, #104-safe, recorded as the slot's login_family lease below, exactly the
+    # supported rescue path). claim_verified_login_family (#127) proves each family
+    # alive via the refresh grant, retires dead stores, and persists the rotation
+    # into the store this install copies from. If NO valid family can be claimed
+    # (snapshot dead AND pool empty/all-dead), REFUSE rather than blank the mount:
+    # raise (a clean no-op — live_creds_path is still untouched until the atomic_copy
+    # below), which _execute_slot_moves logs as a failed move; the picker's dead-
+    # snapshot exclusion keeps it from being re-picked and the SOS points at relogin.
+    # Scoped to the SLOT + gate-on path (claiming/leasing a family is only meaningful
+    # for a lane in the pool model); a gate-off dead snapshot still hits the #141
+    # blank guards / picker exclusion. Degrade-to-safe: refusing a swap never logs
+    # anyone out; installing a dead snapshot does.
+    if (claimed_family is None and not used_independent
+            and slot is not None and independent_logins_enabled(config)
+            and _account_snapshot_dead(target_name, config)):
+        _seed_fam = claim_verified_login_family(target_name, state, config)
+        if _seed_fam is not None:
+            claimed_family = _seed_fam
+            install_src = login_family_creds_path(target_name, _seed_fam)
+            used_independent = True
+            try:
+                _seed_fp = _audit_token_fp(read_json(install_src))
+            except (json.JSONDecodeError, OSError):
+                _seed_fp = "unreadable"
+            _cred_audit("snapshot-dead-family-fallback", "seeded-from-family",
+                        "account snapshot is DEAD (refresh invalid_grant) — seeded the lane from a "
+                        "valid login family instead of blanking the mount (merkos incident)",
+                        slot=slot, mount=slot, account=target_name,
+                        login_family=f"{target_name}/{_seed_fam}", token_fp=_seed_fp)
+            click.echo(f"creds-install: '{target_name}' snapshot is DEAD — seeded {slot} from valid "
+                       f"login family {target_name}/{_seed_fam} instead (no dead-snapshot blank)")
+        else:
+            _cred_audit("snapshot-dead-family-fallback", "refused-no-source",
+                        "account snapshot is DEAD and no valid login family could be claimed — "
+                        "refusing to install dead creds (would blank the mount)",
+                        slot=slot, mount=slot, account=target_name)
+            raise RuntimeError(
+                f"refusing to install '{target_name}' onto lane {slot}: its canonical snapshot "
+                f"credentials are DEAD (the OAuth refresh grant returns invalid_grant) and no valid "
+                f"login family remains to seed from — installing the dead snapshot would blank the mount "
+                f"and log the session out (the 2026-07-07 merkos dead-snapshot incident, which blanked "
+                f"chats1a). Re-login the account first: `cus relogin {target_name}`. Lane left on its "
+                f"prior account (no creds written).")
+    # ---- 2026-07-07 divergence-logout guard (GH #104 lane invariant) ----
+    # INVARIANT: a SLOT swap that lands on an account ALSO held by the shared
+    # ~/.claude mount or by another live lane MUST run a DISTINCT login family —
+    # a freshly CLAIMED pooled family, recorded as state.slots[slot].login_family
+    # (claimed_family is not None). Any other source (the shared account snapshot,
+    # OR a legacy per-(account, slot) store) shares ONE OAuth refresh-token family
+    # across two live mounts; each mount rotates it independently on refresh, the
+    # old refresh token dies, and the loser is logged out with
+    # `401 Invalid authentication credentials` (#104).
+    #
+    # The incident (chats1a, verified live 2026-07-07): `cus slot move slot-2
+    # merkos` printed "installed independent login for (slot-2, merkos)" via the
+    # LEGACY fallback below — `claim_verified_login_family` returned None (merkos's
+    # only pooled family was already leased to slot-1, which was ALSO on merkos),
+    # so the code fell to `has_independent_login` / `swap_install_source` and
+    # installed a per-slot store WITHOUT recording a family lease. login_family
+    # stayed None while merkos was simultaneously the shared-mount account AND on
+    # slot-1. ~5 min later the shared mount's token rotation clobbered slot-2's
+    # copy → the live session hit `401 · Please run /login` for an hour. The
+    # printed "installed independent login" line was a lie: no distinct family
+    # persisted, and the legacy store's token was not a genuinely-independent
+    # family (a stale snapshot copy).
+    #
+    # Fix: for a DOUBLE-BOOKED account, refuse to install a source whose
+    # refresh-token FAMILY already runs on another live mount of that account —
+    # option (b) from the task: fail with a clear error, leaving the lane on its
+    # PRIOR good account (nothing is written to live_creds_path until the
+    # atomic_copy further down, so raising here is a clean no-op for the mount).
+    # The check reads actual token bytes (`_live_family_would_collide`), so it
+    # REFUSES the incident's stale-copy legacy store (same family as the shared
+    # mount) while still ALLOWING a genuinely-independent legacy login (distinct
+    # family — the supported Track-B case, whose own tests must keep passing).
+    # A claimed pooled family installs a distinct family by construction, so this
+    # is a no-op on the normal rescue path; it is defense-in-depth that also
+    # catches a mis-provisioned pool family that happens to share the snapshot's
+    # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
+    # does. The login-free remedy is another pooled family (`cus login-mount`).
+    if (slot is not None and independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config)
+            and _live_family_would_collide(target_name, install_src, slot, state, config)):
+        # The refusal that prevents the divergence-logout: this install source's
+        # token family is already live on another mount of `target_name`. shared=true
+        # is the whole reason we refuse; token_fp names the colliding family.
+        try:
+            _collide_fp = _audit_token_fp(read_json(install_src))
+        except (json.JSONDecodeError, OSError):
+            _collide_fp = "unreadable"
+        _cred_audit("family-collision-refuse", "refused-collision",
+                    "install source shares a live family on another mount (#104)",
+                    slot=slot, account=target_name, login_family=(claimed_family or "legacy/snapshot"),
+                    shared=True, token_fp=_collide_fp)
+        raise RuntimeError(
+            f"refusing to install '{target_name}' onto lane {slot}: the credentials about to be "
+            f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
+            f"or another lane of '{target_name}'. Two live mounts on one token family log one of "
+            f"them out on the next rotation (GH #104 divergence — the 2026-07-07 chats1a logout). "
+            f"No distinct login family could be claimed (pool empty, all families leased, or the "
+            f"source is a stale snapshot copy). Provision another independent login "
+            f"(`cus login-mount {target_name}`) and retry, or move the lane to a different "
+            f"account. Lane left on its prior account (no creds written).")
+    # ---- GH #141 root-cause guard (definitive install-point gate) ----
+    # This is THE line that writes creds to the live mount; every swap path
+    # (snapshot copy, claimed pool family, legacy per-slot login) funnels through
+    # it. Validate the actual bytes about to be installed and REFUSE to write a
+    # blank/expired payload, so no swap can ever leave the live mount logged out
+    # (GH #141). The early guard above already covers the default snapshot path
+    # with zero partial state; this backstops the pool paths (independent-login
+    # families) whose source is resolved only here. `live_creds_path` is still
+    # untouched at this point — the atomic_copy below is its first and only write
+    # — so raising keeps the mount's current, valid creds intact.
+    try:
+        _install_src_creds = read_json(install_src)
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(
+            f"refusing to install '{target_name}' creds: source {install_src} is unreadable "
+            f"({e}) — writing it would blank the live mount (GH #141).")
+    if _live_mount_creds_invalid(_install_src_creds):
+        raise RuntimeError(
+            f"refusing to install '{target_name}' creds: source {install_src.name} is blank/expired "
+            f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
+            f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
+            f"backup (`cus restore-creds {target_name}`).")
     atomic_copy(install_src, live_creds_path, mode=0o600)
-    if used_independent:
+    # THE install-point: the target account's creds are now live on this mount.
+    # source = which store we copied from (claimed pool family / legacy / snapshot);
+    # existing = target's trusted anchor identity; token_fp names the family that is
+    # now live here — the fingerprint a later divergence-detected line would match.
+    _cred_audit("swap-install", "wrote",
+                ("claimed pooled family" if claimed_family is not None
+                 else "independent login (legacy)" if used_independent
+                 else "account snapshot"),
+                slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                existing_identity=_identity_fields(target_account_cj), emit_identity=True,
+                login_family=(f"{target_name}/{claimed_family}" if claimed_family else None),
+                token_fp=_audit_token_fp(_install_src_creds))
+    if claimed_family is not None:
+        click.echo(f"creds-install: claimed pooled login {target_name}/{claimed_family} for {slot} "
+                   f"(distinct family, no clobber — #109 pool)")
+    elif used_independent:
         click.echo(f"creds-install: installed independent login for ({slot}, {target_name}) — GH #109")
 
     # Update state with progressive-threshold bookkeeping
@@ -3553,7 +6213,30 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     else:
         slot_entry["account"] = target_name
         slot_entry["last_swap_ts"] = ts
+        # Occupancy just changed: drop the cached account→slots map so every
+        # same-cycle reader (the NEXT fan-out move's clobber guard, SOS checks)
+        # sees this slot on its new account. Complements the guard's own
+        # cache bypass — belt and braces after the 2026-07-03 16:10Z clobber.
+        _OCCUPIED_SLOTS_CACHE.clear()
+        # Record/clear the pool lease (2026-07-03): a claimed family binds this
+        # slot to (target, family) so leased_families() excludes it from other
+        # slots' free set and save-back routes there. Moving onto a primary /
+        # snapshot (no claim) releases any prior lease.
+        if claimed_family is not None:
+            slot_entry["login_family"] = f"{target_name}/{claimed_family}"
+        else:
+            slot_entry.pop("login_family", None)
     state["accounts"][target_name]["last_swap_ts"] = ts
+    # Ladder hysteresis clock (2026-07-03): only DAEMON-decided swaps arm it.
+    # A launch installing an account into a slot isn't churn, but it used to
+    # bump last_swap_ts and re-arm the anti-ping-pong cooldown — with a long
+    # min_seconds_between_swaps, every launch parked the ladder for all slots
+    # on that account while they climbed (2026-07-03: slot-6/slot-7 stuck at
+    # 84-88% behind a 50-min lockout that launches kept resetting). The ladder
+    # check reads last_auto_swap_ts; last_swap_ts stays for display and the
+    # 60s reactive/cap spacings (where counting launches is harmless).
+    if trigger != "launch":
+        state["accounts"][target_name]["last_auto_swap_ts"] = ts
 
     # Bump current account's next_swap_at_pct ladder using CONFIG steps.
     # Falls back to the hardcoded default ladder if config is missing.
@@ -4097,6 +6780,20 @@ def decide_swap(
         _note("no_usage", "hold", f"no fresh usage poll for active account {current}")
         return None
 
+    # Fix A — extrapolation-aware trigger (2026-07-06 rayi3 incident). The ladder
+    # (Trigger 2) and hard-cap (Trigger 1) trips below compare against the
+    # BURN-EXTRAPOLATED usage, projected forward to the moment the daemon could
+    # next act on this account (its poll interval), instead of the raw last-polled
+    # value. rayi3 read 91% at one poll and 100% at the next ~180s later — a live
+    # session hit the native usage-limit menu in that gap before any swap. Anchor
+    # the projection horizon at the account's own poll interval; when poll_accel
+    # is disabled these stay 0 / raw and every trip is byte-identical to before.
+    _trig_now = datetime.now(timezone.utc)
+    _trig_look_ahead = (
+        _account_poll_interval(state, config, current)
+        if _poll_accel_enabled(config) else 0.0
+    )
+
     # NOTE: the previous "Trigger 0: active is rate-limited (poll 429)" has
     # been REMOVED (GH #18). That trigger fired on the POLLING endpoint's
     # 429 — Anthropic's per-IP throttle on /api/oauth/usage, which is NOT
@@ -4121,9 +6818,30 @@ def decide_swap(
     # aggregate ceiling of 80.
     cur_model = _max_model_weekly_from_usage(cur_usage, config)
     model_cap = _model_weekly_cap_for_config(config)
+    # Fix A: force the hard-cap trips on the burn-EXTRAPOLATED values, not the
+    # stale poll. Aggregate 7d extrapolates via estimate_window_pct (same base as
+    # cur_usage.seven_day.utilization — they're synced by update_state_with_usage).
+    # Per-model weekly has no burn rate of its own; it rides the 7d window, so we
+    # project it forward on the 7d rate (a conservative shared-window proxy). Both
+    # use max()/+delta so extrapolation only ever raises the value — a real
+    # over-cap poll is never masked. Inert when poll_accel is off (look_ahead 0).
+    if _poll_accel_enabled(config):
+        cur_7d = max(cur_7d, estimate_window_pct(
+            active_acct, "7d", config, _trig_now + timedelta(seconds=_trig_look_ahead)))
+        if cur_model > 0:
+            cur_model = min(100.0, cur_model + _burn_extrapolation_delta(
+                active_acct, "7d", config, _trig_now, _trig_look_ahead))
     agg_tripped = cur_7d >= hard_7d_cap
     model_tripped = cur_model > 0 and cur_model >= model_cap
     if agg_tripped or model_tripped:
+        # Preserve the FORCING caps before the display reassignment below stomps
+        # `hard_7d_cap`. The anti-pingpong guard (further down) compares the chosen
+        # target against these swap-AWAY caps — the ones that actually tripped —
+        # NOT the target-side caps pick_swap_target filters arrivals with (those
+        # can sit higher, which is how a target at/over the forcing cap slips
+        # through the picker un-degraded, PR #139 ping-pong).
+        _forcing_agg_cap = hard_7d_cap
+        _forcing_model_cap = model_cap
         # For the operator-facing messages below: show whichever signal tripped
         # (the model % when only the model cap tripped, else the aggregate).
         cur_7d = cur_7d if agg_tripped else cur_model
@@ -4154,8 +6872,16 @@ def decide_swap(
 
         target = pick_swap_target(state, config)
         if target is None:
-            _note("hard_7d_cap_no_target", "hold",
-                  f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but no valid swap target")
+            # Visibility (2026-07-03): this hold used to be SILENT — _note()
+            # only writes the trace dict, it does NOT echo to daemon.log (unlike
+            # every sibling hold gate below). In lanes/hybrid mode a hot lane
+            # whose only candidates are all excluded (GH #104 no-double-book) or
+            # saturated lands here every cycle, so the operator saw "hard 7d cap
+            # tripped" followed by silence and no swap. Echo the reason so the
+            # daemon log explains WHY it held; SOS Condition 2b surfaces it too.
+            msg = f"hard 7d cap tripped on {current} ({cur_7d:.1f}%) but no valid swap target"
+            click.echo(f"  {msg}")
+            _note("hard_7d_cap_no_target", "hold", msg)
             return None
         # If the picker had to fall back to a DEGRADED candidate (also above
         # hard_7d_cap), swapping doesn't actually help — both accounts are
@@ -4170,6 +6896,49 @@ def decide_swap(
             )
             click.echo(f"  {msg}")
             _note("hard_7d_cap_degraded", "hold", msg)
+            return None
+        # ---- Anti-pingpong guard (fix 2026-07-05, PR #139) ----
+        # A hard-cap FORCED swap must land on an account that GENUINELY RELIEVES
+        # the cap forcing us — i.e. is STRICTLY BELOW that cap on the same
+        # dimension. A lateral move onto an equally-or-more-capped account relieves
+        # nothing and bounces straight back next cycle. Live trace: `default` at
+        # Fable 100% (>= 97 cap) swaps toward its best below-cap target (rayi1),
+        # but that move FAILS (pool exhausted, no free login family — see the
+        # over-subscription fix in this same PR); with rayi1 unreachable, the
+        # picker's headroom fallback returned rayi2 at Fable 97% (== cap → also
+        # capped), so default→rayi2→default oscillated forever. min_seconds_between_*
+        # only throttles the rate, it doesn't stop the loop.
+        #
+        # The existing "[DEGRADED: no targets below 7d cap]" check above catches
+        # only the AGGREGATE fallback, and only when the picker itself marked the
+        # pick degraded. It misses the per-model case because pick_swap_target
+        # filters ARRIVALS with the target-side model cap (target_cap_pct), which
+        # can sit ABOVE the swap-away cap_pct that tripped here — so rayi2 at 97
+        # passes the picker un-degraded even though it clears nothing. This guard
+        # compares the chosen target's value on the FORCING dimension directly
+        # against the forcing cap, independent of annotation wording, covering both
+        # the aggregate hard_7d_cap and the per-model weekly cap. Boundary:
+        # target_pct >= cap is NOT relief (rayi2 at exactly 97 is rejected); only a
+        # STRICTLY-below-cap target is a genuine escape. When both signals tripped,
+        # the target must clear BOTH. If nothing reachable clears the cap, HOLD and
+        # let SOS surface the all-capped condition (holding on the current capped
+        # account is strictly no worse than a churning lateral move). Backward-
+        # compatible: `_max_model_weekly_from_acct` is 0.0 with the per-model gate
+        # off, so that branch is inert on unmodified installs.
+        target_acct = state["accounts"].get(target.name, {})
+        capped_dims: list[str] = []
+        if agg_tripped and target_acct.get("current_7d_pct", 0.0) >= _forcing_agg_cap:
+            capped_dims.append(f"7d {target_acct.get('current_7d_pct', 0.0):.0f}% >= {_forcing_agg_cap:.0f}%")
+        if model_tripped and _max_model_weekly_from_acct(target_acct, config) >= _forcing_model_cap:
+            capped_dims.append(f"model {_max_model_weekly_from_acct(target_acct, config):.0f}% >= {_forcing_model_cap:.0f}%")
+        if capped_dims:
+            gate_word = "hard_7d_cap" if agg_tripped else "per-model weekly"
+            shown_cap = _forcing_agg_cap if agg_tripped else _forcing_model_cap
+            msg = (f"hold {current}: all reachable targets at/over the {gate_word} cap "
+                   f"({shown_cap:.0f}%) — swapping wouldn't relieve it (anti-pingpong); "
+                   f"best target '{target.name}' still capped [{'; '.join(capped_dims)}]")
+            click.echo(f"  {msg}")
+            _note("hard_cap_pingpong", "hold", msg)
             return None
         reason = f"hard 7d cap: {current} at {cur_7d:.1f}% >= {hard_7d_cap}%; target: {target.reason}"
         _note("hard_7d_cap", "swap", reason)
@@ -4191,14 +6960,20 @@ def decide_swap(
     hyst_cfg = config.get("swap_hysteresis", {})
     if hyst_cfg.get("enabled", True):
         min_seconds = hyst_cfg.get("min_seconds_between_swaps", 300)
-        last_swap = active_acct.get("last_swap_ts")
+        # last_auto_swap_ts, NOT last_swap_ts (2026-07-03): this gate exists to
+        # stop ladder ping-pong between DAEMON swaps, so only daemon swaps arm
+        # it. Launches used to arm it via last_swap_ts, deferring the ladder
+        # for every slot on a freshly-launched account (see _execute_swap_locked).
+        # Missing field (pre-upgrade state) = no recent auto swap; the ladder
+        # threshold + min_improvement_pct still gate the swap itself.
+        last_swap = active_acct.get("last_auto_swap_ts")
         if last_swap:
             try:
                 last_swap_dt = datetime.fromisoformat(last_swap.replace("Z", "+00:00"))
                 elapsed = (datetime.now(timezone.utc) - last_swap_dt).total_seconds()
                 if elapsed < min_seconds:
                     msg = (
-                        f"ladder check deferred: last swap was {int(elapsed)}s ago "
+                        f"ladder check deferred: last auto swap was {int(elapsed)}s ago "
                         f"(< min_seconds_between_swaps={min_seconds}s)"
                     )
                     click.echo(f"  {msg}")
@@ -4237,7 +7012,19 @@ def decide_swap(
         # this, and reactive 429 catches actually-exhausted accounts.
         threshold = cfg_steps[-1]
 
+    # Fix A (2026-07-06 rayi3 incident): trip the ladder on the burn-EXTRAPOLATED
+    # max(5h, 7d), projected forward to the next poll — NOT the raw last-polled
+    # value. max() with the raw current_max_pct so extrapolation only ever trips
+    # EARLIER, never masks a genuine over-step poll; inert when poll_accel is off
+    # (_trig_look_ahead == 0 ⇒ extrapolate-to-now on a freshly-polled account ≈
+    # raw). This is the core fix: rayi3 sat at 91%-last-poll (< 95% step) while
+    # burning fast enough to hit 100% before the next poll; extrapolating its
+    # ~180s poll interval forward trips the 95% step THIS cycle so the lane swaps
+    # off BEFORE the native cap instead of after.
     cur_pct = current_max_pct(cur_usage, config)
+    if _poll_accel_enabled(config):
+        cur_pct = max(cur_pct, _account_estimated_effective_pct(
+            active_acct, config, _trig_now, look_ahead_seconds=_trig_look_ahead))
     if cur_pct < threshold:
         _note("below_threshold", "hold",
               f"{current} at {cur_pct:.1f}% < ladder threshold {threshold}% — nothing to do")
@@ -4268,7 +7055,17 @@ def decide_swap(
         cur_7d_val = cur_usage.seven_day.utilization if cur_usage.seven_day else 0.0
         five_h_over = th_cfg.get("five_hour", True) and cur_5h >= threshold
         seven_d_over = th_cfg.get("seven_day", True) and cur_7d_val >= threshold
-        if five_h_over and not seven_d_over and cur_5h < max_defer_pct:
+        # Fix A (2026-07-06): gate the max_defer_pct "too close to gamble" guard on
+        # the burn-EXTRAPOLATED 5h, not the raw poll. Deferring a swap because 5h
+        # resets soon is safe ONLY if 5h won't hit the native cap first; a fast
+        # burner sitting at raw 88% but projected to 96% before the reset must NOT
+        # be deferred (that is exactly the rayi3 too-late failure via this path).
+        # Extrapolation only raises cur_5h_eff, so it can only make us defer LESS.
+        cur_5h_eff = cur_5h
+        if _poll_accel_enabled(config):
+            cur_5h_eff = max(cur_5h, estimate_window_pct(
+                active_acct, "5h", config, _trig_now + timedelta(seconds=_trig_look_ahead)))
+        if five_h_over and not seven_d_over and cur_5h_eff < max_defer_pct:
             time_to_reset_s = _five_hour_remaining_seconds(cur_usage, active_acct)
             if time_to_reset_s is not None and 0 < time_to_reset_s <= wait_window_s:
                 msg = (
@@ -4331,8 +7128,18 @@ def decide_swap(
 
     target = pick_swap_target(state, config)
     if target is None:
-        _note("no_target", "hold",
-              f"ladder tripped on {current} ({cur_pct:.1f}% >= {threshold}%) but no valid swap target")
+        # Visibility (2026-07-03): this hold used to be SILENT — _note() only
+        # writes the trace dict, it does NOT echo to daemon.log (unlike the
+        # cap_degraded_target / min_improvement gates just below). This is the
+        # exact branch that swallowed the "no swaps since lanes" symptom: with
+        # 4 live lanes + the shared mount across 5 accounts, GH #104's
+        # no-double-book exclusion leaves a hot lane at most one candidate, and
+        # when that candidate is itself saturated the picker returns None. The
+        # ladder trip was logged, then silence. Echo the reason; SOS Condition
+        # 2b raises the operator-actionable flag (add an account / free a lane).
+        msg = f"ladder tripped on {current} ({cur_pct:.1f}% >= {threshold}%) but no valid swap target"
+        click.echo(f"  {msg}")
+        _note("no_target", "hold", msg)
         return None
 
     # Anti-pingpong / cap-degraded-target gate (GH #53, 2026-05-28): refuse a
@@ -4573,8 +7380,13 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     "deferrable", "reason", "pool"}. Multiple slots on the same hot account
     FAN OUT to distinct targets (best-headroom-first — each pick excludes
     targets already taken this round) rather than piling onto one; when the
-    account pool runs out of distinct targets, remaining slots share the last
-    pick (doubling up beats staying on a tripped account).
+    account pool runs out of distinct targets, remaining slots HOLD on their
+    current account. (Superseded 2026-07-03: the original "doubling up beats
+    staying on a tripped account" fallback put one account's token family on
+    two live mounts — the exact #104 clobber, hit live on slot-3/slot-4 that
+    day. A parked hot slot degrades gracefully; a clobbered one logs a session
+    out. Exception: a slot with its own independent login for the target may
+    still double-book — distinct family, no clobber, GH #109 Phase 3b.)
 
     Slots are grouped by (account, pool): slots on the same account but in
     different rotation-set pools get DIFFERENT decisions — a premium slot
@@ -4594,8 +7406,27 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
     # Seed with the cross-mount exclusions so BOTH the primary pick (via the
     # per-group accounts shim below) and the fan-out re-pick avoid them.
     taken: set[str] = set(exclude)
+    # Per-cycle family-consumption tally (fix 2026-07-05): how many moves this
+    # round have already been aimed at each target, so a same-cycle pool double-
+    # book can't exceed the target's distinct login families (see the can_pool
+    # gate below). Mirrors the reactive path's round_claims.
+    round_claims: dict[str, int] = {}
     locked = _locked_slots(config)
     occupied = occupied_slot_accounts(state)
+    # Anti-clustering lane-load base (2026-07-06): account → number of live lanes
+    # it ALREADY backs at cycle start. Fed (merged with this-cycle's round_claims)
+    # into pick_swap_target's score penalty AND consulted by the deferrable-move
+    # HOLD gate below, so the daemon spreads lanes one-per-account instead of
+    # piling every lane onto the single burn-soon magnet (the rayi5→rayi4 pile-up).
+    base_lane_load: dict[str, int] = {a: len(s) for a, s in occupied.items()}
+
+    def _cur_lane_load() -> dict[str, int]:
+        """account → lanes it will back = pre-existing live lanes + moves already
+        queued onto it THIS cycle. Recomputed per pick so each successive fan-out
+        re-pick sees the accreting load and steers to a fresh account."""
+        names = set(base_lane_load) | set(round_claims)
+        return {a: base_lane_load.get(a, 0) + round_claims.get(a, 0) for a in names}
+
     # Group occupied, unlocked slots by (account, pool). Locked slots are frozen
     # — dropped here so a group whose slots are all locked never burns a
     # decide_swap and fan-out never counts them.
@@ -4613,8 +7444,24 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         # Drop cross-mount-excluded accounts from the candidate pool for THIS
         # group's decision (keep the group's own account — it's being left).
         drop = exclude - {acct_name}
+        # Independent-login POOL rescue (2026-07-03): an account is only excluded
+        # because a COPY onto a second live mount would clobber its shared token
+        # family (#104). If that account has a FREE pooled login family, a swap
+        # can claim it (distinct family) — so it's a legal target, un-drop it.
+        # Without this a hot lane whose only headroom sits behind held accounts
+        # had NO target and held forever (the "no swaps since lanes" symptom).
+        # Execution (_execute_swap_locked) does the actual claim + lease and
+        # REFUSES if the pool turns out exhausted, so this can't cause a clobber.
+        # Gated on use_independent_logins — OFF (default) leaves drop unchanged.
+        if drop and independent_logins_enabled(config):
+            rescuable = {x for x in drop if has_free_login_family(x, state)}
+            drop = drop - rescuable
         if drop:
             shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in drop}
+        # Anti-cluster: expose the current lane-load so the PRIMARY pick (through
+        # decide_swap → pick_swap_target) penalizes an account already backing
+        # lanes and prefers a distinct empty one.
+        shim["_lane_load"] = _cur_lane_load()
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
         if traces is not None:
@@ -4623,22 +7470,132 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
             continue
         for slot_name in sorted(slots):
             target = decision.target
+            reason = decision.reason
             if target in taken:
-                # Fan-out: re-pick with this round's taken targets excluded
-                # (the hot account stays excluded as the shim's active). Use the
-                # SAME pool-adjusted config so a standard slot's re-pick also
-                # ignores the model gate.
+                # The primary pick is unavailable to THIS slot as a plain
+                # snapshot-copy: another live mount holds it (cross-mount
+                # exclusion) or an earlier slot took it this round (fan-out).
+                # Two escape hatches; healthy fan-out wins, then pool:
+                #
+                #   1. Fan-out re-pick — a DIFFERENT account with this round's
+                #      taken targets excluded (the hot account stays excluded as
+                #      the shim's active; same pool-adjusted config so a
+                #      standard slot's re-pick also ignores the model gate).
+                #      Accepted only when HEALTHY (wouldn't immediately re-trip
+                #      its own ladder), or when the pool hatch below can't take
+                #      the pick anyway (old fall-back-somewhere behavior).
+                #   2. Pool double-book — keep the pick and claim a distinct
+                #      login family for this mount (free pooled family, or a
+                #      legacy per-slot login — #109 3b). No #104 clobber:
+                #      execution does the claim and REFUSES if the pool turns
+                #      out exhausted, so an optimistic keep here is safe.
+                #
+                # Regression guard (2026-07-03, slot-2 → rayi3@99% incident):
+                # the pool rescue above un-drops held-but-poolable accounts for
+                # the PICK, but `taken` is seeded with the raw exclude set — so
+                # the rescued pick always died at this veto, and the re-pick
+                # ran on degraded leftovers: pick_swap_target's headroom_fallback
+                # happily returned a 99%-5h account ("swap somewhere beats
+                # sitting on a hot active"), which beat the 0%-usage pooled
+                # pick and rate-limited the live session within a minute.
+                # Hence "healthy" gate on the retry: a re-pick that would
+                # re-trip on arrival loses to a pooled family on the account
+                # the strategy actually scored best.
+                # can_pool is capacity-aware (2026-07-05): the target may be
+                # double-booked only while it still has a DISTINCT login family
+                # free AFTER the moves already queued this cycle. Checking the
+                # static has_free_login_family (as before) let several slots on
+                # one hot account fan out onto a SINGLE free family in the same
+                # cycle — the GH #104 clobber (2026-07-05 rayi1 pile-up). Gate
+                # off ⇒ capacity 0 ⇒ can_pool False ⇒ HOLD, exactly as before.
+                can_pool = (independent_logins_enabled(cfg_view)
+                            and round_claims.get(target, 0) < _distinct_family_capacity(
+                                target, state, cfg_view, slot_name))
                 shim2 = dict(shim)
                 shim2["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n not in taken}
+                # Anti-cluster: the re-pick sees the accreting lane-load too, so it
+                # steers to a fresh account rather than the loaded magnet.
+                shim2["_lane_load"] = _cur_lane_load()
                 retry = pick_swap_target(shim2, cfg_view)
-                if retry is not None:
-                    target = retry.name
-                # else: pool exhausted — double up on the original target.
+                retry_healthy = retry is not None and not _target_would_immediately_re_trip(
+                    state.get("accounts", {}).get(retry.name, {}), cfg_view)
+                # Anti-clustering HOLD (2026-07-06 rayi5→rayi4 pile-up). The #109
+                # pool double-book below is what lets several lanes STACK onto one
+                # burn-soon account in a single cycle (4 mounts on 3 families → the
+                # shared token diverged → the "mount blanked" auto-heal loop, and
+                # they then all hit that account's 5h cap together). The whole
+                # incident was `burn_before_reset` moves — a pure OPTIMIZATION that
+                # fires only while the lane's current account is BELOW its own step
+                # (decide_swap gates bbr on current_max < ladder_threshold), i.e.
+                # the lane does NOT need to move at all. When such a move would grow
+                # a target past `max_stack` live lanes (existing occupancy + this
+                # cycle's claims), HOLD: the lane keeps its perfectly-usable current
+                # account and can move to a DISTINCT account next cycle. Scoped to
+                # the bbr gate on purpose — a LADDER move means the source IS hot
+                # (at/over its step) and genuinely needs off, so when clean accounts
+                # are scarce it still pool-double-books (the task's "allow stacking
+                # when clean accounts are scarce"); likewise hard-cap / reactive-429
+                # escapes (deferrable=False) must go somewhere. The #104/#109 family
+                # accounting guards those last-resort stacks. Gated on
+                # spread_lanes.enabled (off ⇒ pre-fix path, bit-for-bit).
+                sl_cfg = config.get("spread_lanes", {})
+                spread_on = _spread_lanes_enabled(config)
+                max_stack = int(sl_cfg.get("max_stack", 1))
+                target_lane_load = base_lane_load.get(target, 0) + round_claims.get(target, 0)
+                cluster_hold = (spread_on and decision.gate == "burn_before_reset"
+                                and target_lane_load >= max_stack)
+                if retry is not None and (retry_healthy or not can_pool):
+                    # Re-pick reasons were silently dropped pre-2026-07-03 —
+                    # decisions.jsonl showed the ORIGINAL pick's stats next to
+                    # the re-picked target (log said "5h=0%" for a 99% move).
+                    target, reason = retry.name, retry.reason
+                elif cluster_hold:
+                    # Would pile a non-urgent move onto an already-loaded account —
+                    # keep the lane put instead (anti-clustering).
+                    click.echo(f"  {slot_name}: holding on '{acct_name}' — not stacking a "
+                               f"non-urgent {decision.gate} move onto '{target}', which already "
+                               f"backs {target_lane_load} live lane(s) (spread_lanes.max_stack="
+                               f"{max_stack}); the lane stays put and can move to a distinct "
+                               "account next cycle (2026-07-06 lane-clustering incident)")
+                    continue
+                elif can_pool:
+                    reason = (f"{reason} (pool double-book: '{target}' backs another "
+                              f"live mount; claiming a distinct login family — #109)")
+                else:
+                    # No valid DISTINCT target for this slot, and the original
+                    # pick can't be pool-double-booked (no free login family).
+                    # This branch == (retry is None and not can_pool); the
+                    # re-pick returned None for one of two reasons:
+                    #   1. Every other account is saturated / token_expired /
+                    #      would immediately re-trip its own ladder. Pre-2026-07-03
+                    #      the fallback DOUBLED UP on the original target here —
+                    #      installing one token family on two live mounts, the
+                    #      exact clobber #104 forbids (hit live on slot-3/slot-4,
+                    #      2026-07-03: one refresh logs the other out).
+                    #   2. (2026-07-05, this PR) a PREMIUM lane whose every
+                    #      remaining candidate is at/over the per-model Fable
+                    #      weekly cap — pick_swap_target now HOLDS rather than
+                    #      landing a premium lane on a Fable-dead account (the
+                    #      per-model analog of #139's hard-cap HOLD). This is the
+                    #      exact rayi4 fan-out incident: the first two lanes took
+                    #      the clean Fable targets, the third had only Fable-capped
+                    #      accounts left.
+                    # Either way HOLD: a parked hot slot degrades gracefully and
+                    # can move next cycle when a clean target frees (e.g. after a
+                    # 5h reset); staying on the hot account is strictly better
+                    # than a Fable-dead landing or a #104 clobber.
+                    click.echo(f"  {slot_name}: holding on '{acct_name}' — no valid distinct swap "
+                               f"target for this {pool} lane (remaining candidates excluded: "
+                               f"saturated / would re-trip, or over the per-model Fable weekly cap "
+                               f"for a premium lane; won't double-book '{target}' onto a second "
+                               f"live mount — GH #104 / #139)")
+                    continue
             taken.add(target)
+            round_claims[target] = round_claims.get(target, 0) + 1
             moves.append({
                 "slot": slot_name, "from": acct_name, "to": target,
                 "gate": decision.gate, "tier": decision.tier,
-                "deferrable": decision.deferrable, "reason": decision.reason,
+                "deferrable": decision.deferrable, "reason": reason,
                 "pool": pool,
             })
     return moves
@@ -4696,6 +7653,14 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
     # Seed with cross-mount exclusions (GH #104): even an urgent 429 escape must
     # not land on an account another live mount holds.
     taken: set[str] = set(exclude_accounts or ())
+    # Per-cycle family-consumption tally (fix 2026-07-05): how many moves this
+    # round have already been aimed at each target. A target may be picked only
+    # while it still has a DISTINCT login family free AFTER the moves already
+    # queued this cycle (each will claim one). Without this, two 429s in one cycle
+    # both saw the same single free family in the static snapshot and both
+    # committed onto it — the exact GH #104 clobber the pool exists to prevent
+    # (execution refuses the 2nd, but noisily, and the lane is stranded anyway).
+    round_claims: dict[str, int] = {}
     for slot_name, acct in sorted(slot_to_account.items()):
         last_swap = state.get("accounts", {}).get(acct, {}).get("last_swap_ts")
         if min_gap and last_swap:
@@ -4709,7 +7674,30 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         shim["active"] = acct
         # Keep the slot's own account present (pick excludes the active anyway);
         # drop this-round targets + cross-mount exclusions.
-        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in taken}
+        drop = {n for n in taken if n != acct}
+        # Independent-login POOL rescue (2026-07-03), now with same-round capacity
+        # accounting (2026-07-05): a 429'd slot may escape onto a held account only
+        # while that account still has a DISTINCT login family free AFTER the moves
+        # already queued this cycle — each queued move onto it will claim one. The
+        # swap installs that distinct family (no clobber). A held account whose
+        # remaining capacity has reached zero stays EXCLUDED, so the picker never
+        # returns it and the lane holds instead of over-subscribing. Same relaxation
+        # as the proactive ladder path; execution does the claim + refuses if the
+        # pool turns out exhausted. Gated on use_independent_logins: off ⇒ no
+        # families ⇒ held accounts have capacity 0 ⇒ drop is unchanged (never
+        # double-book — the pre-pool #104 rule), so gate-off behavior is identical.
+        if drop and independent_logins_enabled(config):
+            drop = {x for x in drop
+                    if _distinct_family_capacity(x, state, config, slot_name)
+                       - round_claims.get(x, 0) <= 0}
+        shim["accounts"] = {n: a for n, a in state.get("accounts", {}).items() if n == acct or n not in drop}
+        # Anti-cluster (2026-07-06): even an urgent 429 escape prefers a distinct,
+        # unloaded account over one already backing lanes. Load = live occupancy +
+        # this-cycle's reactive claims (round_claims). No HOLD here — a 429'd lane
+        # MUST leave — but the penalty biases WHICH account it lands on.
+        occ_now = occupied_slot_accounts(state)
+        shim["_lane_load"] = {a: len(occ_now.get(a, [])) + round_claims.get(a, 0)
+                              for a in set(occ_now) | set(round_claims)}
         # Pick the escape target under the offending slot's pool rules (GH #99):
         # a standard slot's 429 escape may land on a model-exhausted account,
         # a premium slot's may not.
@@ -4717,6 +7705,22 @@ def check_rate_limit_reactive_per_session(state: dict, config: dict, entries: li
         target = pick_swap_target(shim, _config_for_pool(config, pool))
         if target is None:
             continue  # nowhere safe to go; SOS handles the all-full case
+        # Authoritative capacity HOLD (fix 2026-07-05, GH #104 reactive over-
+        # subscribe): never commit a move that would put more concurrent live
+        # mounts on `target` than it has distinct login families to cover them.
+        # The un-drop above already keeps exhausted HELD accounts out of the
+        # candidate pool, so pick rarely returns one — but this also catches an
+        # unheld account picked twice in one cycle, and makes the reactive path
+        # degrade with a clear HOLD line rather than relying on the execution
+        # layer's downstream 'pool exhausted' refusal (which strands the 429'd
+        # lane on its hot account just the same, only noisier). Incident 2026-07-05:
+        # 6 lanes landed on rayi1's 2 families and the shared token diverged.
+        if round_claims.get(target.name, 0) >= _distinct_family_capacity(target.name, state, config, slot_name):
+            click.echo(f"  reactive-429 on {slot_name}: HOLDING on '{acct}' — no distinct login "
+                       f"family free for '{target.name}' (a 2nd live mount would clobber its shared "
+                       f"token family — GH #104). Provision one: `cus login-mount {target.name}`")
+            continue
+        round_claims[target.name] = round_claims.get(target.name, 0) + 1
         taken.add(target.name)
         moves.append({
             "slot": slot_name, "from": acct, "to": target.name,
@@ -4763,7 +7767,12 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
         if acct and d.exists():
             r = saveback_mount_credentials(d, acct, state, only_if_fresher=True)
             if r["action"] != "skipped":
-                click.echo(f"  save-back {name}: {r['action']} → account-{r['account']}")
+                # Leased mounts save to their pooled family dir, not the
+                # account snapshot — say which, so the log doesn't read as a
+                # snapshot stomp (the pre-fix 2026-07-03 symptom line).
+                dest = (f"logins/{r['account']}/{r['family']}" if r.get("family")
+                        else f"account-{r['account']}")
+                click.echo(f"  save-back {name}: {r['action']} → {dest}")
 
     # Slot gc (risk #5 in the plan: dead mounts holding real credentials).
     # Only long-idle slots — a slot free for minutes is a REUSE candidate for
@@ -4791,7 +7800,7 @@ def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
             result = gc_slot(name, state)
             if result["action"] == "reaped":
                 sb = result["saveback"]
-                click.echo(f"  slot-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
+                click.echo(f"  lane-gc: reaped {name} (idle {idle_s/3600:.0f}h; save-back {sb['action']})")
 
 
 def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute: bool) -> None:
@@ -4816,10 +7825,10 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"]},
             ))
             continue
-        click.echo(f"  slot move: {label} ({move['gate']})")
+        click.echo(f"  lane move: {label} ({move['gate']})")
         click.echo(f"    reason: {move['reason']}")
         if no_execute:
-            click.echo("    (--no-execute) skipping slot move")
+            click.echo("    (--no-execute) skipping lane move")
             _log_decision(_build_decision_record(
                 state, config, action="would_swap", gate=move["gate"], reason=move["reason"],
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
@@ -4835,7 +7844,7 @@ def _execute_slot_moves(moves: list[dict], state: dict, config: dict, no_execute
                 target=move["to"], tier=move["tier"], where={"slot": move["slot"], "from": move["from"]},
             ))
         except (RuntimeError, FileNotFoundError, ValueError) as e:
-            click.echo(f"    slot move FAILED: {type(e).__name__}: {e}", err=True)
+            click.echo(f"    lane move FAILED: {type(e).__name__}: {e}", err=True)
             _log_decision(_build_decision_record(
                 state, config, action="error", gate=move["gate"],
                 reason=f"{move['reason']} — FAILED: {e}",
@@ -4854,12 +7863,32 @@ def _per_session_cycle(state: dict, config: dict, usage_by_account: dict, no_exe
     """
     _slot_saveback_and_gc(state, config, no_execute)
 
+    # Cross-mount exclusions (GH #104), fix 2026-07-05. In per_session mode every
+    # live slot holds its own account, and no lane may move onto an account ANOTHER
+    # live slot already holds — two mounts on one account rotate its single-use
+    # OAuth refresh token and log one out. Hybrid mode has always computed and
+    # passed this exclusion (see _hybrid_cycle's exclude_for_slots); per_session —
+    # the PRIMARY live mode — never did, so decide_slot_swaps and
+    # check_rate_limit_reactive_per_session ran with an EMPTY exclusion set. Their
+    # #104 clobber guards only fire for an account already in `taken`, so with an
+    # empty seed they never engaged for accounts held by OTHER live slots: the
+    # first lane to best-target a low-usage account already live elsewhere sailed
+    # straight past the HOLD/pool-rescue logic into a plain double-book. That let
+    # the reactive-429 and ladder paths pile several lanes onto one account past
+    # its login families — the 2026-07-05 rayi1 pile-up (6 lanes, 2 families →
+    # the shared refresh token diverged and clobbered the losers, GH #104). Seed
+    # the exclusion exactly as hybrid does so both paths' pool-rescue/HOLD logic
+    # engages. Unconditional (not gated on the pool feature), matching hybrid: with
+    # the pool off it simply excludes every already-live account (never double-book).
+    exclude_for_slots = _live_slot_accounts(state)
+
     # Urgent reactive-429 moves preempt ladder moves (same precedence as the
     # global cycle's step 0).
-    moves = check_rate_limit_reactive_per_session(state, config)
+    moves = check_rate_limit_reactive_per_session(state, config, exclude_accounts=exclude_for_slots)
     traces: dict = {}
     if not moves:
-        moves = decide_slot_swaps(state, config, usage_by_account, traces)
+        moves = decide_slot_swaps(state, config, usage_by_account, traces,
+                                  exclude_accounts=exclude_for_slots)
 
     # Persist usage + 429 watermark + gc'd slots BEFORE acting, so a crash
     # mid-move leaves valid state (same ordering as the global path).
@@ -4921,7 +7950,7 @@ def _execute_global_mount_swap(decision: "SwapDecision", state: dict, config: di
             execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
     else:
         execute_swap(decision.target, trigger=f"auto-tier{decision.tier}")
-        click.echo(f"    swapped shared mount (bare sessions follow; slots unaffected)")
+        click.echo(f"    swapped shared mount (bare sessions follow; lanes unaffected)")
     _log_decision(_build_decision_record(
         state, config, action="swap", gate=decision.gate,
         reason=decision.reason, target=decision.target, tier=decision.tier,
@@ -5075,6 +8104,14 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct.pop("rate_limited", None)
         acct.pop("token_stale", None)
         acct["token_expired"] = False
+        # A SUCCESSFUL poll of an INACTIVE account read its SNAPSHOT's access token
+        # (poll_account_usage → _read_access_token reads storage for inactive accts),
+        # so the snapshot authenticates and is NOT refresh-dead — clear a stale flag
+        # (e.g. after a relogin restored the snapshot). The ACTIVE account is polled
+        # from the LIVE creds, whose success says nothing about the snapshot (merkos:
+        # live family fine, snapshot dead), so we must NOT clear it for the active one.
+        if name != state.get("active"):
+            acct.pop("snapshot_refresh_dead", None)
         update_backoff(acct, success=True, config=config)
         # Estimator (C, 2026-06-23): measure per-window burn rate (%/min) from the
         # gap between the PRIOR poll and this one, before the old values are
@@ -5084,7 +8121,15 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         # the post-reset base. Stored on the account for estimate_window_pct().
         old_5h = acct.get("current_5h_pct")
         old_7d = acct.get("current_7d_pct")
-        old_poll_ts = acct.get("last_poll_ts")
+        # Anchor the burn-rate window at the PRIOR real OBSERVATION, not the
+        # prior poll ATTEMPT (2026-07-03 token-stale blindness incident, GH
+        # #130). old_5h/old_7d are the last OBSERVED percentages — they survive
+        # the error branches above (which `continue` without touching
+        # current_*_pct) but `last_poll_ts` gets restamped by those same error
+        # branches. Using last_poll_ts here would understate dt across a stale
+        # gap and overstate %/min. `last_observed_ts or last_poll_ts` falls
+        # back to today's behavior for legacy state that predates the field.
+        old_poll_ts = acct.get("last_observed_ts") or acct.get("last_poll_ts")
         old_5h_resets = acct.get("five_hour_resets_at")
         old_7d_resets = acct.get("seven_day_resets_at")
         new_5h_val = u.five_hour.utilization if u.five_hour else old_5h
@@ -5109,10 +8154,30 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct["current_5h_pct"] = u.five_hour.utilization if u.five_hour else acct.get("current_5h_pct", 0.0)
         acct["current_7d_pct"] = u.seven_day.utilization if u.seven_day else acct.get("current_7d_pct", 0.0)
         acct["last_poll_ts"] = u.polled_at
+        # last_observed_ts = "last time we actually OBSERVED real usage data",
+        # written ONLY on this success branch (2026-07-03 token-stale blindness
+        # incident, GH #130). Distinct from last_poll_ts = "last time we
+        # attempted/settled a poll", which the error branches above keep
+        # restamping without observing anything. `_five_hour_rolled_since_poll`
+        # and the burn-rate estimator read last_observed_ts so a token_stale
+        # account (Branch 0) can no longer masquerade as freshly-observed and
+        # defeat the GH #59 countdown reset inference.
+        acct["last_observed_ts"] = u.polled_at
         if u.five_hour and u.five_hour.resets_at:
             acct["five_hour_resets_at"] = u.five_hour.resets_at
         if u.seven_day and u.seven_day.resets_at:
             acct["seven_day_resets_at"] = u.seven_day.resets_at
+        # 72h seven_day reset detection (2026-07-05, gist: monperrus). The
+        # `seven_day` budget really refreshes every ~72h at a fixed UTC anchor,
+        # NOT every 7 days, and the API resets_at doesn't mark it. Infer the
+        # real reset from its observable signature — a sharp DROP in 7d
+        # utilization between two consecutive OBSERVATIONS — and stamp when it
+        # happened so projected_seven_day_reset() can project the next one 72h
+        # out. old_7d is the last observed % (captured above before overwrite);
+        # new_7d_val is this poll's %. Kept as a call to the pure helper so the
+        # detection logic stays unit-testable apart from the poll I/O.
+        if _is_seven_day_reset_drop(old_7d, new_7d_val, config):
+            acct["seven_day_last_reset_ts"] = u.polled_at
         # Per-model WEEKLY utilization (GH: fable/sonnet tracking). Persisted as
         # a flat {model: pct} dict so `cus status` and the weekly-cap gate can
         # read it from state.json without a live poll. Only written on a
@@ -5133,7 +8198,7 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
 @dataclass
 class SOSCondition:
     """One thing that needs human action. Severity drives statusline color."""
-    severity: str  # "urgent" (red) | "warning" (yellow)
+    severity: str  # "urgent" (red) | "warning" (yellow) | "info" (soft, sos-only)
     summary: str   # one-line headline
     action: str    # concrete next step
     affected: str  # account name or "daemon" or "system"
@@ -5253,6 +8318,1525 @@ def finish_active_relogin(account_name: str) -> None:
             write_json(CLAUDE_JSON, live_cj)
 
 
+def _diagnose_live_mount_creds(
+    creds: Any,
+    mode: str,
+    active_account: str | None,
+    live_identity: dict | None = None,
+    active_identity: dict | None = None,
+) -> SOSCondition | None:
+    """Pure predicate for the blanked/invalid live shared-mount check (2026-07-05).
+
+    In `global` and `hybrid` mode the live ~/.claude/.credentials.json is what
+    BARE sessions on the shared mount read. When it gets blanked (the observed
+    signature: `expiresAt: 0` + empty `accessToken`) those sessions show "not
+    logged in" while the active account's own snapshot stays healthy — so
+    nothing else in diagnose() notices and `cus sos` reported all-clear during
+    the incident (GH #141). In `per_session` mode the shared mount is
+    observe-only / authless by design (bare launches are observed, not swapped),
+    so a blank there is expected and MUST NOT fire.
+
+    Factored out of diagnose() as a pure function — takes an already-parsed
+    creds dict (None / non-dict = unreadable → invalid), the mode, the active
+    account name, and optionally the live-mount vs active-account identity dicts
+    — so it can be unit-tested without touching real files.
+
+    Primary signal: token blank/invalid (`_live_mount_creds_invalid`). Secondary
+    signal (only when both identity dicts are supplied): the live mount's
+    identity disagrees with the active account's expected identity — a live file
+    that is technically token-valid but belongs to the WRONG account, the
+    2026-07-01 duplicate-identity shape. Returns one SOSCondition or None.
+    """
+    # Only the shared-mount-serving modes care about the live file's validity.
+    if mode not in ("global", "hybrid"):
+        return None
+
+    # Name the concrete remedy account; fall back to a placeholder if state has
+    # no active account recorded (can't happen in a served mode in practice, but
+    # keeps the message well-formed rather than emitting "None").
+    account = active_account or "<active-account>"
+    remedy = (
+        f"      cus restore-creds {account} --live\n"
+        f"    (restores the newest good credential backup into the live file; the "
+        f"account must be active, which it is). If there is no usable backup, "
+        f"re-login instead:\n"
+        f"      cus relogin {account}   # then: cus poll")
+
+    if _live_mount_creds_invalid(creds):
+        return SOSCondition(
+            severity="urgent",
+            summary=("live shared mount ~/.claude/.credentials.json has no valid token — "
+                     "bare sessions on the shared mount will show 'not logged in'"),
+            action=(
+                "The live shared-mount credentials file has been blanked/invalidated "
+                "(empty accessToken or expiresAt <= 0), the 2026-07-05 signature (GH #141). "
+                f"Any BARE session on the shared mount is locked out even though '{account}'s "
+                "own snapshot may be healthy. Reinstall a good token into the live file:\n"
+                + remedy),
+            affected=active_account or "system",
+        )
+
+    # Secondary: token is present+valid but points at the wrong account. Only
+    # evaluated when both identities are known — _identities_match returns None
+    # on no shared evidence, and we treat only an explicit False as a mismatch.
+    if (live_identity and active_identity
+            and _identities_match(live_identity, active_identity) is False):
+        live_email = live_identity.get("emailAddress") or "?"
+        want_email = active_identity.get("emailAddress") or "?"
+        return SOSCondition(
+            severity="urgent",
+            summary=("live shared mount ~/.claude/.credentials.json belongs to the wrong "
+                     "account — bare sessions on the shared mount are on the wrong identity"),
+            action=(
+                f"The live mount identity ('{live_email}') disagrees with the active account "
+                f"'{account}' ('{want_email}') — the 2026-07-01 duplicate-identity shape. "
+                "Reinstall the active account's own credentials into the live file:\n"
+                + remedy),
+            affected=active_account or "system",
+        )
+    return None
+
+
+def _newest_usable_creds_source(account_name: str) -> Path | None:
+    """Newest credential FILE for `account_name` whose payload is a usable OAuth
+    token, or None if nothing usable exists (GH #141 auto-heal source picker).
+
+    Searches, newest-first: the account's live snapshot `.credentials.json`, then
+    its rotated `.credentials.json.bak.*` generations (which are, by construction,
+    always OLDER than the snapshot — a backup is the pre-overwrite copy). The
+    snapshot is therefore the freshest candidate and is tried first. "Usable" is
+    the negation of `_live_mount_creds_invalid` — the exact predicate the swap
+    guard and the SOS detector use — so a source this returns is safe to install
+    into the live mount without re-blanking it. Unreadable / unparseable files
+    are skipped, not fatal.
+
+    This is the backup-selection half of `cus restore-creds <account> --live`,
+    factored so the daemon can pick a heal source without shelling out. It also
+    considers the snapshot itself (which `restore-creds` does not) because in the
+    observed incident the snapshot stayed HEALTHY while only the live file was
+    blanked — copying the snapshot back is then the direct, freshest heal.
+    """
+    candidates: list[Path] = []
+    snap = account_creds_path(account_name)
+    if snap.exists():
+        candidates.append(snap)
+    # list_creds_backups returns newest-first already; snapshot stays ahead of
+    # every backup since backups predate it.
+    candidates.extend(list_creds_backups(account_name))
+    for path in candidates:
+        try:
+            creds = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue  # a corrupt candidate can't heal anything; try the next
+        if not _live_mount_creds_invalid(creds):
+            return path
+    return None
+
+
+def _auto_heal_live_mount(state: dict, config: dict, no_execute: bool = False) -> bool:
+    """Self-heal a blanked/invalid live shared mount in-daemon (GH #141).
+
+    In `global`/`hybrid` mode the live ~/.claude/.credentials.json is what BARE
+    sessions on the shared mount read. When it gets blanked (empty accessToken /
+    expiresAt<=0) every bare session locks out. Detection already exists
+    (`_diagnose_live_mount_creds`); this is the automatic REMEDY that used to
+    require a human running `cus restore-creds <active> --live` — the ask in
+    GH #141 ("make it never need a human").
+
+    Behavior — the in-daemon equivalent of `cus restore-creds <active> --live`:
+      * No-op unless the mount is actually blanked/invalid (idempotent; safe to
+        call every cycle — a healthy mount is never touched).
+      * Only runs in shared-mount-serving modes (global/hybrid). In per_session
+        the shared mount is observe-only/authless by design, so a blank there is
+        expected and must NOT be "healed" — matches `_diagnose_live_mount_creds`.
+      * Restores the ACTIVE account's newest USABLE credential source
+        (`_newest_usable_creds_source`: snapshot, else newest valid backup) into
+        the live file, with the SAME atomic-write + rotated-backup discipline as
+        `restore_creds_backup`'s --live install: back up the (blank) live file
+        first so the heal is itself reversible, then atomically copy.
+      * NEVER installs a blank (the source is validated by the picker) and never
+        clobbers a healthy mount (the invalid-check gates the whole thing).
+      * When NO usable source exists, does nothing and returns False, so the
+        URGENT re-login SOS in diagnose() still fires (genuine human needed).
+
+    Returns True iff it healed. `no_execute` makes it log the intended heal
+    without writing, for `cus daemon --once --no-execute` dry-runs.
+    """
+    if config.get("mode", "global") not in ("global", "hybrid"):
+        return False
+    active = state.get("active")
+    if not active:
+        return False  # no active account recorded → nothing authoritative to install
+    try:
+        live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+    except (json.JSONDecodeError, OSError):
+        live_creds = None  # unreadable == unusable, treat as blanked
+    if not _live_mount_creds_invalid(live_creds):
+        return False  # mount is healthy — no-op
+    source = _newest_usable_creds_source(active)
+    if source is None:
+        # No usable snapshot or backup anywhere: cannot self-heal without a
+        # browser re-login. Leave the blank in place so diagnose() surfaces the
+        # URGENT re-login SOS — the one case that still needs a human.
+        click.echo(f"  auto-heal: live shared mount is blanked but '{active}' has NO usable "
+                   f"credential backup — leaving it for the URGENT re-login SOS (GH #141)")
+        return False
+    if no_execute:
+        click.echo(f"  auto-heal (--no-execute): WOULD restore '{active}' creds from {source.name} "
+                   f"into the live shared mount (GH #141)")
+        return False
+    # Same discipline as restore_creds_backup(into_live=True): back up the live
+    # file (even blanked, it is one more recoverable generation) then atomic-copy
+    # the validated source over it. Only the live file is touched — the snapshot
+    # is a heal SOURCE here, never a write target, so a healthy snapshot is
+    # preserved untouched.
+    backup_credentials_file(CREDS_JSON)
+    atomic_copy(source, CREDS_JSON, mode=0o600)
+    msg = (f"live shared mount ~/.claude/.credentials.json was blanked/invalid (GH #141) — "
+           f"auto-restored '{active}' credentials from {source.name} into the live file; "
+           f"bare sessions on the shared mount are usable again without a human.")
+    click.echo(f"  AUTO-HEAL: {msg}")
+    try:
+        append_inbox("auto-heal", "blanked live shared mount self-healed (GH #141)", msg)
+    except OSError:
+        pass  # inbox is best-effort observability; never fail the heal over it
+    return True
+
+
+# ---------------------------------------------------------------------------
+# LANE-mount blank detection + auto-heal (2026-07-05, GH #141 follow-up).
+#
+# The GH #141 fix above heals only the SHARED mount (~/.claude/.credentials.json).
+# But a per-slot LANE has its OWN mount creds (slot-N/.credentials.json) — the
+# file the running Claude Code session on that lane actually reads — and it can be
+# blanked the exact same way by an EXTERNAL writer (Claude's own logout, a crash
+# mid-write). That is precisely what happened to slot-2 on 2026-07-05: its mount
+# creds went blank and had to be fixed by hand, because neither `cus sos` nor the
+# daemon's auto-heal looked at anything but the shared mount. These helpers are the
+# lane analogue of Condition 0 + `_auto_heal_live_mount`: same predicate
+# (`_live_mount_creds_invalid`), same atomic-write + rotated-backup + never-write-
+# a-blank discipline, but scoped to each LIVE lane's own mount.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Blank-mount PREEMPT + STUCK-SESSION + FORENSICS shared state (2026-07-07)
+# ---------------------------------------------------------------------------
+# In-process tracking for the three 2026-07-07 durable fixes. All three are
+# process-local (the daemon is a long-lived process) and intentionally NOT
+# persisted to disk:
+#   * A daemon restart clearing them is safe-by-design — the worst case is one
+#     extra proactive-refresh attempt (Fix 1) or a reset heal-count (Fix 2), both
+#     harmless; there is nothing durable to corrupt.
+#   * Keeping them off-disk avoids adding a new on-disk format (backward-compat).
+# Tests reset them explicitly (they persist for the module's lifetime).
+#
+# _PREEMPT_ATTEMPT_MS: (slot, account) -> monotonic-ish wall-clock seconds of the
+#   last proactive-refresh ATTEMPT, the poll-burnout backoff clock for Fix 1.
+# _LANE_HEAL_HISTORY: (slot, account) -> list of wall-clock heal timestamps, the
+#   heal→blank→heal detector for Fix 2 (pruned to the stuck window on read).
+_PREEMPT_ATTEMPT_MS: dict[tuple[str, str], float] = {}
+_LANE_HEAL_HISTORY: dict[tuple[str, str], list[float]] = {}
+# _UNSTALE_ATTEMPT_MS: account -> last un-stale refresh-grant attempt (Fix 4,
+#   2026-07-07), the poll-burnout backoff clock for the idle-account un-stale sweep.
+_UNSTALE_ATTEMPT_MS: dict[str, float] = {}
+# _SNAPSHOT_DEAD_PROBE: account -> (wall-clock seconds of the last probe, is-dead bool),
+#   the cooldown cache for `_account_snapshot_dead` (2026-07-07 merkos dead-snapshot
+#   incident). That probe is a network round-trip that ROTATES the snapshot's refresh
+#   token on success, so — like the un-stale sweep — it must run at most once per
+#   `unstale_cooldown_minutes` per account (poll-burnout backoff). Cleared below.
+_SNAPSHOT_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
+
+
+def _reset_blank_tracking() -> None:
+    """Clear all in-process blank-mount / un-stale tracking (test hook; also
+    usable to force a fresh preempt/un-stale attempt or heal-count after a config
+    change). Never needed in normal daemon operation — the dicts self-prune."""
+    _PREEMPT_ATTEMPT_MS.clear()
+    _LANE_HEAL_HISTORY.clear()
+    _UNSTALE_ATTEMPT_MS.clear()
+    _SNAPSHOT_DEAD_PROBE.clear()
+
+
+def _account_snapshot_dead(account: str, config: dict | None = None, *, force: bool = False) -> bool:
+    """True iff account-<X>'s CANONICAL snapshot (.credentials.json) cannot
+    currently authenticate — the "dead snapshot" the 2026-07-07 merkos incident
+    exposed.
+
+    THE INCIDENT: merkos's canonical snapshot held a DEAD refresh token (the
+    OAuth refresh grant returns invalid_grant — see the un-stale sweep's
+    `CRED-AUDIT op=unstale-refresh account=merkos decision=failed
+    reason="refresh grant dead"`), yet merkos was perfectly usable through a live
+    login FAMILY (lane tabby-2 ran on it fine). The danger is the SWAP install-
+    point: installing that dead snapshot into a NEW lane mount blanks the mount
+    ("not logged in") the moment Claude Code attempts its first token refresh —
+    exactly what blanked chats1a when it was swapped onto merkos.
+
+    WHY `_live_mount_creds_invalid` DOESN'T CATCH THIS: that predicate only flags
+    the blank-SHAPED signature (empty accessToken / expiresAt<=0). A dead snapshot
+    can be perfectly well-SHAPED — a real-looking-but-expired access token, a
+    positive-but-past expiresAt — and still be dead because its refresh branch was
+    rotated away elsewhere. Shape alone can't tell a dead branch from a live one;
+    only the refresh grant can (the same lesson as #127 / classify_live_creds_owner).
+
+    Verdict:
+      * access token currently VALID (non-blank, within expiry) → NOT dead: the
+        snapshot authenticates right now, so no (token-rotating) probe is needed.
+        This cheap path keeps the common healthy-account case network-free.
+      * no refresh token AND no valid access token → dead (nothing to mint from).
+      * else probe the refresh token via `_oauth_refresh_grant`:
+          - "alive"   → PERSIST the rotated tokens into the snapshot (the grant is
+                        single-use — #104 — so the fresh pair MUST land on disk or
+                        the family is lost) and return NOT dead. Mirrors the persist
+                        block in `_unstale_account_snapshot`.
+          - "dead"    → invalid_grant → return dead.
+          - "unknown" → network/endpoint drift → FAIL OPEN (return NOT dead): a
+                        transient must never turn a working account into a refused
+                        swap. The #141 blank-shape guards still backstop an actually
+                        blank install, so worst case is exactly today's behavior.
+
+    Cooldown-cached in `_SNAPSHOT_DEAD_PROBE` (poll-burnout backoff, bypassed by
+    `force`). Never raises into the caller."""
+    snap = account_creds_path(account)
+    if not snap.exists():
+        # Missing snapshot is owned by other guards (the `cus init` check in
+        # _execute_swap_locked; the #141 blank-shape guards). Not a dead-refresh case.
+        return False
+    try:
+        creds = read_json(snap)
+    except (json.JSONDecodeError, OSError):
+        # Unreadable snapshot: the #141 install-point guard already refuses it as
+        # blank. Not our (dead-refresh) call to make.
+        return False
+    # Cheap path: a currently-valid access token means the snapshot authenticates
+    # right now — definitively not dead, and no token-rotating probe needed. The 30s
+    # grace mirrors poll_account_usage so we don't probe a token about to expire.
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    access0 = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    exp = _creds_expires_at(creds)
+    now_ms = int(time.time() * 1000)
+    if isinstance(access0, str) and access0.strip() and exp is not None and int(exp) > now_ms - 30_000:
+        return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # No refresh token to mint from AND no valid access token above → unusable.
+        return True
+    cfg = config if config is not None else load_config()
+    cooldown_min = cfg.get("token_self_refresh", {}).get("unstale_cooldown_minutes", 10)
+    now = time.time()
+    if not force:
+        cached = _SNAPSHOT_DEAD_PROBE.get(account)
+        if cached is not None and (now - cached[0]) < cooldown_min * 60:
+            return cached[1]
+    verdict, tok = _oauth_refresh_grant(rt)
+    if verdict == "alive" and isinstance(tok, dict):
+        # Persist the rotation BEFORE returning (mirrors _unstale_account_snapshot):
+        # after a successful grant the snapshot's OLD refresh token is a dead branch
+        # (single-use rotation, #104), so the fresh pair must land on disk or we'd
+        # lose the family. Whole assembly is guarded so a malformed grant response
+        # can never crash a swap.
+        try:
+            access = tok.get("access_token")
+            if isinstance(access, str) and access:
+                new_oauth = dict(creds.get("claudeAiOauth") or {})
+                new_oauth["accessToken"] = access
+                new_oauth["refreshToken"] = tok.get("refresh_token") or rt
+                expires_in = tok.get("expires_in")
+                if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+                    new_oauth["expiresAt"] = int((time.time() + float(expires_in)) * 1000)
+                new_creds = dict(creds)
+                new_creds["claudeAiOauth"] = new_oauth
+                backup_credentials_file(snap)
+                write_json(snap, new_creds, mode=0o600)
+                _cred_audit("snapshot-dead-probe", "refreshed",
+                            "snapshot access token was expired but its refresh grant is ALIVE — "
+                            "minted+persisted fresh tokens; snapshot is usable",
+                            account=account, token_fp=_audit_token_fp(new_creds),
+                            extra=f"new_expiry={_expiry_repr(new_creds)}")
+        except (OSError, TypeError, ValueError):
+            pass  # persist failed; fall through — the grant WAS alive, so not dead
+        _SNAPSHOT_DEAD_PROBE[account] = (now, False)
+        return False
+    if verdict == "dead":
+        _SNAPSHOT_DEAD_PROBE[account] = (now, True)
+        _cred_audit("snapshot-dead-probe", "detected",
+                    "snapshot refresh grant returned invalid_grant — canonical creds are DEAD "
+                    "(installing them would blank the mount)",
+                    account=account, token_fp=_audit_token_fp(creds))
+        return True
+    # "unknown" → fail open. Cache the not-dead verdict for the cooldown so a flapping
+    # endpoint isn't hammered, but never let a transient refuse a swap.
+    _SNAPSHOT_DEAD_PROBE[account] = (now, False)
+    return False
+
+
+def _lane_lastvalid_path(mount_creds: Path) -> Path:
+    """Path of a lane mount's last-known-valid SHADOW copy (Fix 3, 2026-07-07).
+
+    A sibling of the mount's `.credentials.json` named `.credentials.json.lastvalid`.
+    We APPEND the suffix (not `with_suffix`, which would replace `.json`) so the
+    shadow sits next to the live file and is trivially greppable. Refreshed
+    whenever the mount is observed valid, it serves two ends: (a) an INSTANT,
+    same-family heal source (see `_lane_heal_source`), and (b) a stable baseline
+    to diff a freshly-blanked mount against for forensics (prior-valid token
+    fingerprint / expiry vs the now-blank state)."""
+    return Path(str(mount_creds) + ".lastvalid")
+
+
+def _update_lane_lastvalid(mount_creds: Path, creds: Any) -> None:
+    """Refresh a lane's last-known-valid shadow copy IFF the mount is valid
+    (Fix 3). Best-effort observability: never raises into the caller — a failed
+    shadow write must not disturb a poll/preempt/heal. No-op on a blank/invalid
+    mount (we never overwrite a good shadow with a bad snapshot — the whole point
+    is to retain the last GOOD generation to heal/diff against)."""
+    if _live_mount_creds_invalid(creds):
+        return
+    try:
+        atomic_copy(mount_creds, _lane_lastvalid_path(mount_creds), mode=0o600)
+    except OSError:
+        pass
+
+
+def _lastvalid_age_seconds(mount_creds: Path) -> float | None:
+    """Seconds since the lane's last-valid shadow was last refreshed (its mtime),
+    i.e. roughly how long since the mount was last seen healthy — the "how long
+    since it was last valid" forensic field. None when no shadow exists yet."""
+    shadow = _lane_lastvalid_path(mount_creds)
+    try:
+        return (time.time() - shadow.stat().st_mtime) if shadow.exists() else None
+    except OSError:
+        return None
+
+
+def _mtime_iso(path: Path) -> str:
+    """UTC ISO mtime of a file for a CRED-AUDIT line, or `none` if absent/unreadable."""
+    try:
+        if not path.exists():
+            return "none"
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        return "none"
+
+
+def _expiry_repr(creds: Any) -> str:
+    """Compact expiresAt for a CRED-AUDIT line: the raw epoch-ms plus its ISO
+    rendering, or `none`. For a blanked mount this is typically `0` — the epoch
+    signature — which is itself the evidence, so we log it verbatim."""
+    exp = _creds_expires_at(creds)
+    if exp is None:
+        return "none"
+    try:
+        iso = datetime.fromtimestamp(exp / 1000, timezone.utc).isoformat(timespec="minutes")
+    except (OverflowError, OSError, ValueError):
+        iso = "?"
+    return f"{int(exp)}({iso})"
+
+
+def _record_lane_heal(slot: str, account: str) -> None:
+    """Log one successful lane heal for the Fix 2 heal→blank→heal detector.
+    Appends now() to the lane's rolling history; `_diagnose_stuck_lanes` prunes
+    to the stuck window and escalates once the count crosses the threshold."""
+    _LANE_HEAL_HISTORY.setdefault((slot, account), []).append(time.time())
+
+
+def _blanked_live_lanes(state: dict, config: dict) -> list[tuple[str, str]]:
+    """(slot, account) for every LIVE lane whose OWN mount creds are blanked/invalid.
+
+    A "live lane" is a slot with a registered account (`state.slots[slot].account`)
+    AND a live session on its mount (`occupied_slot_accounts` → `mount_in_use` /proc
+    ground truth). The file a lane's session reads is the slot mount's own
+    `.credentials.json` (`mount_creds_path`) — NOT the leased pooled-family store,
+    which is only the swap SOURCE / save-back target. When THAT mount file is
+    blanked (empty accessToken / expiresAt<=0, the 2026-07-05 slot-2 signature) the
+    session shows "not logged in".
+
+    Deliberately excludes the cases the task calls out as NOT-a-fault:
+      * Only lane-serving modes (per_session/hybrid) have first-class lanes — the
+        complement of the shared-mount check, which is global/hybrid. In global the
+        daemon does not manage lanes, so it does not heal them here.
+      * IDLE / observe-only slots (no live session on the mount) are skipped:
+        occupied_slot_accounts only returns slots with a live PID, so a blank in an
+        idle slot — expected, it holds no session — never surfaces.
+      * Slots with no registered account are skipped (nothing authoritative to
+        reinstall; also covers a slot mid-swap that hasn't committed an account).
+    """
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    out: list[tuple[str, str]] = []
+    # account -> [live slot names]; already /proc-gated and account-gated.
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            cred = mount_creds_path(slot_path(slot))
+            try:
+                creds = read_json(cred) if cred.exists() else None
+            except (json.JSONDecodeError, OSError):
+                creds = None  # unreadable == unusable from the session's point of view
+            if _live_mount_creds_invalid(creds):
+                out.append((slot, account))
+    return out
+
+
+def _lane_heal_source(slot: str, account: str, state: dict, config: dict) -> Path | None:
+    """Newest USABLE creds file to reinstall into a blanked live lane mount, or
+    None when nothing usable exists (needs a real relogin → escalate to SOS).
+
+    Honors the GH #104/#109 login-family discipline, which is the ONE thing that
+    differs from the shared-mount heal's source pick:
+      * If the lane LEASES a pooled family (`state.slots[slot].login_family`, and
+        the independent-logins gate is on), the only safe source is THAT family's
+        own creds. Installing the account's shared snapshot instead would put a
+        DIFFERENT refresh-token family on the live lane and clobber every other
+        holder of that snapshot the next time either side refreshes (#104). So a
+        pooled lane whose family store is itself blanked/missing heals from
+        NOTHING here (returns None) rather than cross-contaminating — it escalates
+        to the relogin SOS, same as the shared-mount "no usable backup" case.
+      * A plain (non-pooled) lane is a shared-snapshot copy, so it heals from its
+        own last-valid SHADOW first (Fix 3, 2026-07-07 — the freshest, guaranteed
+        same-family copy of exactly what this mount last held) and then, failing
+        that, the account's newest usable snapshot/backup — the same
+        `_newest_usable_creds_source` the shared-mount heal uses.
+
+    "Usable" is `not _live_mount_creds_invalid(...)` throughout — the same bar the
+    swap install-point guard and the shared-mount heal apply — so whatever this
+    returns is safe to atomic-copy into the mount without re-blanking it.
+    """
+    lease = slot_leased_family(state, slot)
+    if lease is not None and lease[0] == account and independent_logins_enabled(config):
+        fam_path = login_family_creds_path(*lease)
+        if fam_path.exists():
+            try:
+                if not _live_mount_creds_invalid(read_json(fam_path)):
+                    return fam_path
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Leased family store blanked/missing → NO cross-family fallback (#104).
+        # The last-valid shadow is deliberately NOT consulted for a pooled lane:
+        # a stale shadow could predate a re-lease to a different family, and
+        # re-installing it would cross-contaminate; the family store is the only
+        # authoritative source for a pooled lane.
+        return None
+    # Plain lane. The last-valid shadow is a copy of THIS lane's own mount taken
+    # while it was valid — same slot, same refresh-token lineage by construction
+    # — so it is the freshest #104-safe heal source and cannot cross-contaminate.
+    # Prefer it; fall through to the snapshot/backup when there's no usable shadow
+    # (e.g. right after a daemon restart, before any valid scan has taken one).
+    shadow = _lane_lastvalid_path(mount_creds_path(slot_path(slot)))
+    if shadow.exists():
+        try:
+            if not _live_mount_creds_invalid(read_json(shadow)):
+                return shadow
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Fall through to the account's newest usable snapshot/backup — UNLESS the
+    # snapshot is DEAD (its refresh grant returns invalid_grant). 2026-07-07 merkos
+    # incident: `_newest_usable_creds_source` only rejects blank-SHAPED creds
+    # (`_live_mount_creds_invalid`), so a well-shaped-but-dead snapshot would be
+    # returned here and re-blank the mount on Claude Code's first refresh — a
+    # heal→blank→heal loop (which the Fix 2 stuck-session detector would then flag).
+    # Dropping the dead snapshot from the plain-lane heal chain means such a lane
+    # escalates straight to the URGENT relogin SOS (a human is genuinely needed)
+    # instead of looping. The pooled-lane branch above already never touches the
+    # snapshot (#176), so this closes the one remaining dead-snapshot heal path.
+    source = _newest_usable_creds_source(account)
+    if source is not None and source == account_creds_path(account) and _account_snapshot_dead(account, config):
+        return None
+    return source
+
+
+def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
+    """SOS for a blanked LIVE lane mount (GH #141 follow-up, 2026-07-05 slot-2).
+
+    Only reached when the daemon's in-cycle heal (`_auto_heal_live_lanes`) could
+    NOT fix the lane — i.e. no usable credential source exists for `account`
+    (snapshot + backups, and any leased login family, are all blanked), which is
+    the one case that genuinely needs a human `cus relogin`.
+    """
+    return SOSCondition(
+        severity="urgent",
+        summary=(f"lane {slot} ({account}) mount creds are blanked — "
+                 f"session will show 'not logged in'"),
+        action=(
+            f"The live lane mount {slot}/.credentials.json has been blanked/invalidated "
+            f"(empty accessToken or expiresAt <= 0), the 2026-07-05 slot-2 signature "
+            f"(GH #141 lane follow-up). The Claude Code session running on lane {slot} is "
+            f"locked out even though other accounts may be fine, and the daemon could NOT "
+            f"self-heal it — '{account}' has no usable credential source (its snapshot and "
+            f"backups, and any leased login family, are all blanked). Re-login the account:\n"
+            f"      cus relogin {account}   # then: cus poll\n"
+            f"    or restore a good backup if one exists:\n"
+            f"      cus restore-creds {account} --list"),
+        affected=account,
+    )
+
+
+def _divergence_risk_lanes(state: dict, config: dict) -> list[tuple[str, str, bool]]:
+    """(slot, account, mount_token_expired) for every LIVE lane whose OWN mount
+    runs the SAME OAuth refresh-token family as another live mount of its account
+    — the shared ~/.claude mount or another live lane. This is the GH #104
+    divergence-logout SETUP (2026-07-07 chats1a): two live mounts on one family,
+    logged out on the next rotation with `401 Invalid authentication credentials`.
+
+    This is the DETECTOR twin of the swap-time `_live_family_would_collide` guard:
+    the guard stops a NEW swap from creating the setup; this surfaces a setup that
+    already exists (a lane provisioned before the guard shipped, a manual mount
+    edit, a state where login_family was never recorded) so an operator sees it
+    BEFORE the rotation bites.
+
+    Why it reads token BYTES rather than keying on login_family being None:
+      * It must CATCH the incident — whose lane had a legacy store that PASSED
+        `has_independent_login` but carried a stale COPY of the shared family. A
+        state-only check that trusted has_independent_login (like
+        `double_booked_live_accounts._covered`) would have judged it safe and
+        stayed silent — exactly why `cus sos` reported all-clear during the
+        incident.
+      * It must NOT false-positive on a GENUINELY independent legacy login
+        (distinct token, login_family unset but clobber-safe — the supported
+        Track-B case with its own passing tests). Comparing actual families keeps
+        that lane quiet (its family matches no other mount).
+    So the discriminator is the true invariant — a shared LIVE family — not a
+    proxy for it. A lane holding a distinct pooled lease installs a distinct
+    family, so it never matches and is never flagged.
+
+    Closes the bare-session blind spot the existing live-mount detectors have:
+    `duplicate_live_mount_families` / `double_booked_live_accounts` gate the
+    shared mount on `mount_in_use(CLAUDE_DIR)` (False for bare sessions — #141),
+    so a lane sharing the shared-mount account was invisible to them.
+    `_live_family_would_collide` counts the shared mount unconditionally in
+    global/hybrid.
+
+    Scoping (mirrors `_blanked_live_lanes`, deliberately quiet elsewhere): only
+    when the independent-logins gate is ON, only lane-serving modes
+    (per_session/hybrid), and only LIVE lanes (`occupied_slot_accounts` is
+    /proc-gated, so idle/observe-only slots — which hold no session to refresh a
+    token — are excluded).
+
+    The bool is whether the lane's OWN mount is already blank/expired
+    (`_live_mount_creds_invalid`) — the caller tiers severity on it (already
+    clobbered ⇒ urgent, still valid ⇒ warning early nudge).
+    """
+    if not independent_logins_enabled(config):
+        return []
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    out: list[tuple[str, str, bool]] = []
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            mount_path = mount_creds_path(slot_path(slot))
+            # Does THIS lane's live family already run on another mount of `account`?
+            if not _live_family_would_collide(account, mount_path, slot, state, config):
+                continue
+            try:
+                mount_creds = read_json(mount_path)
+            except (json.JSONDecodeError, OSError):
+                mount_creds = None
+            out.append((slot, account, _live_mount_creds_invalid(mount_creds)))
+    return out
+
+
+def _lane_divergence_sos(slot: str, account: str, mount_expired: bool) -> SOSCondition:
+    """SOS for a lane whose live mount shares one OAuth token family with the
+    shared-mount account (or another lane's account) — the GH #104
+    divergence-logout setup (2026-07-07 chats1a). See `_divergence_risk_lanes`.
+
+    Severity: urgent if the lane's mount token is ALREADY blank/expired (the
+    clobber has likely already fired and the session is/soon logged out);
+    warning otherwise (the setup exists but the rotation hasn't bitten yet — an
+    early nudge to re-provision before it does).
+    """
+    return SOSCondition(
+        severity="urgent" if mount_expired else "warning",
+        summary=(f"lane {slot} shares one OAuth token family for account '{account}' with another "
+                 f"live mount and has NO distinct login family — divergence/logout risk (GH #104)"
+                 + ("; its mount token is already blank/expired" if mount_expired else "")),
+        action=(
+            f"Lane {slot} is live on '{account}' and its mount runs the SAME refresh-token family "
+            f"as the shared ~/.claude mount or another live lane of '{account}' (its "
+            f"state.slots.{slot}.login_family is unset / it never claimed a distinct family). Two "
+            f"live mounts on one token family is the #104 clobber: the next refresh on either "
+            f"side rotates the shared refresh token and logs the other out with "
+            f"'401 Invalid authentication credentials' (the 2026-07-07 chats1a logout, which "
+            f"cost a live session an hour). Fix it by re-running the move so it CLAIMS a distinct "
+            f"pooled family:\n"
+            f"      cus login-mount {account}     # add a pooled family if none is free\n"
+            f"      cus slot move {slot} {account}   # re-claims a distinct family lease\n"
+            f"    or move the lane to a different account:\n"
+            f"      cus slot move {slot} <other-account>"),
+        affected=account,
+    )
+
+
+def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Self-heal blanked live LANE mounts in-daemon (GH #141 follow-up, 2026-07-05).
+
+    The lane analogue of `_auto_heal_live_mount`: for every LIVE lane whose own
+    mount creds are blanked (`_blanked_live_lanes`), reinstall its owning account's
+    newest USABLE credential source (`_lane_heal_source` — the leased family store
+    if pooled, else the account snapshot/backup) into the lane mount, with the SAME
+    atomic-write + rotated-backup + never-write-a-blank discipline the shared-mount
+    heal uses. Runs in `_emit_sos_after` BEFORE `diagnose()`, so a healable blank
+    never reaches the operator as an SOS — the heal fixes the mount and diagnose
+    then sees it valid. Only a lane with NO usable source falls through to the
+    URGENT relogin SOS (`_lane_mount_sos`).
+
+    Idempotent (a healthy lane is byte-for-byte untouched — the invalid-check gates
+    the whole thing), never clobbers a healthy lane, and honors login-family
+    discipline (a pooled lane heals only from its own family — see
+    `_lane_heal_source`). Returns the list of healed slot names. `no_execute` logs
+    the intended heal without writing, for `cus daemon --once --no-execute`.
+
+    Forensics (Fix 3, 2026-07-07): every blank detection emits a `op=blank-detected`
+    CRED-AUDIT line and every successful restore a `op=blank-heal` line, capturing
+    the mount mtime, how long since the mount was last valid (shadow age), the
+    prior-valid token fingerprint (from the last-valid shadow) vs the now-blank
+    state, and the expiry that triggered — so the NEXT recurrence can be
+    characterized (which family, how stale, was Claude Code's refresh the writer).
+    No raw tokens ever (fingerprint only). Each heal is also recorded for the Fix 2
+    heal→blank→heal stuck-session detector (`_diagnose_stuck_lanes`)."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    healed: list[str] = []
+    for slot, account in _blanked_live_lanes(state, config):
+        source = _lane_heal_source(slot, account, state, config)
+        dest = mount_creds_path(slot_path(slot))
+        # ── Forensics: characterize the blank BEFORE we heal it (Fix 3). ──────
+        # Read the now-blank mount + the last-valid shadow so we can log what the
+        # mount held when it was healthy vs the blank it is now — the evidence
+        # that pins the cause (family, staleness, epoch signature) next time.
+        try:
+            _blank_creds = read_json(dest) if dest.exists() else None
+        except (json.JSONDecodeError, OSError):
+            _blank_creds = None
+        try:
+            _shadow_p = _lane_lastvalid_path(dest)
+            _shadow_creds = read_json(_shadow_p) if _shadow_p.exists() else None
+        except (json.JSONDecodeError, OSError):
+            _shadow_creds = None
+        _lv_age = _lastvalid_age_seconds(dest)
+        _cred_audit(
+            "blank-detected", "detected",
+            "live lane mount creds blanked/invalid (2026-07-07 blank-mount signature)",
+            slot=slot, account=account, token_fp=_audit_token_fp(_blank_creds),
+            extra=(f"mount_mtime={_mtime_iso(dest)} "
+                   f"last_valid_age={'unknown' if _lv_age is None else f'{_lv_age:.0f}s'} "
+                   f"blank_expiry={_expiry_repr(_blank_creds)} "
+                   f"prev_valid_fp={_audit_token_fp(_shadow_creds)} "
+                   f"prev_valid_expiry={_expiry_repr(_shadow_creds)}"))
+        if source is None:
+            # No usable snapshot/backup/family: cannot self-heal without a browser
+            # relogin. Leave the blank so diagnose() surfaces the URGENT SOS.
+            click.echo(f"  auto-heal: live lane {slot} ({account}) mount is blanked but there is NO "
+                       f"usable credential source — leaving it for the URGENT relogin SOS "
+                       f"(GH #141 lane follow-up)")
+            continue
+        if no_execute:
+            click.echo(f"  auto-heal (--no-execute): WOULD restore '{account}' creds from {source} "
+                       f"into live lane {slot} (GH #141 lane follow-up)")
+            continue
+        # Install-point guard mirror (#141): never write a blank. The source was
+        # already validated by _lane_heal_source, but re-check at the install point
+        # so a source that went bad between pick and copy can't re-blank the mount.
+        try:
+            if _live_mount_creds_invalid(read_json(source)):
+                continue
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Same discipline as _auto_heal_live_mount / restore_creds_backup: back up
+        # the (blank) lane mount first so the heal is itself reversible, then
+        # atomic-copy the validated source over it. Only the lane mount is touched
+        # — the family store / snapshot is a heal SOURCE here, never a write target.
+        backup_credentials_file(dest)
+        atomic_copy(source, dest, mode=0o600)
+        # Forensics: record the heal, its source, and the restored token's fp so a
+        # heal→blank→heal cycle is visible in the audit stream (Fix 3).
+        try:
+            _healed_creds = read_json(dest)
+        except (json.JSONDecodeError, OSError):
+            _healed_creds = None
+        _cred_audit(
+            "blank-heal", "wrote",
+            f"auto-restored blanked live lane mount from {source.name}",
+            slot=slot, account=account, token_fp=_audit_token_fp(_healed_creds),
+            extra=f"source={source} restored_expiry={_expiry_repr(_healed_creds)}")
+        # Record the heal for the Fix 2 stuck-session (heal→blank→heal) detector.
+        _record_lane_heal(slot, account)
+        # The restored mount is a fresh last-known-good — refresh the shadow so a
+        # subsequent blank diffs against THIS generation, and heal has it instantly.
+        _update_lane_lastvalid(dest, _healed_creds)
+        msg = (f"live lane {slot} ({account}) mount creds were blanked/invalid (GH #141 lane "
+               f"follow-up) — auto-restored '{account}' credentials from {source} into {dest}; "
+               f"the lane's session is usable again without a human (2026-07-05 slot-2 incident).")
+        click.echo(f"  AUTO-HEAL: {msg}")
+        try:
+            append_inbox("auto-heal", f"blanked live lane {slot} self-healed (GH #141 follow-up)", msg)
+        except OSError:
+            pass  # inbox is best-effort observability; never fail the heal over it
+        healed.append(slot)
+    return healed
+
+
+# ---------------------------------------------------------------------------
+# PRE-EMPTIVE creds-health early-warning (2026-07-06)
+# ---------------------------------------------------------------------------
+# The blank-mount detection + auto-heal above (GH #141 + lane follow-up) is the
+# REACTIVE backstop: it only notices AFTER a live mount's creds have already
+# blanked/logged out, and fires an URGENT SOS (or silently heals). Incident
+# 2026-07-05: a live LOCKED lane's mount creds blanked and the operator only
+# learned via an after-the-fact SOS. This layer adds a PROACTIVE scan each cycle
+# over every LIVE mount (lanes + shared mount) that emits a soft WARNING BEFORE
+# a mount fails — while its OAuth access token is merely near-expiry-and-idle, or
+# its refresh token is nearing its assumed TTL and will soon need a browser
+# re-login. It NEVER makes a network grant to probe liveness (OAuth refresh
+# tokens are single-use — a probe grant would rotate the stored token and clobber
+# the live family, GH #104); it judges purely from the STORED expiresAt / token
+# presence / provenance age. The reactive path is untouched — this only ADDS an
+# earlier, softer signal. Gated by config `creds_warn.enabled` (default True).
+
+
+def _account_snapshot_age_days(account: str) -> float | None:
+    """Best-available age (days) of an account's base SNAPSHOT refresh token, or
+    None if there's nothing to judge by.
+
+    Login FAMILIES carry a `minted_ts` provenance record (see login_age_days), but
+    a base account snapshot / the shared mount has no such record — so we fall back
+    to the account's meta.yaml timestamps as a mint proxy: `refreshed_ts` (written
+    on the last `cus init --force` snapshot refresh) preferred, else `imported_ts`
+    (first import). This is an imperfect proxy — a refresh token can rotate on the
+    live mount without a snapshot refresh — but it only feeds the SOFT refresh-TTL
+    WARNING, never a hard action, and degrades to "unknown" (no warning) when the
+    timestamp is missing, so an over/under-estimate is harmless. NEVER a network
+    probe — refresh tokens are single-use (GH #104)."""
+    meta = account_meta(account)
+    stamp = meta.get("refreshed_ts") or meta.get("imported_ts")
+    if not stamp or not isinstance(stamp, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+
+def _mount_refresh_age_days(account: str, slot: str | None, state: dict, config: dict) -> float | None:
+    """Age (days) of the refresh token a given LIVE mount actually reads, or None
+    when no age source exists (→ the refresh-TTL warning is skipped for it).
+
+    Resolves the right provenance the same way `_lane_heal_source` resolves the
+    right heal source, so the age we age-out on matches the token in play:
+      * a lane LEASING a pooled family → that family's `minted_ts` provenance;
+      * a lane with a legacy per-(slot,account) independent login → its provenance;
+      * everything else (a plain shared-snapshot-copy lane, or the shared mount,
+        slot=None) → the account snapshot mint proxy (`_account_snapshot_age_days`).
+    """
+    if slot is not None:
+        lease = slot_leased_family(state, slot)
+        if lease is not None and lease[0] == account and independent_logins_enabled(config):
+            return login_age_days(*lease)  # login_age_days keys on (account, family_id)
+        if has_independent_login(account, slot):
+            return login_age_days(account, slot)
+    return _account_snapshot_age_days(account)
+
+
+def _diagnose_mount_creds_health(
+    mount_label: str,
+    account: str,
+    creds: Any,
+    now_ms: int,
+    config: dict,
+    *,
+    refresh_age_days: float | None = None,
+    recently_refreshed: bool = False,
+) -> SOSCondition | None:
+    """PURE predicate for the pre-emptive creds-health scan: given ONE live mount's
+    already-parsed creds dict + the current time + config (+ its resolved refresh-
+    token age and whether it was recently rewritten), return a soft WARNING
+    SOSCondition or None. No file / process / network I/O — the impure inputs
+    (creds dict, age, recently_refreshed flag) are resolved by the caller
+    (`_diagnose_live_mounts_creds_health`), mirroring `_diagnose_premium_headroom`,
+    so this is unit-testable with plain values.
+
+    Deliberately returns None (no WARNING) for an ALREADY-BLANK/invalid mount: that
+    is the REACTIVE layer's job (`_diagnose_live_mount_creds` / the lane heal fire
+    an URGENT for it). The two layers must not collide — a blanked mount is one
+    URGENT, not also a WARNING. This layer only speaks to mounts that are still
+    valid but AGING toward failure.
+
+    Precedence (one WARNING per mount, so SOS.md stays readable and de-dups
+    cleanly): the refresh-token-TTL warning wins over the access-token warnings —
+    it is the only one that needs a human action (a browser `cus relogin` with a
+    deadline), and it subsumes the access-token heads-up. Among the access-token
+    signals, an ALREADY-stale access token (condition 3) outranks a merely
+    near-expiry one (condition 1).
+
+    Summaries are kept STABLE across cycles (no live-decrementing minutes/days in
+    the summary — those go in the action) so the existing SOS notify de-dup
+    (`maybe_write_sos` hashes severity:summary) fires the desktop notification once
+    per condition, not every poll."""
+    if not config.get("creds_warn", {}).get("enabled", True):
+        return None
+    # A blank/invalid mount belongs to the reactive URGENT path — never double it
+    # up as a WARNING here (keeps the two layers from colliding; test (d)).
+    if _live_mount_creds_invalid(creds):
+        return None
+
+    il = config.get("independent_logins", {}) if isinstance(config, dict) else {}
+    ttl = il.get("refresh_token_ttl_days", 30)
+    warn_within = il.get("warn_expiry_within_days", 5)
+
+    # (2) Refresh token approaching its assumed TTL → a browser re-login will soon
+    # be required. Highest human-action value, so it wins.
+    state, days_left = _expiry_state_from_age(refresh_age_days, config)
+    if state in ("near", "expired"):
+        # Relogin-by date, derived from now_ms so tests are deterministic.
+        by_dt = datetime.fromtimestamp(now_ms / 1000, timezone.utc) + timedelta(days=max(0.0, days_left or 0.0))
+        by_date = by_dt.date().isoformat()
+        age_txt = f"~{refresh_age_days:.0f} days old" if refresh_age_days is not None else "of unknown age"
+        if state == "near":
+            return SOSCondition(
+                severity="warning",
+                summary=(f"refresh token on {mount_label} ({account}) nears its assumed "
+                         f"{ttl}-day expiry — plan a browser re-login soon"),
+                action=(
+                    f"The {mount_label} mount's login for '{account}' is {age_txt}; its OAuth "
+                    f"refresh token is assumed to expire around {by_date} (within "
+                    f"{warn_within}d — config independent_logins.warn_expiry_within_days). Once it "
+                    f"expires a live session can no longer self-refresh and the mount blanks / logs "
+                    f"out (the 2026-07-05 failure mode). No action needed yet — it keeps refreshing "
+                    f"until then — but plan a browser re-login before {by_date}:\n"
+                    f"      cus relogin {account}"),
+                affected=account,
+            )
+        return SOSCondition(
+            severity="warning",
+            summary=(f"refresh token on {mount_label} ({account}) is past its assumed "
+                     f"{ttl}-day TTL — re-login before it blanks"),
+            action=(
+                f"The {mount_label} mount's login for '{account}' is {age_txt}, past the assumed "
+                f"{ttl}-day refresh-token TTL. It MAY still work (the TTL is an assumption, not a "
+                f"measured fact — #109 Phase 0), but it is the most likely mount to blank/log out "
+                f"next. Re-login it soon to be safe:\n"
+                f"      cus relogin {account}"),
+            affected=account,
+        )
+
+    # Access-token signals need a numeric expiresAt to judge; without one we can't
+    # say anything (a valid-but-timestamp-less token isn't provably at risk).
+    exp = _creds_expires_at(creds)
+    if exp is None:
+        return None
+    minutes_left = (exp - now_ms) / 60_000.0
+    exp_iso = datetime.fromtimestamp(exp / 1000, timezone.utc).isoformat(timespec="minutes")
+
+    # (3) Degrading-but-not-blank: access token already past expiresAt (token_stale)
+    # while the login is still present. This is the state that PRECEDES a blank if
+    # the self-refresh later fails.
+    if minutes_left <= 0:
+        return SOSCondition(
+            severity="warning",
+            summary=(f"access token on {mount_label} ({account}) is already stale — "
+                     f"mount will try to self-refresh; at risk if the refresh token is old"),
+            action=(
+                f"The live {mount_label} mount for '{account}' still has a login, but its OAuth "
+                f"access token expired at {exp_iso} (already past). A running session normally "
+                f"self-refreshes it on next use — heads-up only. But if that refresh ALSO fails the "
+                f"mount blanks (the 2026-07-05 signature). If it stays stale across cycles, plan a "
+                f"re-login:\n"
+                f"      cus relogin {account}"),
+            affected=account,
+        )
+
+    # (1) Access token near expiry AND the mount isn't observed refreshing. A
+    # healthy session refreshes well ahead of expiry (fresh tokens sit hours out),
+    # so a token this close to expiry whose creds file hasn't been rewritten
+    # recently is one that isn't self-maintaining.
+    window = config.get("creds_warn", {}).get("access_expiry_minutes", 45)
+    if minutes_left <= window and not recently_refreshed:
+        return SOSCondition(
+            severity="warning",
+            summary=(f"access token on {mount_label} ({account}) expires soon and the "
+                     f"mount isn't refreshing — may age into a stale/blank state"),
+            action=(
+                f"The live {mount_label} mount for '{account}' has an OAuth access token expiring in "
+                f"~{minutes_left:.0f} min ({exp_iso}) and its creds file hasn't been rewritten "
+                f"recently, so it isn't self-refreshing right now. A healthy session refreshes well "
+                f"ahead of expiry; near-expiry AND idle is the state that ages into a stale/blank "
+                f"mount if a later refresh can't reach Anthropic. Heads-up only — it should self-heal "
+                f"on next use; watch for a blank-mount SOS on {mount_label}."),
+            affected=account,
+        )
+    return None
+
+
+def _diagnose_live_mounts_creds_health(state: dict, config: dict) -> list[SOSCondition]:
+    """Impure driver for the pre-emptive creds-health scan: enumerate every LIVE
+    mount, read its creds + resolve its refresh-token age + whether it was recently
+    rewritten, and collect the WARNINGs `_diagnose_mount_creds_health` returns.
+
+    Live mounts, by mode (mirrors the reactive layer's scoping):
+      * LANES — per_session/hybrid: every slot with a live session on its own mount
+        (`occupied_slot_accounts`, /proc ground truth). The file that lane's session
+        reads is `mount_creds_path(slot_path(slot))`.
+      * SHARED mount — global/hybrid: `~/.claude/.credentials.json`, read by bare
+        sessions; its account is the active one.
+
+    Read-only: reads creds files and stats their mtime; never writes, refreshes, or
+    makes a network call. Returns a (possibly empty) list of WARNING SOSConditions;
+    the caller merges them into `diagnose()`'s output so they ride the existing
+    SOS.md write + notify de-dup. Off entirely when `creds_warn.enabled` is False."""
+    if not config.get("creds_warn", {}).get("enabled", True):
+        return []
+    mode = config.get("mode", "global")
+    now_ms = int(time.time() * 1000)
+    recent_min = config.get("creds_warn", {}).get("recent_refresh_minutes", 10)
+    out: list[SOSCondition] = []
+    seen: set[tuple[str, str]] = set()  # (mount_label, account) — one warning per mount/cycle
+
+    def _recently_written(path: Path) -> bool:
+        """True iff the creds file was (re)written within recent_refresh_minutes —
+        the read-only 'is this mount actively maintaining its token' signal (no
+        network probe). A just-rotated mount is not at risk even if momentarily
+        caught near a stale expiresAt."""
+        try:
+            return path.exists() and (time.time() - path.stat().st_mtime) < recent_min * 60
+        except OSError:
+            return False
+
+    def _scan(mount_label: str, account: str, cred_path: Path, slot: str | None) -> None:
+        if (mount_label, account) in seen:
+            return
+        seen.add((mount_label, account))
+        try:
+            creds = read_json(cred_path) if cred_path.exists() else None
+        except (json.JSONDecodeError, OSError):
+            creds = None  # unreadable → reactive layer owns it; predicate returns None
+        cond = _diagnose_mount_creds_health(
+            mount_label, account, creds, now_ms, config,
+            refresh_age_days=_mount_refresh_age_days(account, slot, state, config),
+            recently_refreshed=_recently_written(cred_path),
+        )
+        if cond is not None:
+            out.append(cond)
+
+    if mode in ("per_session", "hybrid"):
+        for account, slots in occupied_slot_accounts(state).items():
+            for slot in slots:
+                _scan(slot, account, mount_creds_path(slot_path(slot)), slot)
+    if mode in ("global", "hybrid"):
+        active = state.get("active")
+        if active:
+            _scan("shared", active, CREDS_JSON, None)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — PREEMPT the blank (proactive mount-token refresh, 2026-07-07)
+# ---------------------------------------------------------------------------
+# The single highest-value fix for the recurring blank-mount failure. The warn
+# scan above emits a heads-up when a live lane's OAuth access token is near
+# expiry AND its mount isn't observed refreshing — the EXACT condition that
+# precedes the classic blank: Claude Code, seeing its token near expiry, attempts
+# its OWN in-place refresh of the mount's .credentials.json, and a mid-write
+# failure leaves the file blank (accessToken:"" / expiresAt:0) → "Not logged in".
+# Rather than only WARN, this PROACTIVELY performs the refresh cus-side (a pure
+# token-mint grant via `_refresh_account_token`, no quota, no session) and writes
+# the fresh, valid token straight into the mount — so the mount stays ahead of
+# expiry and Claude Code never needs its fragile in-place refresh. This breaks
+# the heal→blank→heal cycle at its SOURCE. Incident it targets: 2026-07-07
+# tabby-5/slot-7 (rayi6) sat "not logged in" until a human noticed.
+
+
+def _preempt_live_lane_blanks(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Proactively refresh live lane mounts that are near-expiry-AND-idle, BEFORE
+    Claude Code's failure-prone in-place refresh can blank them (Fix 1).
+
+    For every LIVE lane (per_session/hybrid; /proc-gated via `occupied_slot_accounts`)
+    whose mount is still VALID but whose access token is within
+    `creds_warn.access_expiry_minutes` of expiry and hasn't been rewritten within
+    `creds_warn.recent_refresh_minutes` (i.e. it isn't self-maintaining — the exact
+    predicate condition 1 of `_diagnose_mount_creds_health` warns on), mint a fresh
+    token via `_refresh_account_token(account, creds_path=<mount>)` and let it
+    rewrite the mount in place. Because a successful refresh bumps the mount mtime,
+    the subsequent warn scan sees it "recently refreshed" and stays silent — a
+    preempted lane neither warns nor blanks.
+
+    Safety / degrade-to-safe posture (never crashes a poll, backward-compatible):
+      * Gated by `creds_warn.enabled` AND `creds_warn.preempt.enabled` (default on);
+        both off ⇒ the pre-2026-07-07 warn+heal-only behavior, bit-for-bit.
+      * Only touches a lane whose mount is VALID and carries a usable refresh token
+        (an ALREADY-blank mount belongs to the reactive heal, not the preempt).
+      * Poll-burnout backoff: at most one ATTEMPT per lane per
+        `preempt.cooldown_minutes`, success or fail, so a persistently-failing
+        grant can't re-fire every poll (the 2026-06-19 burnout shape).
+      * Family-safe (#104): refreshes using the mount's OWN refresh token and
+        writes back ONLY to that mount — no other mount/store is touched; the
+        existing save-back propagates the fresh token to the canonical store.
+      * On ANY failure (refresh disabled, grant error, non-200) it does NOTHING to
+        the mount and leaves the lane for the existing warn+heal path — degrade,
+        never worsen.
+
+    Returns the list of preempted slot names. `no_execute` logs intent only."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    cw = config.get("creds_warn", {}) if isinstance(config, dict) else {}
+    if not cw.get("enabled", True):
+        return []
+    pcfg = cw.get("preempt", {}) if isinstance(cw, dict) else {}
+    if not pcfg.get("enabled", True):
+        return []
+    window = cw.get("access_expiry_minutes", 45)
+    recent_min = cw.get("recent_refresh_minutes", 10)
+    cooldown_min = pcfg.get("cooldown_minutes", 15)
+    now = time.time()
+    now_ms = int(now * 1000)
+    preempted: list[str] = []
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            mount = mount_creds_path(slot_path(slot))
+            try:
+                creds = read_json(mount) if mount.exists() else None
+            except (json.JSONDecodeError, OSError):
+                creds = None
+            # An already-blank mount is the REACTIVE heal's job, not the preempt's
+            # — the whole point of preempt is to act while the mount is still valid.
+            if _live_mount_creds_invalid(creds):
+                continue
+            # Fix 3: the mount is valid → refresh its last-known-good shadow. Doing
+            # it here (every cycle, on every live valid lane) keeps the shadow
+            # current for instant heal + blank-vs-lastvalid forensic diffing.
+            _update_lane_lastvalid(mount, creds)
+            # Near-expiry gate. Skip the healthy (plenty of runway) and the already
+            # -stale (minutes_left<=0 — that's the warn/heal path, not a token we
+            # can safely pre-refresh: a stale mount may already be mid-fail).
+            exp = _creds_expires_at(creds)
+            if exp is None:
+                continue
+            minutes_left = (exp - now_ms) / 60_000.0
+            if minutes_left <= 0 or minutes_left > window:
+                continue
+            # Self-maintaining? A mount rewritten within recent_min is actively
+            # rotating its own token — leave it alone (matches the warn scan's
+            # `recently_refreshed` suppression).
+            try:
+                if mount.exists() and (now - mount.stat().st_mtime) < recent_min * 60:
+                    continue
+            except OSError:
+                continue
+            # Need a usable refresh token to mint a new access token; without one
+            # this lane needs a browser relogin (the refresh-TTL warning handles it).
+            if _credential_refresh_token(creds) is None:
+                continue
+            # Poll-burnout backoff (per lane, success OR fail).
+            key = (slot, account)
+            last_attempt = _PREEMPT_ATTEMPT_MS.get(key)
+            if last_attempt is not None and (now - last_attempt) < cooldown_min * 60:
+                continue
+            _PREEMPT_ATTEMPT_MS[key] = now
+            old_fp = _audit_token_fp(creds)
+            if no_execute:
+                click.echo(f"  preempt (--no-execute): WOULD proactively refresh live lane {slot} "
+                           f"({account}) mount token (~{minutes_left:.0f} min to expiry, idle) "
+                           f"before Claude Code's in-place refresh can blank it (Fix 1)")
+                continue
+            # Proactive refresh straight into the mount. On failure, do NOT touch
+            # the mount — degrade to the existing warn+heal path.
+            if _refresh_account_token(account, creds_path=mount):
+                try:
+                    fresh = read_json(mount)
+                except (json.JSONDecodeError, OSError):
+                    fresh = None
+                _cred_audit(
+                    "blank-preempt", "wrote",
+                    f"proactive mount-token refresh ahead of expiry (~{minutes_left:.0f}m left, idle)",
+                    slot=slot, account=account, token_fp=_audit_token_fp(fresh),
+                    extra=(f"prev_token_fp={old_fp} mount_mtime={_mtime_iso(mount)} "
+                           f"new_expiry={_expiry_repr(fresh)}"))
+                _update_lane_lastvalid(mount, fresh)
+                click.echo(f"  PREEMPT: refreshed live lane {slot} ({account}) mount token ahead of "
+                           f"expiry (~{minutes_left:.0f} min left, idle) — kept it ahead of Claude "
+                           f"Code's failure-prone in-place refresh, so it can't blank (Fix 1).")
+                preempted.append(slot)
+            else:
+                _cred_audit(
+                    "blank-preempt", "skipped-refresh-failed",
+                    "proactive refresh grant failed — degrading to the existing warn+heal path",
+                    slot=slot, account=account, token_fp=old_fp,
+                    extra=f"mount_mtime={_mtime_iso(mount)} expiry={_expiry_repr(creds)}")
+    return preempted
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — STUCK-SESSION escalation (heal→blank→heal detector, 2026-07-07)
+# ---------------------------------------------------------------------------
+# The reactive file-heal restores a blanked mount, but that is SILENT success
+# even when it doesn't actually un-stick the live session: once the running
+# Claude Code process has cached the logged-out state ("Not logged in · Run
+# /login"), restoring the file does NOT revive it — the process must be
+# RELAUNCHED (hot_swap is disabled in this config, so nothing does it
+# automatically). A lane blanking REPEATEDLY (heal→blank→heal) is the signature
+# of exactly this: the file keeps getting fixed and re-blanked while the process
+# stays wedged. This escalates that case to a distinct URGENT that tells the
+# operator a file-heal won't help and names the relaunch command.
+
+
+def _stuck_lane_sos(slot: str, account: str, heal_count: int, window_min: int) -> SOSCondition:
+    """URGENT for a lane stuck in a heal→blank→heal cycle (Fix 2). The summary is
+    STABLE (no live-changing counts) so `maybe_write_sos`'s severity:summary
+    de-dup notifies once, not every poll; the volatile count/window ride the
+    action."""
+    return SOSCondition(
+        severity="urgent",
+        summary=(f"lane {slot} ({account}) keeps blanking / session stuck 'not logged in' — "
+                 f"file healed but the live process needs a RELAUNCH"),
+        action=(
+            f"Lane {slot}'s mount for '{account}' has been auto-healed {heal_count} times within "
+            f"{window_min} min — a heal→blank→heal cycle. Each heal restores the FILE, but the "
+            f"running Claude Code process on this lane cached the logged-out state ('Not logged in "
+            f"· Run /login') and a file-heal cannot revive it (hot_swap is disabled, so nothing "
+            f"auto-relaunches). The 2026-07-07 tabby-5/slot-7 signature. The live process needs a "
+            f"RELAUNCH — restore the session in place:\n"
+            f"      cus launch {account} --lane {slot} -- --continue\n"
+            f"    (Fix 1's proactive refresh should keep the mount ahead of expiry so this stops "
+            f"recurring; if it persists, the account likely needs a browser re-login: "
+            f"cus relogin {account}.)"),
+        affected=account,
+    )
+
+
+def _diagnose_stuck_lanes(state: dict, config: dict) -> list[SOSCondition]:
+    """Escalate every LIVE lane healed >= `creds_warn.stuck.heal_threshold` times
+    within `creds_warn.stuck.window_minutes` to the stuck-session URGENT (Fix 2).
+
+    Reads the in-process `_LANE_HEAL_HISTORY` populated by `_auto_heal_live_lanes`,
+    pruning each lane's timestamps to the rolling window as it goes (so a lane that
+    stops blanking ages out of the count and clears). Only reports lanes that are
+    STILL live — a lane whose session exited is no longer stuck. Off entirely
+    outside lane-serving modes."""
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    cw = config.get("creds_warn", {}) if isinstance(config, dict) else {}
+    scfg = cw.get("stuck", {}) if isinstance(cw, dict) else {}
+    threshold = scfg.get("heal_threshold", 2)
+    window_min = scfg.get("window_minutes", 30)
+    now = time.time()
+    live = {(slot, account)
+            for account, slots in occupied_slot_accounts(state).items()
+            for slot in slots}
+    out: list[SOSCondition] = []
+    for key in list(_LANE_HEAL_HISTORY.keys()):
+        recent = [t for t in _LANE_HEAL_HISTORY[key] if (now - t) <= window_min * 60]
+        if recent:
+            _LANE_HEAL_HISTORY[key] = recent
+        else:
+            del _LANE_HEAL_HISTORY[key]  # fully aged out — forget the lane
+            continue
+        if key not in live:
+            continue  # session exited → not stuck anymore
+        if len(recent) >= threshold:
+            slot, account = key
+            out.append(_stuck_lane_sos(slot, account, len(recent), window_min))
+    return out
+
+
+def _premium_target_loss_reason(name: str, acct: dict, config: dict) -> str:
+    """Human label for WHY a reachable account is NOT a valid premium swap target.
+
+    Used only to name the LOST capacity in the pre-emptive headroom SOS
+    (`_diagnose_premium_headroom`) — it does not drive the decision, it just
+    tells the operator which lever to pull ("rayi3 TOKEN_STALE = revive it").
+    The order mirrors the hard-then-soft filter order in `pick_swap_target`, and
+    every branch is computed with the SAME helper the picker uses so the label
+    can never disagree with the actual eligibility verdict.
+    """
+    # token_stale = our stored access token aged out (nothing polls an idle
+    # account), but the refresh token is still good — recoverable. As of the
+    # 2026-07-06 false-URGENT fix, an idle token_stale account WITH real headroom
+    # is counted as a viable (refresh-on-swap) target upstream and never reaches
+    # this labeller. It only lands here when it is ALSO lost for another reason
+    # (its last-known numbers read over a cap). We deliberately label it
+    # TOKEN_STALE rather than the cap reason: a stale account's cached usage % is
+    # NOT trustworthy for a decision (2026-07-05 incident), so the honest operator
+    # action is "revive it" (force-poll / relogin), after which its REAL numbers
+    # decide — not "it's over cap" on a number we could not reconfirm.
+    if acct.get("token_stale"):
+        return "TOKEN_STALE"
+    if acct.get("token_expired"):
+        return "TOKEN_EXPIRED"
+    if acct.get("poll_error"):
+        return "POLL_ERROR"
+    if acct.get("rate_limited"):
+        return "RATE_LIMITED"
+    est = _account_estimated_effective_pct(acct, config)
+    if est >= config.get("never_swap_to_pct", 100):
+        return f"SATURATED ({est:.0f}%)"
+    hard_7d = _hard_7d_cap_for_config(config)
+    if acct.get("current_7d_pct", 0) >= hard_7d:
+        return f"over 7d cap ({acct.get('current_7d_pct', 0):.0f}% ≥ {hard_7d:.0f}%)"
+    if _max_model_weekly_from_acct(acct, config) >= _model_weekly_target_cap_for_config(config):
+        return "over per-model weekly cap"
+    if _target_would_immediately_re_trip(acct, config):
+        eff = _account_effective_pct(acct, config)
+        return f"at ladder step ({eff:.0f}% ≥ {acct.get('next_swap_at_pct', 50):.0f}%)"
+    return "unavailable"
+
+
+def _candidate_is_valid_premium_target(
+    leaver: str, candidate: str, state: dict, accounts: dict, premium_config: dict) -> bool:
+    """True iff `candidate` is a GENUINE swap target for a premium lane leaving
+    `leaver`, per the exact predicate the daemon's picker uses.
+
+    Rather than re-implement the eligibility filters (token_expired / poll_error
+    / rate_limited / saturation / 7d cap / per-model weekly cap / would-re-trip),
+    we hand `pick_swap_target` a two-account shim — {leaver (active), candidate}
+    under the PREMIUM pool config — so the only account it can possibly return is
+    `candidate`. If it returns it CLEANLY (no `[DEGRADED: ...]` note) the account
+    is really below every cap; a degraded pick means the picker only reached the
+    candidate via a fallback tier (no target below 7d cap, or all candidates
+    would re-trip their own ladder) — i.e. it is NOT below the caps that would
+    force it back off, so it is not a valid pre-emptive target. This matches the
+    "BELOW the caps that would force it off" definition in the SOS spec and is a
+    stricter cousin of Condition 2b's `"[DEGRADED:" ... "no targets below"` test.
+    token_stale is handled by the caller (pick_swap_target does not filter it).
+    """
+    shim = dict(state)
+    shim["accounts"] = {leaver: accounts[leaver], candidate: accounts[candidate]}
+    shim["active"] = leaver
+    tgt = pick_swap_target(shim, premium_config)
+    if tgt is None:
+        return False
+    if "[DEGRADED:" in tgt.reason:
+        return False
+    return tgt.name == candidate
+
+
+def _diagnose_premium_headroom(
+    state: dict,
+    config: dict,
+    occupied: dict[str, list[str]],
+    free_family_accounts: set[str],
+) -> SOSCondition | None:
+    """Pre-emptive alarm: premium lanes are live but the pool of accounts they
+    could swap ONTO has collapsed, so a lane will 429 the moment it caps (GH #150).
+
+    Why this exists separately from Condition 2b: 2b only fires once a lane is
+    ALREADY at/over its ladder step ("this lane cannot rotate NOW"). By then a
+    live premium session is often already wedged. This check fires EARLY — while
+    lanes are still climbing — the instant the count of VALID swap targets for
+    the premium pool drops to zero (URGENT) or to a single target while a lane is
+    already past the high-water step (WARNING). It is the exact 2026-07-05 shape:
+    the one spare account went token_stale, so when live premium sessions hit
+    their 5h caps the daemon had nowhere to swap and they 429'd.
+
+    Pure predicate (mirrors `_diagnose_live_mount_creds`): the impure inputs —
+    which accounts are LIVE-occupied (`occupied`, from /proc) and which of them
+    carry a FREE pooled login family (`free_family_accounts`, from the login
+    store on disk) — are computed by the caller and injected, so this function
+    is unit-testable with plain dicts and never touches the filesystem.
+
+    Returns one SOSCondition or None. None whenever there is headroom (>=1 valid
+    target and no hot lane), in any global-only / no-premium-lane setup, and in
+    every mode that does not serve slot lanes.
+    """
+    mode = config.get("mode", "global")
+    # Only lane-serving modes have per-slot lanes; global-only never fires.
+    if mode not in ("hybrid", "per_session"):
+        return None
+    accounts = state.get("accounts", {})
+
+    # 1. Identify LIVE PREMIUM lanes: occupied accounts with >=1 premium-pool slot.
+    #    Standard-pool lanes are excluded — they are not gated onto the scarce
+    #    Fable-clean accounts, so their target scarcity is a different question.
+    premium_lanes: dict[str, list[str]] = {}
+    for acct_name, slots in occupied.items():
+        prem = sorted(s for s in slots if _slot_pool(state, s, config) == "premium")
+        if prem:
+            premium_lanes[acct_name] = prem
+    if not premium_lanes:
+        return None  # no premium lanes to protect → nothing to warn about
+
+    # 2. Double-booking exclusion (GH #104), mirroring Condition 2b: an account
+    #    held by a LIVE mount cannot be a fresh swap target — a second live mount
+    #    on one refresh-token family clobbers it — UNLESS it has a FREE pooled
+    #    login family (then a lane can borrow a distinct family). In hybrid the
+    #    shared-mount active account is also a live holder.
+    shared_active = state.get("active")
+    live_held = set(occupied.keys()) | (
+        {shared_active} if (mode == "hybrid" and shared_active) else set())
+    if independent_logins_enabled(config):
+        blocking = {a for a in live_held if a not in free_family_accounts}
+    else:
+        blocking = set(live_held)
+
+    # 3. Count usable targets and NAME the lost capacity. A candidate is any known
+    #    account not blocked by a live mount. For each we drive the real picker with
+    #    a distinct premium-lane leaver (cap/headroom filters do not depend on WHICH
+    #    lane departs, so any premium leaver != candidate serves).
+    #
+    #    Two usable buckets, because they carry DIFFERENT urgency:
+    #      • valid_targets     — FRESH, below every cap, refresh-token good. A swap
+    #                            lands cleanly with no recovery step. Drives the
+    #                            existing healthy / high-water-WARNING tiers unchanged.
+    #      • stale_refreshable — idle token_stale (its stored access token aged out
+    #                            because nothing polls an idle account) but the
+    #                            refresh token is still VALID, and below every cap on
+    #                            its last-known numbers. A swap installs the snapshot
+    #                            creds and the existing auto-refresh fast-track (see
+    #                            the token_stale fast-track near cus.py:2779 /
+    #                            `_refresh_account_token`) revives the token on use —
+    #                            so it IS a usable target, just not a zero-recovery one.
+    #
+    #    FALSE-URGENT INCIDENT (2026-07-06) this split fixes: the only free
+    #    Fable-clean accounts were IDLE (rayi4 @ 5h 0%/Fable 54%, rayi3 @ 5h 0%/Fable
+    #    82%). An idle account is never polled, so its stored access token aged out →
+    #    token_stale. The OLD code blanket-EXCLUDED every token_stale account from the
+    #    target count, so it reported "0 valid swap targets" and screamed the URGENT
+    #    will-429 line — even though those accounts were perfectly swappable. Proof:
+    #    `cus force-poll rayi4 rayi3` freshened them and `cus sos` flipped straight to
+    #    all-clear with ZERO change in real capacity. A token_stale-but-not-
+    #    token_expired account with real headroom is therefore a genuine target and
+    #    must NOT trigger the 429 klaxon.
+    #
+    #    STALE-vs-REFRESHABLE distinction — DO NOT "fix" this back by re-excluding
+    #    stale accounts: a token_stale account's cached USAGE numbers can be a wrong
+    #    stale reading, and we must NOT trust a stale % as authoritative for a swap
+    #    DECISION (that bit us on 2026-07-05 — see the stale-guard in pick_swap_target).
+    #    But this ALARM is not executing a swap on the stale number — it only decides
+    #    "does a plausibly-usable target EXIST." Counting a stale-but-refreshable
+    #    account as a *candidate* is therefore correct and safe: if its last-known
+    #    numbers show headroom it is a viable target; the refresh-on-swap then re-reads
+    #    its REAL numbers before anything commits. token_EXPIRED (dead refresh token)
+    #    is the genuinely-unusable case — pick_swap_target filters it, so it never
+    #    becomes a usable target and it alone (with over-cap/blocked candidates) can
+    #    still produce the URGENT line.
+    premium_config = _config_for_pool(config, "premium")
+    disabled = _disabled_accounts(config)   # operator-parked: never a target, not lost capacity
+    valid_targets: list[str] = []       # fresh, below every cap → clean swap
+    stale_refreshable: list[str] = []   # idle token_stale, below caps → refresh-on-swap
+    lost: list[str] = []                # reachable-but-unusable = visible lost capacity
+    for name, acct in sorted(accounts.items()):
+        if name in blocking:
+            continue  # held by a live mount, no free family → would double-book
+        if name in disabled:
+            # Operator took this account OUT of rotation (`cus disable`). It is
+            # not a swap target, so it can't be valid_targets — and it is also
+            # NOT "lost capacity" to be revived (naming a deliberately-parked
+            # account as lost would tell the operator to un-park it, the opposite
+            # of what they asked). Skip it entirely: neither counted nor named.
+            # (pick_swap_target already excludes it, so _candidate_is_valid would
+            # return False regardless; this makes the intent explicit and keeps
+            # it out of the `lost` list.)
+            continue
+        leavers = [a for a in premium_lanes if a != name]
+        if not leavers:
+            continue  # the only premium lane IS this account; nothing swaps onto it
+        leaver = leavers[0]
+        # pick_swap_target does NOT filter token_stale (only token_expired /
+        # poll_error), and its per-model gate reads a stale account as 0.0
+        # (stale-guard) → eligible. So this predicate tells us whether the candidate
+        # is below every cap on its LAST-KNOWN numbers — for fresh and stale alike.
+        is_valid = _candidate_is_valid_premium_target(
+            leaver, name, state, accounts, premium_config)
+        if acct.get("token_stale") and not acct.get("token_expired"):
+            # Refreshable spare: below caps → usable-after-refresh (counts toward
+            # "a target exists"); over a cap on its (untrusted) last-known numbers →
+            # revive it before trusting them, so it is named as lost, not counted.
+            if is_valid:
+                stale_refreshable.append(name)
+            else:
+                lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+            continue
+        if is_valid:
+            valid_targets.append(name)
+        else:
+            lost.append(f"{name} {_premium_target_loss_reason(name, acct, config)}")
+
+    n_lanes = len(premium_lanes)
+    m = len(valid_targets)           # FRESH, below-cap targets (drive the existing tiers)
+    s = len(stale_refreshable)       # idle-stale-but-refreshable targets
+
+    # High-water step: reuse thresholds.steps' top step (~90%), config-driven.
+    steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    top_step = max(steps) if steps else 90
+    hot_lanes = []  # premium lanes already past the high-water mark
+    for acct_name, prem_slots in sorted(premium_lanes.items()):
+        eff = _account_effective_pct(accounts.get(acct_name, {}), config)
+        if eff >= top_step:
+            hot_lanes.append((acct_name, prem_slots, eff))
+
+    lane_desc = "; ".join(
+        f"{a} ({'/'.join(premium_lanes[a])} @ {_account_effective_pct(accounts.get(a, {}), config):.0f}%)"
+        for a in sorted(premium_lanes)
+    )
+    lost_desc = (f" Lost capacity: {', '.join(lost)}." if lost else "")
+    levers = (
+        "Premium lanes rotate onto scarce Fable-clean accounts and the pool of viable "
+        "targets has collapsed — when a live lane hits its 5h/7d cap it will have nowhere "
+        "to swap and the session 429s. Levers: revive stale/offline accounts "
+        "(`cus relogin <acct>`, or wait for auto-refresh), add capacity (`cus add <name>`), "
+        "or reduce concurrent premium load (exit a premium session)."
+        + lost_desc
+        + f" Live premium lanes: {lane_desc}."
+    )
+
+    # ---- At least one FRESH target: unchanged healthy / high-water behavior ----
+    # A fresh, below-cap target means a clean swap is available, so the only
+    # question is whether the pool is thin. This is the backward-compatible path;
+    # its verdicts are byte-for-byte what they were before the stale split.
+    if m >= 1:
+        if m > 1:
+            return None  # >1 fresh target = healthy pool, even with a hot lane
+        if not hot_lanes:
+            return None  # single fresh target but no lane is hot yet → quiet
+        # m == 1 AND a lane is already past the high-water step: a single mistake
+        # (that last target caps, or the hot lane trips) away from the wall → WARNING.
+        hot_names = ", ".join(f"{a} @ {eff:.0f}%" for a, _s, eff in hot_lanes)
+        return SOSCondition(
+            severity="warning",
+            summary=(f"{n_lanes} premium lane(s) live, only 1 valid swap target — "
+                     f"lane(s) past {top_step:.0f}% ({hot_names}) are near the wall"),
+            action=levers,
+            affected="system",
+        )
+
+    # ---- No FRESH target (m == 0), but idle-stale-but-refreshable targets exist ----
+    # This is the 2026-07-06 false-URGENT shape: the only usable targets are idle
+    # token_stale accounts that WILL refresh on swap. NOT a 429 klaxon — downgrade to
+    # an informational note (severity "info", quieter than "warning"). The statusline
+    # surfaces only urgent/warning, so this stays OFF the status bar and shows only in
+    # `cus sos` / SOS.md. This is the ONLY behavior change vs the old URGENT-on-m==0.
+    if s >= 1:
+        stale_desc = ", ".join(stale_refreshable)
+        action = (
+            "The only pooled swap targets for the live premium lane(s) are idle and "
+            "token_stale — their stored access token aged out because nothing polls an "
+            "idle account, but the refresh token is still valid. They are NOT capped: a "
+            "swap installs their snapshot creds and the auto-refresh fast-track revives "
+            "the token on use, so no 429 results. Informational only. To freshen now: "
+            f"`cus force-poll {stale_refreshable[0]}` (or `cus relogin <acct>`)."
+            + lost_desc
+            + f" Idle-stale targets: {stale_desc}. Live premium lanes: {lane_desc}."
+        )
+        return SOSCondition(
+            severity="info",
+            summary=(f"{n_lanes} premium lane(s) live; {s} swap target(s) are idle-stale "
+                     f"and will refresh on swap"),
+            action=action,
+            affected="system",
+        )
+
+    # ---- m == 0 AND s == 0: genuinely zero usable targets ----
+    # Every candidate is over a cap, poll_error, rate_limited, or token_EXPIRED (dead
+    # refresh token). The next premium lane to cap 429s with no recourse → URGENT even
+    # before any lane is hot. This is the ONLY remaining path to the will-429 klaxon;
+    # idle-stale-but-refreshable spares no longer reach it (they route to INFO above).
+    return SOSCondition(
+        severity="urgent",
+        summary=(f"{n_lanes} premium lane(s) live, 0 valid swap targets — "
+                 f"a premium lane will 429 when it caps"),
+        action=levers,
+        affected="system",
+    )
+
+
 def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
     """Scan state + system for conditions requiring human intervention.
 
@@ -5273,6 +9857,72 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         config = load_config()
     out: list[SOSCondition] = []
     accounts = state.get("accounts", {})
+
+    # Condition 0 (2026-07-05, GH #141): the LIVE shared mount itself is unusable.
+    # Every other condition here trusts state.json + per-account snapshots; none
+    # inspect the live ~/.claude/.credentials.json that BARE sessions on the
+    # shared mount actually read. In the 2026-07-05 incident that file was blanked
+    # (expiresAt 0 + empty accessToken) while the active account's snapshot stayed
+    # healthy — a bare session showed "not logged in" but `cus sos` said all-clear.
+    # Only meaningful where the shared mount serves sessions (global/hybrid); in
+    # per_session the shared mount is observe-only/authless by design, so the pure
+    # predicate skips it. Read the files here (impure) and hand the parsed payloads
+    # + identities to the pure, unit-tested predicate.
+    live_mode = config.get("mode", "global")
+    if live_mode in ("global", "hybrid"):
+        try:
+            live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+        except (json.JSONDecodeError, OSError):
+            live_creds = None  # unreadable == unusable from a session's point of view
+        try:
+            live_ident = _identity_fields(read_json(CLAUDE_JSON)) if CLAUDE_JSON.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            live_ident = {}
+        live_active = state.get("active")
+        active_ident = account_canonical_identity(live_active) if live_active else {}
+        live_cond = _diagnose_live_mount_creds(
+            live_creds, live_mode, live_active, live_ident, active_ident)
+        if live_cond is not None:
+            out.append(live_cond)
+
+    # Condition 0b (2026-07-05, GH #141 follow-up): a LIVE LANE's own mount creds
+    # are blanked. Condition 0 above only inspects the SHARED mount; a slot lane's
+    # own slot-N/.credentials.json can be blanked independently (Claude's logout,
+    # a crash mid-write) — the 2026-07-05 slot-2 incident, which `cus sos` reported
+    # as all-clear because nothing scanned lane mounts. Only in lane-serving modes
+    # (per_session/hybrid); `_blanked_live_lanes` self-gates on mode and returns
+    # only LIVE lanes with a registered account whose mount is actually invalid
+    # (idle/observe-only slots and mid-swap slots are excluded there). In the
+    # daemon, `_emit_sos_after` auto-heals blanked lanes BEFORE this diagnose runs,
+    # so a lane only reaches here when it has NO usable source (genuine relogin
+    # needed); an ad-hoc `cus sos` still reports the blank so an operator sees it.
+    for _lane_slot, _lane_acct in _blanked_live_lanes(state, config):
+        out.append(_lane_mount_sos(_lane_slot, _lane_acct))
+
+    # Condition 0c (2026-07-07, GH #104): a LIVE LANE shares its account with the
+    # shared mount (or another live lane) but holds NO distinct login family —
+    # the divergence-logout SETUP. Conditions 0/0b only fire AFTER a mount is
+    # already blanked; this fires on the SETUP, before the token rotation clobbers
+    # anyone, so an operator can re-provision a distinct family first. Exactly the
+    # 2026-07-07 chats1a shape: slot-2 landed on merkos (also the shared-mount
+    # account and on slot-1) with login_family=None, and ~5 min later a rotation
+    # logged the live session out for an hour. `_divergence_risk_lanes` self-gates
+    # on the independent-logins pool feature + lane-serving mode and never flags a
+    # lane that holds a distinct family.
+    for _dv_slot, _dv_acct, _dv_expired in _divergence_risk_lanes(state, config):
+        # Log the clobber PRECONDITION the moment it exists — before any save-back
+        # can carry a foreign token into the wrong store. This lane's live family
+        # already runs on another live mount of `_dv_acct` (the divergence setup);
+        # shared=true is that signal. token_fp names the shared family.
+        try:
+            _dv_fp = _audit_token_fp(read_json(mount_creds_path(slot_path(_dv_slot))))
+        except (json.JSONDecodeError, OSError):
+            _dv_fp = "unreadable"
+        _cred_audit("divergence-detected", "detected",
+                    "lane shares one live token family with another mount (#104)"
+                    + ("; lane mount already blank/expired" if _dv_expired else ""),
+                    slot=_dv_slot, account=_dv_acct, shared=True, token_fp=_dv_fp)
+        out.append(_lane_divergence_sos(_dv_slot, _dv_acct, _dv_expired))
 
     # Condition 1: token expired anywhere
     for name, acct in accounts.items():
@@ -5353,6 +10003,104 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                     action="Add another Claude account (run `claude /login` with CLAUDE_CONFIG_DIR=~/.claude-newname/) or wait for cooldown. Or set `smart_strategy.allow_rate_limited_targets: true` if you have a rate-limited account that works elsewhere.",
                     affected=active,
                 ))
+
+    # Condition 2b (2026-07-03): lanes/hybrid TARGET STARVATION. Condition 2
+    # above only evaluates the SHARED-mount active account and treats "any
+    # unblocked other account exists" as "a target is available" — so it is
+    # doubly blind to the lanes failure mode: (a) it never looks at per-lane
+    # (slot) accounts at all, and (b) an unblocked-but-saturated account (e.g.
+    # rayi1 at 100%) counts as an available target. The observed symptom
+    # ("no swaps since lanes"): with as many live mounts as accounts, GH #104's
+    # no-double-book rule leaves a hot lane's only candidate(s) either excluded
+    # or saturated, so decide_swap held every cycle while `cus sos` reported
+    # all-clear and a live session kept burning on a 100% account. This check
+    # replays the EXACT exclusion + picker decide_slot_swaps uses, per live-lane
+    # account, and raises the operator-actionable flag (add an account / free a
+    # lane / wait for a window reset). State-based only — pick_swap_target reads
+    # stored current_*_pct, so no live poll is needed here.
+    if config.get("mode") in ("hybrid", "per_session"):
+        occupied = occupied_slot_accounts(state)
+        shared_active = state.get("active")
+        # Same cross-mount exclusion the cycle applies (GH #104): every live-lane
+        # account, plus the shared-mount account in hybrid mode.
+        exclude = set(occupied.keys()) | (
+            {shared_active} if (config.get("mode") == "hybrid" and shared_active) else set())
+        sat_pct = config.get("usage_growth_gate", {}).get("saturation_pct", 95)
+        thr_cfg = config.get("thresholds", {})
+        for acct_name, slots in sorted(occupied.items()):
+            acct = accounts.get(acct_name, {})
+            if not is_valid(acct):
+                continue  # blocked accounts are already covered by Conditions 1/3
+            lane_thr = acct.get("next_swap_at_pct", 50)
+            cand = []
+            if thr_cfg.get("five_hour", True):
+                cand.append(acct.get("current_5h_pct", 0))
+            if thr_cfg.get("seven_day", True):
+                cand.append(acct.get("current_7d_pct", 0))
+            lane_pct = max(cand) if cand else 0
+            if lane_pct < lane_thr:
+                continue  # lane below its ladder step — nothing to rotate
+            # Build the same shim decide_slot_swaps builds for this group:
+            # active = the lane's own account, candidate pool minus every OTHER
+            # live-mount account (the lane's own account is retained — it's the
+            # one being left). Then run the real picker.
+            drop = exclude - {acct_name}
+            # Mirror the pool rescue (2026-07-03): a held account with a FREE
+            # pooled family is a legal target (execution claims a distinct
+            # family), so it must NOT count toward starvation — else Condition 2b
+            # false-positives on a lane that can actually rescue.
+            if drop and independent_logins_enabled(config):
+                drop = drop - {x for x in drop if has_free_login_family(x, state)}
+            shim = dict(state)
+            if drop:
+                shim["accounts"] = {n: a for n, a in accounts.items() if n not in drop}
+            shim["active"] = acct_name
+            pool = _slot_pool(state, sorted(slots)[0], config)
+            tgt = pick_swap_target(shim, _config_for_pool(config, pool))
+            starved = tgt is None or (
+                "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
+            if not starved:
+                continue
+            # Remedy hint. With the pool feature ON, the starvation means every
+            # headroom account is held AND has no free family — so provisioning
+            # another family (raising a pool's depth) is the login-free unlock,
+            # alongside add-account / free-a-lane / wait-for-reset.
+            pool_hint = (" Or provision another independent login for a headroom account "
+                         "(`cus login-mount <account>`) so this lane can borrow it."
+                         if independent_logins_enabled(config) else "")
+            # Tier severity: at/above saturation the lane is effectively frozen
+            # and burning a live session → urgent; merely over the first ladder
+            # step (still has headroom) → warning, an early nudge to add capacity.
+            out.append(SOSCondition(
+                severity="urgent" if lane_pct >= sat_pct else "warning",
+                summary=f"lane {', '.join(sorted(slots))} on '{acct_name}' at {lane_pct:.0f}% "
+                        f"(≥{lane_thr}%) with no swap target",
+                action=(f"'{acct_name}' is over its ladder step but every other account is either "
+                        f"held by another live mount (GH #104 forbids double-booking — it clobbers "
+                        f"the OAuth token) or is saturated, so this lane cannot rotate. Add another "
+                        f"account (`cus add <name>`), free a live lane, or wait for another account's "
+                        f"5h/7d window to reset." + pool_hint),
+                affected=acct_name,
+            ))
+
+    # Condition 2c (2026-07-05, GH #150): PRE-EMPTIVE premium-headroom alarm.
+    # Condition 2b above only fires once a lane is ALREADY at/over its ladder
+    # step — too late (a live premium session is usually wedged by then). This
+    # fires EARLY: while lanes are still climbing, the instant the count of VALID
+    # swap targets for the premium pool collapses. Exactly the 2026-07-05 shape —
+    # the one spare account went token_stale, so live premium sessions 429'd at
+    # their 5h caps with nowhere to swap. Impure inputs (which accounts are
+    # live-occupied, which carry a free pooled family) are gathered here and
+    # handed to the pure, unit-tested predicate. Only for lane-serving modes;
+    # the pure helper re-checks mode and premium-lane presence and returns None
+    # in every no-lane / global-only case.
+    if config.get("mode") in ("hybrid", "per_session"):
+        occ = occupied_slot_accounts(state)
+        free_fam = ({a for a in occ if has_free_login_family(a, state)}
+                    if independent_logins_enabled(config) else set())
+        headroom_cond = _diagnose_premium_headroom(state, config, occ, free_fam)
+        if headroom_cond is not None:
+            out.append(headroom_cond)
 
     # Condition 3b (GH #9): account stuck in 429 poll-backoff for > 30 min.
     # The polling endpoint is per-IP throttled; another machine hammering it
@@ -5450,7 +10198,7 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         match = _identities_match(slot_ids, _dir_identity(acct))
         if match is False:  # None = no shared evidence — can't say, stay quiet
             out.append(SOSCondition(
-                severity="critical",
+                severity="urgent",
                 summary=f"{slot_name} identity does not match its assigned account '{acct}' (slot↔state drift, GH #2 class)",
                 action=(f"The slot's live files hold a different account than state.json claims. "
                         f"Check `python3 ~/repos/claude-usage-swap/cus.py slot list` and the slot's .claude.json oauthAccount; "
@@ -5503,8 +10251,17 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         # Wrong-account stored login: --finish refuses this, but a hand-edited
         # store or a --force override could leave one behind. It would seed a
         # swap with the wrong account's tokens, so treat it as critical.
+        #
+        # 2026-07-06 disambiguation: a login-store-vs-canonical mismatch has TWO
+        # possible culprits. Historically this blamed the LOGIN store. But the
+        # recurring clobber makes the CANONICAL .claude.json the wrong side while
+        # the login store is right — so only blame the login store here when the
+        # canonical store is anchor-CONSISTENT. When canonical is itself poisoned,
+        # the dedicated Condition 10.5 below reports it (naming the canonical store,
+        # not the correct login) and we skip the misleading login-blame message.
         if _identities_match(login_store_identity(acct, slot), account_canonical_identity(acct)) is False:
-            mismatched.append(f"{slot}->{acct}")
+            if not account_canonical_store_poisoned(acct)[0]:
+                mismatched.append(f"{slot}->{acct}")
         exp_state, _ = login_expiry_state(acct, slot, config)
         if exp_state == "expired":
             expired.append(f"{slot}->{acct}")
@@ -5512,12 +10269,68 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
             expiring.append(f"{slot}->{acct}")
     if mismatched:
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"Independent login(s) stored under the wrong account: {', '.join(mismatched)}",
             action=("A stored login's identity does not match its account. Re-provision it: "
                     "`cus login-mount <slot> <account>` and log in as the correct account."),
             affected="system",
         ))
+
+    # Condition 10.5 (2026-07-06, this PR): CANONICAL store poisoned by a wrong-
+    # account clobber. This is the OTHER side of the identity-mismatch coin from
+    # Condition 10: here account-<X>/.claude.json disagrees with X's TRUSTED anchor
+    # (meta.yaml + login families), i.e. the canonical store was overwritten with
+    # another account's identity while meta + families stayed correct (the live
+    # 2026-07-06 rayi1<-rayi2 incident). Naming the CANONICAL store as the bad side
+    # — not the (correct) login families — is the whole point of splitting this out.
+    # The guard has already refused further wrong writes and the picker excludes the
+    # account as a swap target; the operator fix is a browser re-login.
+    for acct_name in state.get("accounts", {}):
+        poisoned, detail = account_canonical_store_poisoned(acct_name)
+        if not poisoned:
+            continue
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=(f"'{acct_name}' CANONICAL store is clobbered with a wrong account's identity: "
+                     f"{detail}"),
+            action=(f"account-{acct_name}/.claude.json (and likely .credentials.json) hold ANOTHER "
+                    f"account's identity/token, while '{acct_name}'s meta.yaml + login families are "
+                    f"correct — so the CANONICAL store is the bad side, not the families. cus has "
+                    f"refused further wrong-account writes and excluded '{acct_name}' as a swap target. "
+                    f"Repair with a browser re-login: `cus relogin {acct_name}` then `cus poll`."),
+            affected=acct_name,
+        ))
+
+    # Condition 10.6 (2026-07-07 merkos incident, this PR): DEAD SNAPSHOT with no
+    # valid login family. The account's canonical snapshot refresh token is dead
+    # (invalid_grant — flagged `snapshot_refresh_dead` by the un-stale sweep) AND it
+    # has no free login family to seed a NEW lane from. Such an account can still
+    # serve an EXISTING lane that already runs a live family (that lane is never
+    # disturbed) — but it can no longer HOST a new lane: the swap install-point
+    # refuses it (would blank the mount) and the picker excludes it. Surface it so
+    # the operator reloginss before the account silently drops out of rotation. An
+    # account that is dead-snapshot but HAS a free family is deliberately NOT alarmed
+    # here — the install-point seeds new lanes from the family, so it's still usable.
+    for acct_name, acct in state.get("accounts", {}).items():
+        if not isinstance(acct, dict):
+            continue
+        if acct.get("snapshot_refresh_dead") and not has_free_login_family(acct_name, state):
+            out.append(SOSCondition(
+                severity="urgent",
+                summary=(f"'{acct_name}' snapshot creds are dead and no valid login family remains — "
+                         f"relogin required before it can host new lanes"),
+                action=(f"account-{acct_name}/.credentials.json's refresh token is dead (the OAuth "
+                        f"refresh grant returns invalid_grant) and '{acct_name}' has no free login "
+                        f"family to seed a lane from, so cus has excluded it as a swap target and will "
+                        f"refuse to install it onto a new lane — installing the dead snapshot would "
+                        f"blank the mount (the 2026-07-07 merkos dead-snapshot incident, which blanked "
+                        f"chats1a). Any existing lane already running a live family keeps working. "
+                        f"Restore it with a browser re-login:\n"
+                        f"      cus relogin {acct_name}   # then: cus poll\n"
+                        f"    or add another independent login family:\n"
+                        f"      cus login-mount {acct_name}"),
+                affected=acct_name,
+            ))
     if expired:
         out.append(SOSCondition(
             severity="warning",
@@ -5541,29 +10354,111 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # the gate, because the operator has provisioned them expecting safety.
     for dup in duplicate_login_families():
         out.append(SOSCondition(
-            severity="critical",
+            severity="urgent",
             summary=f"Independent-login families collide across mounts: {', '.join(dup['pairs'])} share one token family",
             action=("Two live mounts on one refresh-token family clobber on rotation. Give the extra "
                     "mount(s) their OWN login: `cus login-mount <slot> <account>` (a real /login, "
                     "NOT --from-existing — only the browser flow mints a distinct family)."),
             affected="system",
         ))
+    # Same invariant measured at the LIVE mounts (2026-07-03). The store check
+    # above only sees provisioned independent logins; a double-book created by
+    # `--force` or the daemon's legacy fan-out double-up has NO store entry and
+    # was silent (slot-3/slot-4 incident: sos said all-clear while two live
+    # mounts shared rayi2's family — one refresh from a forced logout).
+    for dup in duplicate_live_mount_families(state):
+        if len(dup.get("accounts", [])) <= 1:
+            continue  # single-account double-book: the by-account check below reports it with phase detail
+        # One family live on 2+ mounts — the clobber precondition, naming BOTH
+        # mounts + their accounts + the shared family, logged the moment it exists.
+        _cred_audit("divergence-detected", "detected",
+                    "one login family live on multiple mounts (#104)",
+                    shared=True, token_fp=dup["refresh_fp"],
+                    extra=("mounts=" + ",".join(dup["mounts"]).replace(" ", "")
+                           + " accounts=" + ",".join(dup["accounts"])))
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=f"One login family live on {len(dup['mounts'])} mounts: {', '.join(dup['mounts'])}",
+            action=("These mounts share ONE refresh token — the next rotation logs the others out. "
+                    "Exit the extra session(s); relaunch joins the surviving lane (lane sharing) "
+                    "or gets its own family via `cus login-mount <slot> <account>`."),
+            affected="system",
+        ))
+    # By-account view of the same invariant (2026-07-03): catches the
+    # POST-rotation phase too — once a doubled-up account's token rotates on
+    # one mount, the families diverge (so the same-family check above goes
+    # quiet) but the other mount now holds a dead refresh token and fails at
+    # its next refresh (2026-07-01 duplicate-identity incident shape).
+    for db in double_booked_live_accounts(state):
+        if db["phase"] == "will_clobber":
+            detail = "families still identical — the next token refresh logs the other(s) out"
+        else:
+            detail = ("families already DIVERGED — the mount(s) on the old family hold a dead "
+                      "refresh token and will fail their next refresh")
+        out.append(SOSCondition(
+            severity="urgent",
+            summary=f"'{db['account']}' is live on {len(db['mounts'])} mounts without independent logins "
+                    f"({', '.join(db['mounts'])}): {detail}",
+            action=("Exit the extra session(s) — relaunching then JOINS the surviving lane (lane sharing) "
+                    "instead of copying. For deliberate multi-lane use of one account, provision "
+                    "independent logins: `cus login-mount <slot> <account>`."),
+            affected=db["account"],
+        ))
 
-    # Condition 11: Phase 2 gate is ON but some occupied slots have no
-    # independent login — their next swap falls back to the shared-snapshot copy
-    # (the #104/#103/#3 clobber path this feature exists to remove). Only
-    # actionable, hence only raised, when the gate is on.
-    if config.get("independent_logins", {}).get("use_independent_logins", False):
-        missing = _slots_missing_logins(state)
-        if missing:
-            pairs = ", ".join(f"{s}->{a}" for s, a in missing)
+    # Condition 11 (2026-07-03, pool model): the gate is ON but some accounts
+    # backing live lanes have NO login pool, so a lane can't rescue onto them (or
+    # safely double-book them) — a swap onto such an account while it's held just
+    # HOLDS/refuses. Not a clobber (the pre-pool "copy-fallback" framing is gone:
+    # execution claims a pooled family or refuses), so this is an informational
+    # nudge to widen coverage, not an alarm. Only raised when the gate is on.
+    if independent_logins_enabled(config):
+        missing_accts = sorted({a for _, a in _slots_missing_logins(state)})
+        if missing_accts:
             out.append(SOSCondition(
                 severity="warning",
-                summary=f"independent_logins is ON but these slots lack a login (swap will copy-fallback): {pairs}",
-                action=("Provision each: `cus login-mount <slot> <account>` then `--finish`. "
-                        "Until then, swaps into these slots use the shared-snapshot copy."),
+                summary=f"independent_logins is ON but these accounts backing live lanes have no login pool: "
+                        f"{', '.join(missing_accts)}",
+                action=("A lane can only rescue onto (or safely double-book) an account that has a login pool. "
+                        "Provision one per account you want borrowable: `cus login-mount <account>` "
+                        "(run pool_size times, then `--finish` each). Accounts without a pool still work as "
+                        "today — they just can't be a rescue target."),
                 affected="system",
             ))
+
+    # ---- Operator-disabled accounts: silence their per-account klaxon -------
+    # An account the operator deliberately took out of rotation (`cus disable`)
+    # must not scream. The motivating case is a POISONED canonical store (rayi1,
+    # 2026-07-06): before it's disabled it emits an URGENT "canonical store is
+    # clobbered" line every poll; disabling it means the operator has SEEN that
+    # and chosen to park it until a browser relogin. So for any disabled account
+    # that has an outstanding URGENT/WARNING per-account condition (token
+    # expired, poisoned canonical, ...), drop ALL of that account's conditions
+    # and emit ONE soft INFO line instead. Non-loud disabled accounts (only INFO
+    # or nothing) are left untouched — no new noise. SYSTEM-scoped conditions
+    # (affected="system"/"daemon": all-accounts-blocked, premium-headroom
+    # scarcity, ...) are never account-matched here, so a REAL capacity problem
+    # that disabling this account causes still fires at full severity.
+    disabled = _disabled_accounts(config)
+    if disabled:
+        loud = {c.affected for c in out
+                if c.affected in disabled and c.severity in ("urgent", "warning")}
+        if loud:
+            cfg_accounts = {a.get("name"): a for a in config.get("accounts", [])
+                            if isinstance(a, dict)}
+            kept = [c for c in out if c.affected not in loud]
+            for name in sorted(loud):
+                reason = (cfg_accounts.get(name, {}) or {}).get("disabled_reason")
+                rtxt = f", reason: {reason}" if reason else ""
+                kept.append(SOSCondition(
+                    severity="info",
+                    summary=f"{name} is disabled and out of rotation{rtxt}",
+                    action=(f"'{name}' was deliberately taken out of rotation with `cus disable` "
+                            f"(its own alarms are suppressed while disabled). Re-enable with "
+                            f"`cus enable {name}` after fixing (e.g. `cus relogin {name}` for a "
+                            f"poisoned/expired store, then `cus force-poll {name}` to confirm)."),
+                    affected=name,
+                ))
+            out = kept
 
     return out
 
@@ -5601,13 +10496,22 @@ def maybe_write_sos(conditions: list[SOSCondition], state: dict) -> None:
         write_json(LAST_NOTIFY, {"signature": signature, "ts": now_iso()})
         if shutil.which("notify-send"):
             urgent = [c for c in conditions if c.severity == "urgent"]
-            title = "🚨 cus SOS" if urgent else "⚠ cus warning"
+            warning = [c for c in conditions if c.severity == "warning"]
+            # Three-tier title/urgency: an info-only set (e.g. the premium-headroom
+            # "targets are idle-stale but will refresh on swap" note) must not fire a
+            # warning-styled critical-ish popup — keep it low-urgency and labelled info.
+            if urgent:
+                title, urgency = "🚨 cus SOS", "critical"
+            elif warning:
+                title, urgency = "⚠ cus warning", "normal"
+            else:
+                title, urgency = "ℹ cus", "low"
             body = conditions[0].summary
             if len(conditions) > 1:
                 body += f" (and {len(conditions) - 1} more)"
             try:
                 subprocess.run(
-                    ["notify-send", "-u", "critical" if urgent else "normal", "-a", "cus", title, body],
+                    ["notify-send", "-u", urgency, "-a", "cus", title, body],
                     check=False, capture_output=True, timeout=5,
                 )
             except (subprocess.SubprocessError, FileNotFoundError):
@@ -5721,6 +10625,34 @@ def _latest_stops_per_session() -> dict[str, str]:
 _TRANSCRIPT_INDEX_CACHE: dict[str, tuple[float, dict]] = {}
 
 
+class _TranscriptIndexData(dict):
+    """Transcript index: the GH #91 by-stem dict[str, Path] (stem -> path,
+    last-seen-wins) PLUS an `.exact` set of (project_dirname, stem) pairs
+    captured in the SAME scan (GH #90/#95).
+
+    Why a dict subclass: every existing caller and test relies on the plain
+    by-stem mapping contract (`idx[stem]`, `idx.get(stem)`, `set(idx)`,
+    `idx == {}`), so the fallback-lookup shape must not change. Subclassing
+    keeps all of that intact while piggybacking the extra set from the same
+    directory walk at no additional syscall cost.
+
+    Why `.exact` exists: after GH #91 removed the per-session glob, the
+    RESIDUAL scaling term in `cus status` (GH #90/#95) was the cwd-first
+    candidate probe in _resolve_transcript — one live `.exists()` stat per
+    UNIQUE session id ever logged. sessions.log is append-only, so status
+    cost grew with total HISTORY (~13.5k unique ids -> ~13.5k stats ->
+    multi-second, 100%-CPU status on the 2026-07-02 incident box) instead of
+    with the transcripts actually on disk. The scan already visits every
+    existing transcript, so "does <cwd-encoded-dir>/<sid>.jsonl exist?" can
+    be answered by set membership at zero syscalls — see the
+    `live_candidate_stat=False` path in _resolve_transcript.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.exact: set[tuple[str, str]] = set()
+
+
 def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     """One-shot {session_id: transcript_path} index of ~/.claude/projects.
 
@@ -5751,15 +10683,26 @@ def _transcript_index(max_age_seconds: float = 5.0) -> dict[str, Path]:
     if hit and now - hit[0] < max_age_seconds:
         return hit[1]
     projects_root = CLAUDE_DIR / "projects"
-    index: dict[str, Path] = {}
+    index = _TranscriptIndexData()
     if projects_root.exists():
         for jsonl in projects_root.glob("*/*.jsonl"):
             index[jsonl.stem] = jsonl
+            # GH #90/#95: record the (project_dirname, stem) pair so bulk
+            # scans can answer the cwd-first existence question by set
+            # membership instead of a per-session-id stat. Same walk, no
+            # extra syscalls — glob already enumerated this entry.
+            index.exact.add((jsonl.parent.name, jsonl.stem))
     _TRANSCRIPT_INDEX_CACHE[key] = (now, index)
     return index
 
 
-def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Path | None:
+def _resolve_transcript(
+    session_id: str,
+    cwd: str,
+    index: dict[str, Path],
+    *,
+    live_candidate_stat: bool = True,
+) -> Path | None:
     """Deterministic cwd-first transcript resolution with an O(1) index
     fallback (GH #91 + review finding 2026-07-02).
 
@@ -5768,11 +10711,49 @@ def _resolve_transcript(session_id: str, cwd: str, index: dict[str, Path]) -> Pa
     by a same-id duplicate from another project dir. Only when that direct
     candidate is absent do we fall back to the prebuilt index (O(1)), never
     to the minutes-long full-tree glob that _find_transcript's fallback runs.
+
+    `live_candidate_stat` (GH #90/#95) selects HOW the cwd-first candidate's
+    existence is checked:
+
+      True (default) — a live Path.exists() stat, exactly the pre-#90 code
+        path. Kept as the default for the swap/orchestration callers
+        (find_live_panes' _validate + step-1.5 loop): those probe a BOUNDED
+        set (live panes x recent entries), so per-call stats are cheap, and
+        freshness matters there — a transcript written milliseconds ago
+        (the GH #23 SessionStart->first-JSONL race) must be seen the moment
+        it lands, because a swap decision hangs on it.
+
+      False — membership in the index's `.exact` set captured by the same
+        scan that built the by-stem fallback map. Used by the BULK scan in
+        find_live_sessions, where the candidate probe runs once per unique
+        session id ever logged and was therefore the history-proportional
+        cost behind the GH #90/#95 status hang. Within one call the index
+        is built milliseconds earlier, so results are identical to the live
+        stat modulo the same in-flight-file races the exists()->stat()
+        sequence already had; across cached calls (daemon cycles sharing
+        the 5s-TTL scan) a transcript CREATED inside the TTL window is
+        seen up to 5s late — the same staleness bound the GH #91 review
+        already accepted for the fallback map, and irrelevant to the
+        one-shot `cus status` process where the cache is always cold.
+
+    A plain-dict index (defensive: tests or callers holding a pre-#90-shape
+    map) has no `.exact` set, so it always gets the live stat regardless of
+    the flag — degraded to the old cost, never to wrong results.
     """
     if cwd:
-        candidate = CLAUDE_DIR / "projects" / cwd.replace("/", "-") / f"{session_id}.jsonl"
-        if candidate.exists():
-            return candidate
+        dirname = cwd.replace("/", "-")
+        if live_candidate_stat or not isinstance(index, _TranscriptIndexData):
+            candidate = CLAUDE_DIR / "projects" / dirname / f"{session_id}.jsonl"
+            if candidate.exists():
+                return candidate
+        elif (dirname, session_id) in index.exact:
+            # Construct the Path only AFTER the membership hit: on the bulk
+            # path this function runs once per unique session id ever logged
+            # and almost all of them miss (~10.6k of 13.5k on the incident
+            # box), so building a 4-segment pathlib object per miss was
+            # itself a measurable chunk of the scan (~µs each x tens of
+            # thousands). A set probe on an interned tuple is ~100x cheaper.
+            return CLAUDE_DIR / "projects" / dirname / f"{session_id}.jsonl"
     return index.get(session_id)
 
 
@@ -5819,11 +10800,29 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
         # never the minutes-long glob that _find_transcript's fallback runs
         # (see _resolve_transcript / _transcript_index for the incident
         # numbers and the duplicate-id correctness note).
-        transcript = _resolve_transcript(sid, e.get("cwd", ""), transcripts)
-        if transcript and transcript.exists():
-            mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
-            if (now - mtime).total_seconds() < 3600:
-                is_live = True
+        #
+        # GH #90/#95: live_candidate_stat=False — this loop runs once per
+        # UNIQUE session id ever logged (append-only sessions.log, ~13.5k on
+        # the incident box), so a live stat here made status cost grow with
+        # history. Resolution now rides entirely on the index built at the
+        # top of this call: zero syscalls per historical id.
+        transcript = _resolve_transcript(
+            sid, e.get("cwd", ""), transcripts, live_candidate_stat=False
+        )
+        if transcript:
+            # Single guarded stat replaces the old exists()+stat() pair:
+            # halves the syscalls for resolved ids (bounded by transcripts
+            # on disk, not by history) AND closes the latent TOCTOU crash
+            # where the file vanished between exists() and stat() — the old
+            # sequence would have raised an unhandled OSError there. A
+            # vanished file now just contributes no liveness signal, which
+            # is exactly what exists()==False meant before.
+            try:
+                mtime = datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc)
+                if (now - mtime).total_seconds() < 3600:
+                    is_live = True
+            except OSError:
+                pass
 
         if is_live:
             live.append(LiveSession(
@@ -6411,12 +11410,23 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     now = datetime.now(timezone.utc)
 
     # Group by pane; latest entry overwrites (entries are oldest-first).
+    # GH #90/#95: entries_by_pane keeps the FULL per-pane entry list (same
+    # oldest-first order) for the step-1.5 cmdline-staleness sweep below.
+    # That sweep used to re-scan ALL of `entries` once per live pane —
+    # filtering on pane inside the loop and fromisoformat-parsing every
+    # line's timestamp each time — an O(total_entries x live_panes) pass
+    # over an append-only log (~14.6k lines on the incident box). Grouping
+    # here is one O(total_entries) pass; the sweep then touches only its
+    # own pane's entries. Identical subset, identical order, no semantic
+    # change — pure loop restructure.
     by_pane: dict[str, dict] = {}
+    entries_by_pane: dict[str, list[dict]] = {}
     for e in entries:
         pane = e.get("pane", "")
         if not pane or pane == "no-tmux":
             continue
         by_pane[pane] = e
+        entries_by_pane.setdefault(pane, []).append(e)
 
     # GH #22: count how many panes share each cwd. The newest-mtime
     # fallback (step 3 below) is CWD-wide and can't disambiguate between
@@ -6545,9 +11555,12 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         # uncompetitive (best_mtime stays 0 and any newer-than-1h pe wins).
         if best_mtime > 0 and (now_ts - best_mtime) > active_mtime_window:
             best_mtime = 0.0
-        for pe in entries:
-            if pe.get("pane") != pane:
-                continue
+        # GH #90/#95: iterate only THIS pane's entries (pre-grouped above in
+        # the same pass that built by_pane) instead of re-scanning the whole
+        # log per pane. The old `if pe.get("pane") != pane: continue` filter
+        # is exactly what the grouping applied, so subset and order are
+        # unchanged — this is the O(n x panes) -> O(n) half of the fix.
+        for pe in entries_by_pane.get(pane, ()):
             pe_ts_str = pe.get("ts")
             if not pe_ts_str:
                 continue
@@ -7780,16 +12793,31 @@ def status() -> None:
     if per_session:
         click.echo(f"Mode: per_session (global mount observe-only). Bare-launch account: {state['active']}")
     elif mode == "hybrid":
-        click.echo(f"Mode: hybrid (slots + shared mount both managed). Shared-mount account: {state['active']}")
+        click.echo(f"Mode: hybrid (lanes + shared mount both managed). Shared-mount account: {state['active']}")
     else:
         click.echo(f"Active account: {state['active']}")
     click.echo()
-    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Next swap':>12} {'Status':<24} {'Last swap':<28}")
-    click.echo("-" * 104)
+    # Ladder steps are IDENTICAL across accounts — they're the config's
+    # thresholds.steps progression, not a per-account value — so printing the
+    # first step ("Next swap") on every row was pure noise. Show the whole
+    # ladder ONCE here as a legend; the per-row value only reappears below for
+    # an account whose next_swap_at_pct has advanced off the first step
+    # (mid-ladder / non-default), which genuinely IS per-account.
+    cfg_steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    first_step = cfg_steps[0] if cfg_steps else 50
+    click.echo("Ladder steps: " + " → ".join(f"{s}%" for s in cfg_steps))
+    click.echo()
+    click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
+    click.echo("-" * 91)
+    disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
         marker = " *" if name == state["active"] else ""
         last = a.get("last_swap_ts") or "never"
         flags = []
+        # Operator out-of-rotation flag (config, not polled state) — surfaced
+        # here so nobody wonders why the picker never chooses this account.
+        if name in disabled:
+            flags.append("DISABLED")
         if a.get("token_expired"):
             flags.append("TOKEN_EXPIRED")
         if a.get("rate_limited"):
@@ -7809,22 +12837,37 @@ def status() -> None:
             if est - polled >= 1.0:
                 rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
                 est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {a.get('next_swap_at_pct', 50):>12} {status_col:<24} {last:<28}{est_note}")
+        # Show next_swap_at_pct ONLY when it's advanced off the shared first
+        # ladder step (the legend above already prints that) — i.e. this account
+        # is mid-ladder / carries a non-default value, which is the only case
+        # worth a per-row callout.
+        nxt_val = a.get("next_swap_at_pct", first_step)
+        nxt_note = f"  [next-swap: {nxt_val:.0f}%]" if nxt_val != first_step else ""
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {status_col:<24} {last:<28}{nxt_note}{est_note}")
         # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
         # sub-line only for accounts that have any, sorted highest-first so a
         # model nearing its own weekly cap is the first thing the eye lands on.
         # 5h is intentionally absent — the API has no per-model 5h window.
         pm = a.get("per_model_weekly_pct") or {}
         if pm:
-            parts = "  ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+            # Mark per-model numbers stale (dim + trailing '~') for any account
+            # we couldn't freshly observe — a token_stale account's cached
+            # `Fable=100%` printed bare read as an authoritative current value
+            # and drove a wrong swap (2026-07-05 incident). See _fmt_model_pct.
+            parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
+                              for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
-    # Slots (per_session): slot → account → live pids, with any orphan dirs.
+    # Lanes (per_session): lane → account → live pids, with any orphan dirs.
+    # "Lane" is the operator-facing name (GH #109 Phase 4); the slot-N
+    # identifiers underneath stay — they're on-disk dir names and live
+    # sessions' CLAUDE_CONFIG_DIR paths, so renaming THEM is a breaking
+    # migration (tracked separately), not a display fix.
     slots_state = state.get("slots", {}) or {}
     slot_dirs_on_disk = list_slot_dirs()
     if slots_state or slot_dirs_on_disk:
-        click.echo("Slots:")
+        click.echo("Lanes:")
         seen = set()
         locked_slot_names = _locked_slots(config)
         # GH #109 independent-login annotation. Stay invisible until the feature
@@ -7832,7 +12875,8 @@ def status() -> None:
         # login has been provisioned — so users not using it see no new column.
         il_cfg = config.get("independent_logins", {})
         il_flag = il_cfg.get("use_independent_logins", False)
-        il_visible = il_flag or bool(list_provisioned_logins())
+        il_visible = (il_flag or bool(list_provisioned_logins())
+                      or any(list_login_families(a) for a in state["accounts"]))
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
@@ -7847,7 +12891,16 @@ def status() -> None:
             login_col = ""
             if il_visible and entry.get("account"):
                 acct = entry["account"]
-                if has_independent_login(acct, d.name):
+                _lease = slot_leased_family(state, d.name)
+                if _lease and _lease[0] == acct:
+                    # Pool model: this lane is running a borrowed backup family.
+                    login_col = click.style(f"  [pool {_lease[1]}]", fg="green")
+                elif list_login_families(acct):
+                    # Account has a pool to borrow from → covered, not "missing".
+                    # (This lane holds the primary; it can claim a family if it
+                    # ever needs to double-book.)
+                    login_col = click.style("  [pool avail]", fg="green")
+                elif has_independent_login(acct, d.name):
                     login_col = click.style("  [indep-login ✓]", fg="green")
                 elif il_flag:
                     # Gate is ON but no login provisioned → this swap will fall
@@ -7858,6 +12911,22 @@ def status() -> None:
             click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{pool_col}{login_col}{orphan}")
         for name in sorted(set(slots_state) - seen):
             click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
+        click.echo()
+
+    # Login pools (GH #109 pool model): per-account backup-family depth + how
+    # many are currently free (not leased to a live lane). Stays invisible until
+    # a pool exists, so users not using the feature see nothing new.
+    pool_rows = [(n, list_login_families(n)) for n in sorted(state["accounts"])]
+    pool_rows = [(n, fams) for n, fams in pool_rows if fams]
+    if pool_rows:
+        want = config.get("independent_logins", {}).get("pool_size", 3)
+        gate_note = "" if config.get("independent_logins", {}).get("use_independent_logins", False) \
+            else click.style("  (gate OFF — swaps still copy; set use_independent_logins: true)", fg="yellow")
+        click.echo(f"Login pools (independent backup families):{gate_note}")
+        for n, fams in pool_rows:
+            free = [f for f in fams if f not in leased_families(n, state)]
+            short = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
+            click.echo(f"  {n:<12} {len(fams)} family(ies), {len(free)} free{short}")
         click.echo()
 
     # Locks
@@ -7918,6 +12987,344 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+# --------------------------------------------------------------------------
+# `cus sessions` — one-shot per-pane → slot → account → binding-limit view
+# --------------------------------------------------------------------------
+# Motivation (GH #137): diagnosing "3 panes maxed out" used to take ~6 manual
+# probes (status, slot list, force-poll, /proc greps) AND `cus status`'s Live-
+# sessions column showed the WRONG account — it printed the sessions.log launch-
+# time label (or, in background/hybrid mode, machine_active) for panes that were
+# actually mounted on a different slot's account. This command resolves the TRUE
+# mount from live /proc ground truth and folds usage + pool + the binding
+# constraint into a single read-only table. See docs/DIAGNOSTICS.md.
+
+
+def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
+    """Plain-words BINDING constraint for a lane's account under its pool.
+
+    Returns (severity, text) with severity in {"blocked", "warn", "ok"}:
+      - "blocked": the lane cannot make progress on some axis right now — 5h/7d
+        saturated, a dead/expired token, or (premium pool only) a per-model
+        weekly cap over the gate. This is the wall a maxed-out pane is hitting.
+      - "warn": at/over a ladder step — the daemon wants to swap this lane away
+        soon, but it still works right now.
+      - "ok": headroom on every axis the config enforces.
+
+    Two-dimensional exhaustion (see docs/DIAGNOSTICS.md): the 5h/7d windows and
+    the per-model weekly budget are INDEPENDENT walls. A premium lane under its
+    5h cap can still be blocked by a Fable weekly cap; a STANDARD lane ignores
+    the model gate entirely (its work doesn't touch the exhausted model — see
+    _config_for_pool), so we surface the number but say it's ignored rather than
+    hide it. Pure function of (account-state dict, pool, config) so the daemon-
+    less unit tests can exercise every branch without /proc or tmux.
+    """
+    # Blocker flags first — a stale/expired token means the stored % may be a
+    # lie (last-known-good, possibly hours old), so the token state IS the
+    # binding fact, not whatever number happens to be cached.
+    if acct.get("token_expired"):
+        return ("blocked", "token expired (no live creds — relogin needed)")
+    if acct.get("poll_error"):
+        return ("blocked", "poll error (usage unknown)")
+    if acct.get("rate_limited"):
+        return ("blocked", "rate-limited (429)")
+
+    five = acct.get("current_5h_pct", 0.0) or 0.0
+    seven = acct.get("current_7d_pct", 0.0) or 0.0
+    # Effective % honors thresholds.{five_hour,seven_day} exactly like the
+    # ladder logic (current_max_pct / _account_effective_pct), so this reads the
+    # same window the daemon actually swaps on. Label it by whichever window is
+    # the higher of the two enabled ones for an at-a-glance "which wall".
+    eff = _account_effective_pct(acct, config)
+    win = "5h" if five >= seven else "7d"
+
+    # 5h/7d hard wall — never_swap_to_pct is the "fully saturated, do not use"
+    # line (default 100). At/over it the lane is churning context and re-tripping
+    # 429s; that's the maxed-out signature the operator is chasing.
+    full_line = config.get("never_swap_to_pct", 100)
+    if eff >= full_line:
+        return ("blocked", f"{win} {eff:.0f}% (hard cap {full_line:.0f}%)")
+
+    # Per-model weekly gate. Only PREMIUM lanes honor it; standard lanes treat a
+    # model-exhausted account as still usable (aggregate headroom serves
+    # standard-model work). Gate must be enabled in config for this to bind.
+    gate_enabled = config.get("per_model_weekly", {}).get("gate_enabled", False)
+    pm = acct.get("per_model_weekly_pct") or {}
+    top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
+    model_cap = _model_weekly_cap_for_config(config)
+    # A token_stale account passes the blocker-flag checks above (token_stale is
+    # NOT among them — its 5h is still last-known-good), so it reaches here with
+    # a cached per_model_weekly_pct that may be hours old. Never let a STALE
+    # per-model % drive a hard "premium gate" block: that is exactly the verdict
+    # that moved a live Fable session off an account which actually had Fable
+    # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
+    # surface the number marked '~' in the headroom line below instead.
+    model_stale = _model_pct_is_stale(acct)
+    if gate_enabled and not model_stale and top_model is not None and top_pct >= model_cap:
+        if pool == "standard":
+            # Surface the number but make clear it does NOT bind this lane.
+            return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
+        return ("blocked", f"weekly-{top_model} {top_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
+
+    # Graduated ladder pressure (swap-away, not a hard block). The highest
+    # tripped step is what the daemon reacts to.
+    steps = config.get("thresholds", {}).get("steps") or [50, 75, 90]
+    tripped = [s for s in steps if eff >= s]
+    if tripped:
+        return ("warn", f"{win} {eff:.0f}% >= ladder step {max(tripped):.0f}% (swap-away due)")
+
+    # Headroom on every enforced axis.
+    txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
+    if pm:
+        # _fmt_model_pct marks the number '~' when it's stale (token_stale et
+        # al.) so it never reads as an authoritative current value (2026-07-05).
+        txt += f", {top_model} {_fmt_model_pct(acct, top_pct)}"
+        if gate_enabled and pool == "standard":
+            txt += " [std: model gate off]"
+        elif model_stale:
+            # Stale per-model was skipped by the gate above — say so, so the
+            # operator repolls before trusting it rather than reading "ok" as
+            # "Fable confirmed clear".
+            txt += " [stale — repoll to confirm]"
+    txt += ")"
+    return ("ok", txt)
+
+
+def _resolve_mount_account(mount: str | None, state: dict) -> tuple[str | None, str]:
+    """Resolve a live mount's TRUE account + the evidence source used.
+
+    Ground-truth ladder for GH #137, strongest evidence first:
+      1. on-disk oauthAccount — the slot/account dir's .claude.json is what
+         Claude Code actually authenticates as, independent of BOTH sessions.log
+         (launch-time label) and state.slots (the daemon's record, which itself
+         lags an in-place move by up to a cycle). Reverse-mapped to an account
+         name via each account's canonical snapshot identity.
+      2. state.slots[mount].account — the daemon's recorded occupant, used when
+         the on-disk identity matches no known account (e.g. a pooled backup
+         login the snapshots don't cover).
+      3. account-<name> mount — a relogin-style launch where the dir IS the
+         account name.
+
+    Returns (account_or_None, source) where source is one of
+    {"disk-identity", "state-slot", "account-dir", "unresolved"}.
+    """
+    if not mount:
+        return (None, "unresolved")
+    if mount.startswith("account-"):
+        # A relogin/login-mount launch: the dir name is the account. Still
+        # prefer the on-disk identity if it resolves (catches a mislabeled dir).
+        disk = _account_for_mount_identity(slot_path(mount), state)
+        if disk:
+            return (disk, "disk-identity")
+        return (mount.removeprefix("account-"), "account-dir")
+    # Slot mount: on-disk identity wins, else the daemon's recorded occupant.
+    disk = _account_for_mount_identity(slot_path(mount), state)
+    if disk:
+        return (disk, "disk-identity")
+    recorded = (state.get("slots", {}).get(mount, {}) or {}).get("account")
+    if recorded:
+        return (recorded, "state-slot")
+    return (None, "unresolved")
+
+
+def _account_for_mount_identity(mount: Path, state: dict) -> str | None:
+    """Reverse-map a live mount's ON-DISK oauthAccount to an account name.
+
+    The slot dir's .claude.json oauthAccount is the authoritative account
+    identity (the 2026-07-01 duplicate-identity incident proved meta.yaml can
+    lie while oauthAccount holds truth). Matches on accountUuid/emailAddress
+    against each account's canonical snapshot. Returns None when the mount has
+    no readable identity or nothing matches (a login family the snapshots don't
+    cover — the caller falls back to state.slots)."""
+    cj = mount / ".claude.json"
+    if not cj.exists():
+        return None
+    try:
+        ident = _identity_fields(read_json(cj))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not ident:
+        return None
+    for name in state.get("accounts", {}):
+        if _identities_match(ident, _dir_identity(name)) is True:
+            return name
+    return None
+
+
+def build_session_rows(resolved: list[dict], state: dict, config: dict) -> list[dict]:
+    """Assemble display rows from already-resolved sessions. PURE (no I/O).
+
+    Each `resolved` entry carries the /proc-resolved facts the command gathered:
+      {session_id, pane, cwd, logged_account, mount, resolved_account, source}
+    where `mount` is 'slot-N'/'account-X'/None, `logged_account` is the
+    sessions.log launch-time label, and `resolved_account` is the TRUE account
+    from _resolve_mount_account. Factored out so the drift + binding logic is
+    unit-testable without tmux/proc (see tests/test_sessions_view.py).
+    """
+    default_pool = config.get("per_session", {}).get("default_pool", "premium")
+    rows: list[dict] = []
+    for r in resolved:
+        mount = r.get("mount")
+        is_slot = bool(mount) and mount.startswith(SLOT_PREFIX)
+        resolved_account = r.get("resolved_account")
+        acct = state.get("accounts", {}).get(resolved_account, {}) if resolved_account else {}
+        pool = _slot_pool(state, mount, config) if is_slot else None
+
+        if resolved_account and acct:
+            sev, binding = _session_binding(acct, pool or default_pool, config)
+        elif resolved_account:
+            sev, binding = ("unknown", "no usage state for resolved account")
+        else:
+            sev, binding = ("unknown", "mount unresolved (bare/global — observe-only)")
+
+        # DRIFT (GH #137): sessions.log's launch-time label disagrees with the
+        # account the live mount actually resolves to. Only meaningful when we
+        # resolved a real mount — a bare/global pane has no mount to compare and
+        # "follows global creds" by design, which is not the #137 defect.
+        logged = r.get("logged_account")
+        drift = bool(mount) and bool(resolved_account) and logged != resolved_account
+
+        rows.append({
+            "session_id": r.get("session_id"),
+            "pane": r.get("pane"),
+            "cwd": r.get("cwd"),
+            "mount": mount,
+            "slot": mount if is_slot else None,
+            "bare": mount is None,
+            "pool": pool,
+            "logged_account": logged,
+            "account": resolved_account,
+            "resolution_source": r.get("source", "unresolved"),
+            "drift": drift,
+            "five_h_pct": acct.get("current_5h_pct"),
+            "seven_d_pct": acct.get("current_7d_pct"),
+            "per_model_weekly": dict(acct.get("per_model_weekly_pct") or {}),
+            "binding_severity": sev,
+            "binding": binding,
+        })
+    return rows
+
+
+def detect_slot_orphans(slot_pids: dict[str, int], panes_on_slot: set) -> list[dict]:
+    """Slots holding live /proc pids that NO live tmux pane owns. PURE.
+
+    Two shapes of the same leak (see docs/DIAGNOSTICS.md): a slot whose owning
+    pane was closed while a subprocess kept the mount's CLAUDE_CONFIG_DIR alive,
+    or a stray process carrying a slot's config dir with no pane at all. Both
+    read as "the mount is in use, but nobody is driving it" — the slot won't be
+    reaped by idle-gc and won't accept a fresh session cleanly.
+
+    `slot_pids` is {slot_name: pid_count} for slots with >=1 live pid;
+    `panes_on_slot` is the set of slot names a live pane currently resolves to.
+    """
+    return [{"slot": s, "pids": n}
+            for s, n in sorted(slot_pids.items()) if s not in panes_on_slot]
+
+
+@cli.command(name="sessions")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+def sessions_cmd(as_json: bool) -> None:
+    """Per-pane -> slot -> account -> binding-limit view of live sessions.
+
+    Resolves each live Claude pane's TRUE account from the live mount (/proc
+    ground truth), NOT the stale sessions.log launch-time label, and shows in
+    one shot: the slot it's mounted in, that account's 5h/7d/per-model usage,
+    the slot's pool, and the BINDING constraint in plain words. Flags DRIFT
+    (sessions.log account disagrees with the resolved mount — GH #137) and
+    ORPHAN slots (live pids, no owning pane). READ-ONLY.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    state = read_json(STATE_JSON)
+    config = load_config()
+    color_on = sys.stdout.isatty() and not as_json
+
+    # Resolve every live session's TRUE mount from /proc, then hand the pure
+    # facts to build_session_rows. pane_mount_name is the same primitive `status`
+    # per_session mode trusts (~8886) — reused here across ALL modes, which is
+    # the actual #137 fix (the non-per_session branches ignored the mount).
+    live = find_live_sessions()
+    resolved_inputs: list[dict] = []
+    panes_on_slot: set[str] = set()
+    for s in live:
+        mount = pane_mount_name(s.pane)
+        if mount and mount.startswith(SLOT_PREFIX):
+            panes_on_slot.add(mount)
+        acct, source = _resolve_mount_account(mount, state)
+        resolved_inputs.append({
+            "session_id": s.session_id,
+            "pane": s.pane,
+            "cwd": s.cwd,
+            "logged_account": s.account,
+            "mount": mount,
+            "resolved_account": acct,
+            "source": source,
+        })
+    rows = build_session_rows(resolved_inputs, state, config)
+
+    # Orphan sweep: slots with live pids that no live pane resolves to.
+    slot_pids: dict[str, int] = {}
+    for d in list_slot_dirs():
+        pids = mount_pids(d)
+        if pids:
+            slot_pids[d.name] = len(pids)
+    orphans = detect_slot_orphans(slot_pids, panes_on_slot)
+
+    if as_json:
+        click.echo(json.dumps({
+            "mode": config.get("mode", "global"),
+            "active": state.get("active"),
+            "sessions": rows,
+            "orphans": orphans,
+        }, indent=2, default=str))
+        return
+
+    mode = config.get("mode", "global")
+    disabled_set = _disabled_accounts(config)
+    click.echo(f"Mode: {mode}   Machine-active (bare-launch) account: {state.get('active', '?')}")
+    click.echo()
+    if not rows:
+        click.echo("No live Claude sessions detected.")
+    else:
+        click.echo(f"Live sessions ({len(rows)}):")
+        for r in rows:
+            sid = (r["session_id"] or "????????")[:8]
+            where = r["slot"] or (r["mount"] or click.style("bare", fg="yellow"))
+            pool = f" [{r['pool']}]" if r["pool"] else ""
+            acct = r["account"] or "?"
+            # Mark an account the operator disabled — a lane already on it keeps
+            # running (disable is future-rotation-only), so it CAN show up live;
+            # the tag stops the operator wondering why a "disabled" account is in use.
+            if r["account"] and r["account"] in disabled_set:
+                acct = f"{acct} {click.style('[disabled]', fg='yellow')}"
+            # Line 1: identity + where mounted.
+            drift_tag = ""
+            if r["drift"]:
+                drift_tag = click.style(f"  DRIFT: sessions.log said '{r['logged_account']}'", fg="red", bold=True)
+            click.echo(f"  {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
+            # Line 2: usage numbers.
+            five = "?" if r["five_h_pct"] is None else f"{r['five_h_pct']:.0f}%"
+            seven = "?" if r["seven_d_pct"] is None else f"{r['seven_d_pct']:.0f}%"
+            pm = r["per_model_weekly"]
+            pm_txt = ("  " + " ".join(f"{m}={p:.0f}%" for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))) if pm else ""
+            click.echo(f"            5h={five:<5} 7d={seven:<5}{pm_txt}")
+            # Line 3: the binding constraint, colored by severity.
+            sev = r["binding_severity"]
+            color = {"blocked": "red", "warn": "yellow", "ok": "green"}.get(sev)
+            label = click.style(r["binding"], fg=color) if (color_on and color) else r["binding"]
+            click.echo(f"            -> {label}")
+            click.echo(f"            cwd={r['cwd']}")
+    click.echo()
+
+    if orphans:
+        click.echo(click.style(f"Orphan slots ({len(orphans)}) — live pids, no owning pane:", fg="yellow"))
+        for o in orphans:
+            click.echo(f"  {o['slot']:<10} {o['pids']} pid(s) held; no live tmux pane resolves here")
+        click.echo("  -> a closed pane left a subprocess holding the mount, or a stray CLAUDE_CONFIG_DIR process.")
+        click.echo("     idle-gc won't reap it and a fresh session won't mount cleanly. Investigate the pids.")
+        click.echo()
 
 
 @cli.command(name="check-orchestrate")
@@ -8291,11 +13698,36 @@ def force_poll(account: str) -> None:
         sys.exit(4)
     acct = state["accounts"][account]
     if u.token_stale:
-        minutes = u.raw.get("expired_minutes_ago", "?")
-        click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token still valid; account remains usable). State updated to clear any prior token_expired flag.")
+        # Reflect the stale flag in state first, so the Fix 4 un-stale helper
+        # (which gates on acct['token_stale']) can act on it.
         update_state_with_usage(state, {account: u})
-        save_state(state)
-        sys.exit(0)
+        # Fix 4 (2026-07-07): force-poll is the operator's explicit "revive it"
+        # lever. Before accepting the stale flag, try to un-stale via a DIRECT
+        # OAuth refresh grant (no session, no billed tokens) — writes a fresh
+        # access token into the account snapshot and clears token_stale — then
+        # re-poll for live numbers. force=True bypasses the burnout cooldown (an
+        # operator explicitly asked). A DEAD refresh token can't be revived → keep
+        # the stale message + exit (that one needs a browser relogin).
+        if _unstale_account_snapshot(account, state, config, force=True):
+            save_state(state)  # persist the cleared flag + fresh snapshot at once
+            click.echo(f"  UN-STALED {account} — minted a fresh access token via a direct OAuth "
+                       f"refresh grant and cleared token_stale; re-polling for live numbers.")
+            u = poll_account_usage(account)
+            state = load_state()
+            if account not in state.get("accounts", {}):
+                click.echo(f"  account '{account}' disappeared from state.json mid-repoll; not saving")
+                sys.exit(4)
+            acct = state["accounts"][account]
+        if u.token_stale:
+            # Un-stale failed (dead refresh token) OR the re-poll is somehow still
+            # stale — don't loop; record and exit with the recoverable-stale note.
+            minutes = u.raw.get("expired_minutes_ago", "?")
+            click.echo(f"  TOKEN_STALE — stored access token expired {minutes}m ago (refresh token "
+                       f"still valid; account remains usable). A direct refresh grant could not revive "
+                       f"it now; if it persists, re-login: cus relogin {account}.")
+            update_state_with_usage(state, {account: u})
+            save_state(state)
+            sys.exit(0)
     if u.token_expired:
         # GH #77 auto-heal hint (same as `cus poll`): a fresher snapshot means
         # the re-login already happened — only the snapshot→live sync is missing.
@@ -8323,6 +13755,185 @@ def force_poll(account: str) -> None:
     update_state_with_usage(state, {account: u})
     maybe_reset_thresholds(state, config)
     save_state(state)
+
+
+def _known_account_names() -> set[str]:
+    """Every account name cus knows about, from any of its three ledgers.
+
+    disable/enable must accept a name the operator can plausibly reference even
+    if it isn't in every ledger yet:
+      - state.json accounts  — has been polled at least once,
+      - config.yaml accounts — registered for strategy/priority,
+      - account-<name>/ dir  — a snapshot exists on disk (e.g. freshly `cus add`ed
+        but never polled, or the poisoned rayi1 whose canonical store is bad).
+    Union of all three, so `cus disable rayi1` works the moment the dir exists.
+    """
+    names: set[str] = set()
+    try:
+        names |= set(load_state().get("accounts", {}).keys())
+    except (json.JSONDecodeError, OSError):
+        pass
+    if CONFIG_YAML.exists():
+        try:
+            for a in read_yaml(CONFIG_YAML).get("accounts", []):
+                if isinstance(a, dict) and a.get("name"):
+                    names.add(str(a["name"]))
+        except (yaml.YAMLError, OSError):
+            pass
+    if ACCOUNTS_DIR.exists():
+        for d in ACCOUNTS_DIR.glob("account-*"):
+            if d.is_dir():
+                names.add(d.name[len("account-"):])
+    return names
+
+
+def _live_lanes_for_account(name: str) -> list[str]:
+    """Where `name` is currently mounted live (shared active + occupied slots).
+
+    Used to WARN on `cus disable`: disabling governs FUTURE rotation only — it
+    never evicts a lane that is already running on the account (a locked slot
+    especially must be untouched). This just tells the operator which live
+    mounts will keep using the account until they exit on their own. Best-effort
+    / degrade-to-empty; never blocks the disable on an I/O hiccup.
+    """
+    try:
+        state = load_state()
+    except (json.JSONDecodeError, OSError):
+        return []
+    where: list[str] = []
+    if state.get("active") == name:
+        where.append("shared mount (active)")
+    try:
+        for slot in occupied_slot_accounts(state).get(name, []):
+            where.append(slot)
+    except Exception:
+        pass
+    return where
+
+
+@cli.command()
+@click.argument("account", required=True)
+@click.option("--reason", default=None, help="Free-text note on WHY this account is disabled (e.g. 'poisoned canonical store — needs relogin'). Shown in `cus status` and the disabled-account SOS line.")
+def disable(account: str, reason: str | None) -> None:
+    """Take an account OUT of rotation, persistently and reversibly.
+
+    Motivating case (2026-07-06): rayi1's canonical store got clobbered with
+    ANOTHER account's identity, so polling it returns the WRONG account's usage
+    and it cannot be trusted as a swap target until a browser relogin repairs
+    it. `cus disable rayi1` removes it cleanly until then; `cus enable rayi1`
+    puts it back.
+
+    What disabling does (writes `disabled: true` to the account's entry in
+    config.yaml — the durable config, so it survives daemon restarts):
+      - the account is NEVER chosen as a swap/launch target, for any strategy,
+        even as the only candidate and with no degraded-pool fallback (operator
+        mandate outranks "swap somewhere rather than sit hot") — see
+        `_disabled_accounts` / `pick_swap_target`;
+      - it stops counting toward premium-headroom "valid target" scarcity math;
+      - any outstanding URGENT/WARNING SOS for it (poisoned canonical store,
+        token expired, ...) is DOWNGRADED to one soft INFO line — a deliberately
+        parked account should not scream.
+
+    What disabling deliberately does NOT do — it governs FUTURE rotation only:
+      - it does not delete the account dir, credentials, or state;
+      - it does not move or evict a lane already mounted on the account (a
+        locked slot especially is left alone) — those keep running until they
+        exit on their own;
+      - it does not stop `cus force-poll <account>` (so you can check the
+        account after a relogin, before `cus enable`).
+
+    Backward-compatible: absent/false key ⇒ enabled, so existing configs are
+    unaffected. Idempotent: disabling an already-disabled account is a friendly
+    no-op. Reverse with `cus enable <account>`.
+    """
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    known = _known_account_names()
+    if account not in known:
+        click.echo(click.style(
+            f"Unknown account '{account}'. Known: {', '.join(sorted(known)) or '(none)'}", fg="red"))
+        sys.exit(1)
+
+    user_cfg = read_yaml(CONFIG_YAML)
+    accounts = user_cfg.setdefault("accounts", [])
+    entry = next((a for a in accounts if isinstance(a, dict) and a.get("name") == account), None)
+    if entry is None:
+        # The account exists on disk / in state but was never registered in
+        # config.yaml's accounts list (the disabled flag has to live SOMEWHERE
+        # the picker reads it — `_disabled_accounts` scans exactly this list).
+        # Add a minimal entry, mirroring the `cus init` auto-registration path.
+        entry = {"name": account, "priority": 1}
+        accounts.append(entry)
+
+    if entry.get("disabled"):
+        # Idempotent no-op — do not re-stamp disabled_at or clobber the original
+        # reason (that history is more useful than "re-disabled just now").
+        prior = entry.get("disabled_reason")
+        click.echo(f"{account} is already disabled"
+                   + (f" (reason: {prior})" if prior else "")
+                   + f". Re-enable with `cus enable {account}`.")
+        return
+
+    entry["disabled"] = True
+    if reason:
+        entry["disabled_reason"] = reason
+    entry["disabled_at"] = now_iso()
+    write_yaml(CONFIG_YAML, user_cfg)
+
+    click.echo(click.style(f"Disabled '{account}' — it is now OUT of rotation.", fg="yellow", bold=True))
+    if reason:
+        click.echo(f"  reason: {reason}")
+    click.echo(f"  The daemon will never swap or launch ONTO '{account}' until you re-enable it.")
+    click.echo(f"  Re-enable with: cus enable {account}")
+    # Live-lane warning: disable is future-rotation-only, so a lane already on
+    # the account keeps running — say so, or the operator wonders why a live
+    # session is still using a "disabled" account.
+    live = _live_lanes_for_account(account)
+    if live:
+        click.echo(click.style(
+            f"  note: '{account}' is CURRENTLY live on: {', '.join(live)}. "
+            f"These are left running (disable governs future rotation only); "
+            f"they'll release the account when they exit.", fg="yellow"))
+    # The daemon re-reads config every cycle, but a systemd-managed daemon does
+    # not pick up mid-cycle file edits instantly — nudge a restart for immediacy.
+    click.echo("  (running daemon picks this up next cycle; `systemctl --user restart cus.service` to apply now.)")
+
+
+@cli.command()
+@click.argument("account", required=True)
+def enable(account: str) -> None:
+    """Put a previously `cus disable`d account BACK into rotation.
+
+    Clears the `disabled` flag (and its `disabled_reason` / `disabled_at`
+    companions) from the account's config.yaml entry. Idempotent: enabling an
+    account that is already enabled is a friendly no-op. Errors if the account
+    name is unknown.
+    """
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    known = _known_account_names()
+    if account not in known:
+        click.echo(click.style(
+            f"Unknown account '{account}'. Known: {', '.join(sorted(known)) or '(none)'}", fg="red"))
+        sys.exit(1)
+
+    user_cfg = read_yaml(CONFIG_YAML)
+    accounts = user_cfg.get("accounts", []) or []
+    entry = next((a for a in accounts if isinstance(a, dict) and a.get("name") == account), None)
+    if entry is None or not entry.get("disabled"):
+        # Absent entry or absent/false key both mean "already in rotation" — a
+        # no-op, not an error (backward-compat: unknown/absent key ⇒ enabled).
+        click.echo(f"{account} is already enabled (in rotation). Nothing to do.")
+        return
+
+    entry.pop("disabled", None)
+    entry.pop("disabled_reason", None)
+    entry.pop("disabled_at", None)
+    write_yaml(CONFIG_YAML, user_cfg)
+    click.echo(click.style(f"Enabled '{account}' — it is back IN rotation.", fg="green", bold=True))
+    click.echo("  (running daemon picks this up next cycle; `systemctl --user restart cus.service` to apply now.)")
 
 
 # GH #76: fd holding the daemon single-instance flock. Module-level on
@@ -8450,7 +14061,47 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         click.echo(f"startup swap-journal check skipped: {e}")
 
     def _emit_sos_after(state: dict, config: dict) -> None:
+        # Fix 1 (2026-07-07 blank-mount PREEMPT): FIRST — before any heal or
+        # diagnose — proactively refresh live lane mounts that are near-expiry-AND
+        # -idle, the state that PRECEDES the classic blank (Claude Code's own
+        # in-place refresh failing mid-write). Keeping the mount ahead of expiry
+        # means Claude Code never needs its fragile refresh, so the mount never
+        # blanks — breaking the heal→blank→heal cycle at its source. A preempted
+        # mount is rewritten (fresh mtime), so the warn scan below then sees it
+        # self-maintaining and stays silent. No-op outside per_session/hybrid or
+        # when disabled; degrades to the warn+heal path on any refresh failure.
+        _preempt_live_lane_blanks(state, config, no_execute=no_execute)
+        # GH #141 self-heal: BEFORE diagnosing, try to auto-restore a blanked
+        # live shared mount (global/hybrid only; no-op elsewhere or when healthy).
+        # Running it here — the one place every served-mount cycle path funnels
+        # through after the existing detection — means a healable blank never
+        # reaches the operator as an URGENT SOS: the heal fixes the live file and
+        # the diagnose() below then sees it valid. Only a mount with NO usable
+        # backup falls through to the URGENT re-login SOS (needs a human).
+        _auto_heal_live_mount(state, config, no_execute=no_execute)
+        # GH #141 follow-up (2026-07-05 slot-2): the shared-mount heal above never
+        # looked at per-slot LANE mounts, so a blanked lane (Claude's own logout /
+        # a crash mid-write) sat locked out until fixed by hand. Same funnel, same
+        # discipline: heal every LIVE lane whose own creds are blanked BEFORE
+        # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
+        # global mode / when no lane is blanked.
+        _auto_heal_live_lanes(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
+        # PRE-EMPTIVE creds-health early-warning (2026-07-06): AFTER the reactive
+        # auto-heals above (so a just-healed mount reads valid, not near-blank) and
+        # AFTER diagnose() (so a genuinely blanked mount surfaces as its URGENT, not
+        # doubled by a WARNING — the predicate returns None for blanks). Scans every
+        # LIVE mount and appends soft WARNINGs for tokens AGING toward expiry/blank
+        # before they fail. Merged into the same conditions list so they ride the
+        # existing SOS.md write + notify de-dup (`maybe_write_sos`).
+        conditions.extend(_diagnose_live_mounts_creds_health(state, config))
+        # Fix 2 (2026-07-07 STUCK-SESSION escalation): a lane auto-healed
+        # repeatedly (heal→blank→heal within the stuck window) means the file-heal
+        # is NOT un-sticking the live process — it cached the logged-out state and
+        # needs a RELAUNCH. Append the distinct URGENT so the operator knows a
+        # file-heal won't help. Reads the in-process heal history recorded by
+        # `_auto_heal_live_lanes` above.
+        conditions.extend(_diagnose_stuck_lanes(state, config))
         maybe_write_sos(conditions, state)
         if conditions:
             for c in conditions:
@@ -8535,6 +14186,24 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
 
         # 2. Update state
         update_state_with_usage(state, usage_by_account)
+        # Fix 4 (2026-07-07): cheap self-healing pass — un-stale every account the
+        # poll just left token_stale (idle account, valid refresh token) via a
+        # direct OAuth refresh grant. Keeps cus's readings correct and prevents the
+        # "stale snapshot → blank on install" when a lane later swaps onto it.
+        # Cooldown-bounded (no burnout); no-op when disabled or nothing is stale.
+        for _unstaled in _sweep_unstale_idle_accounts(state, config):
+            click.echo(f"  un-staled idle account {_unstaled}: minted a fresh access token via a "
+                       f"direct OAuth refresh grant and cleared token_stale (Fix 4)")
+        # clock_keepalive (2026-07-07 operator directive): keep every DORMANT
+        # account's fixed 5h usage window TICKING with a cheap "hi" ping, so the
+        # whole fleet cycles through 5h windows continuously and resets on a
+        # rolling basis (always-fresh capacity on tap). Cooldown-bounded, skips
+        # live/disabled/backoff/relogin accounts, and force-re-polls each pinged
+        # account so five_hour_resets_at reflects the now-running clock. Gated by
+        # clock_keepalive.enabled (default on); a failed ping only logs.
+        for _pinged in _sweep_clock_keepalive(state, config):
+            click.echo(f"  clock-keepalive: pinged dormant account {_pinged} to start a fresh "
+                       f"5h window (keeping its clock ticking for rolling capacity)")
         # GH #59: countdown fallback — for any account whose 5h reset elapsed
         # without a fresh poll this cycle, trust the countdown and infer the
         # window reset (5h→0) BEFORE the ladder-reset + decision below, so both
@@ -8785,17 +14454,22 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "accounts": "List of OAuth accounts the daemon manages. Auto-populated by `cus init`. Each has a `name` and `priority`.",
     "poll_interval_seconds": "Fallback poll cadence, used when the differential `polling.active_interval_seconds`/`inactive_interval_seconds` keys are unset. Lower = faster reaction; higher = lighter API load. 60 is the practical floor; 180-300 is the recommended default. NOTE: polling ALL accounts this fast bursts the per-IP-throttled usage endpoint — prefer the differential `polling.*` keys below.",
     "polling": "Poll scheduling + 429 backoff. `active_interval_seconds` (fast, e.g. 45): how often the ACTIVE account is polled — it's the one burning usage, so poll it often enough to catch the ramp before it overshoots the swap threshold. `inactive_interval_seconds` (slow, e.g. 600): how often each idle account is polled (only needed for target selection). `stagger_seconds` (e.g. 2): anti-burst spacing between successive HTTP polls in one cycle so N accounts falling due together don't hit the per-IP throttle as a burst. `base_backoff_seconds`/`max_backoff_seconds` (300/600): exponential per-account backoff after a 429 on /api/oauth/usage. Differential cadence (2026-07-02) exists because flat 60s x N accounts throttled every account into 429 backoff. Both interval keys fall back to `poll_interval_seconds` when unset (backward-compat). See GH #84 for burn-adaptive active cadence.",
+    "poll_accel": "Near-threshold responsiveness (2026-07-06 rayi3 incident: burned from under its 95% step to 100% between two ~180s polls, hit the native usage-limit menu before the swap). Two config-gated fixes: (A) the ladder/cap swap TRIGGER decides on burn-EXTRAPOLATED usage (last poll + rate x time-to-next-poll), so an account at 91%-last-poll but climbing fast trips the 95% step NOW instead of next cycle — extrapolation only ever trips EARLIER, never masks a real over-cap reading; (B) an account whose extrapolated usage is within `within_pct_of_step` (default 5) points of its next step — or projected to cross it before the next normal poll — is polled on `fast_interval_seconds` (default 45) instead of the normal cadence. `enabled: false` reverts BOTH to prior behavior bit-for-bit. Only accounts actually near a step accelerate (the fleet is not blanket-fast-polled), and the 429 poll-backoff gate still wins (a throttled account is never fast-polled). `cluster_within_bonus_pct` (default 10, 2026-07-06 rayi4 incident) WIDENS the near-step band by this many points per EXTRA live lane an account backs, because an account under N concurrent sessions climbs ~N× faster than its single-lane burn_rate predicts — so a clustered near-cap account (rayi4 sat at 84% on the slow cadence) fast-polls early enough to swap a lane off in time. Inert for one-lane-per-account operation.",
+    "spread_lanes": "Anti-clustering lane spread (2026-07-06 incident: the daemon piled ALL live lanes onto ONE burn-soon account — first rayi5, then rayi4 — which over-subscribed its login families → the shared token diverged → a recurring 'mount blanked / not logged in' auto-heal loop, and then all lanes hit that account's 5h cap at once with no time to swap). The scorers rank accounts on usage/burn only, so the same magnet is every lane's top pick each cycle. Two coupled levers, both gated by `enabled: true` (false reverts bit-for-bit): (1) `cluster_penalty` (default 40) subtracts this many score points per live lane already backing a candidate target, so an account that already holds a lane loses to a distinct empty one — this breaks the cross-cycle convergence; (2) `max_stack` (default 1) stops a NON-urgent (deferrable, e.g. burn-before-reset) move from growing an account past this many lanes — the lane HOLDS on its current account instead. Urgent moves (hard-cap / reactive-429 escapes) may still stack via independent login families when clean accounts are genuinely scarce, guarded by the #104/#109 family accounting.",
     "strategy": "Swap target picker — see docs/STRATEGIES.md. `smart` (recommended): hard 7d cap + burn-before-reset for 5h windows about to expire. `headroom`: weighted 5h+7d score with hard 7d cap. `lowest_usage`: cux balanced — sort by 7d util only. `drain`: deplete-current. `strict_priority`: priority order. `round_robin`: cycle by name.",
     "smart_strategy": "Tuning for `smart` strategy. `hard_7d_cap_pct: 80` forces-swap active account at 80% 7d AND filters candidates above 80% (the user's explicit goal: never exceed 80% on the weekly window). `burn_window_hours: 2` + `burn_soon_weight: 1.0` boost candidates whose 5h is ticking AND resets within N hours (prefer to burn before reset). `cold_account_penalty: 0` (default off) deprioritizes accounts at 5h=0% (clock not ticking).",
     "headroom_strategy": "Tuning for `headroom` strategy. Same `hard_7d_cap_pct` filter. `five_hour_weight: 0.7` + `seven_day_weight: 0.3` weight the headroom score.",
     "thresholds": "Progressive per-account thresholds. `steps: [70, 85, 95]` means each account's next_swap_at_pct climbs through these levels as we swap out and return. `five_hour`/`seven_day` toggle which window the threshold applies to. `reset_below_pct` resets the ladder when both windows drop below this value.",
+    "seven_day_reset_hours": "72h seven_day reset detection (2026-07-05, gist: monperrus/3ac4b303a84946bbeaf2b1123ee99491). The Claude `seven_day` \"weekly\" budget actually REFRESHES every ~72h at a fixed UTC anchor (~04:50-05:00 UTC), not every 7 days; the API's seven_day.resets_at is misleading (it points ~7 days out at the oldest-tokens-age-off boundary). cus detects the real reset from a sharp DROP in current_7d_pct and projects the next one this many hours forward (default 72). Tunable if Anthropic changes the cadence.",
+    "seven_day_reset_drop_pct": "Min pct-point DROP in current_7d_pct between two consecutive polls to count as a real 72h seven_day reset rather than noise/jitter (default 15). Pairs with `seven_day_reset_hours`. Raise it if normal fluctuation trips false resets; lower it if a genuine reset is being missed.",
     "hot_swap": "Hot-swap of in-flight tmux sessions. `enabled: false` = swap creds for new sessions only (level 3). `enabled: true` = pause + relaunch existing sessions in their panes (level 4). `tier_2_at_pct` controls when pause-message injection starts; `tier_3_at_pct` controls when force-interrupt kicks in. `pause_message`/`wake_up_message` are the texts sent via tmux send-keys. `cache_bust_window_seconds` defers Tier 1 swaps when prompt cache is still warm (avoid burning rebuild cost).",
     "lazy_swap": "Cache-aware lazy background swap (GH #56). Consulted ONLY when `hot_swap.enabled` is false. A background swap never interrupts a session; its only cost is a one-time prompt-cache rebuild on the live sessions that migrate. So `enabled: true` (default) DEFERS a non-urgent swap (ladder below saturation, burn-before-reset) while any live session's last activity is younger than `cache_window_seconds: 300` (≈ Anthropic's prompt-cache TTL) — it re-fires once the cache is cold (free) or the swap turns urgent. Urgent swaps (hard 7d cap, 5h saturation, reactive 429) are never deferred. Set `enabled: false` to swap immediately on every ladder trip (old behavior). Inspect deferrals with `cus decisions`.",
     "reset_inference": "5h-window reset inference (GH #59). The statusline reset countdown ticks live per-render; this makes the daemon act on it. `enabled: true` (countdown fallback): when a poll didn't refresh an account past its 5h reset (poll failed / 429 backoff / token stale), trust the countdown — treat that window as reset (~0%) for decisions + SOS instead of the stale pre-reset %; the next successful poll supersedes it. `adaptive_repoll: true`: wake just after the soonest known 5h reset (+`repoll_buffer_seconds: 20`, floored by `min_repoll_seconds: 30`) to repoll promptly rather than running on the inferred value for a whole poll_interval. Only ever shortens the sleep.",
+    "token_self_refresh": "OAuth self-refresh for `token_stale` accounts (2026-07-02, GH #13 follow-up). `enabled: true` (default): before flagging an inactive account token_stale, POST a refresh_token grant to the same undocumented endpoint the `claude` CLI itself uses (extracted from the installed binary — not a published API). Costs no usage quota and creates no session, unlike spawning a real `claude` probe session would. Any failure (network, non-200, malformed response) falls straight through to the pre-existing token_stale flag. Set `enabled: false` to revert to never talking to this endpoint, e.g. if Anthropic changes its shape and it starts erroring.",
     "subagent_skip": "Skip-guard for sessions with in-flight subagents/tool calls. `defer_below_tier: 3` means Tier 1/2 skip those panes (per-pane, not whole orchestration — cred swap + other panes still proceed); Tier 3 (force) ALWAYS bypasses the guard regardless of defer_below_tier (GH #27).",
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
-    "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths. `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
+    "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
@@ -9054,6 +14728,43 @@ def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool
     return f"{val:>{width}.{prec}f}"
 
 
+def _model_pct_is_stale(acct: dict) -> bool:
+    """True when an account's per-model WEEKLY numbers can't be trusted as a
+    CURRENT reading (2026-07-05 incident).
+
+    Per-model weekly values are 7-day-window numbers, so they share the 7d
+    window's staleness fate: whenever we can't freshly observe the account
+    (token_stale / rate_limited / token_expired / poll_error — exactly the
+    `_pct_is_unknown(acct, "current_7d_pct")` set) the cached
+    per_model_weekly_pct is last-known-good and may be hours old, or even
+    post-rollover — never an authoritative current number.
+
+    The incident: an operator (and an agent) trusted a token_stale account's
+    cached `Fable=100%` as current and moved a live Fable session off it — but
+    the account actually had Fable headroom; the 100% was a STALE cached value.
+    Bug 1 (this helper) is the DISPLAY half of the fix — mark such numbers stale
+    everywhere they're shown so they can never look current. The DECISION half
+    lives in `_max_model_weekly_from_acct`, which returns 0.0 under the same
+    condition so a stale reading never forces or refuses a swap.
+    """
+    return _pct_is_unknown(acct, "current_7d_pct")
+
+
+def _fmt_model_pct(acct: dict, val: float, color_on: bool = False) -> str:
+    """Render a per-model weekly % with the SAME staleness treatment the
+    aggregate 7d line uses (see `_fmt_pct`): a bare `NN%` only when freshly
+    observed, a dim trailing `~` (`NN%~`) when it's last-known-but-unreconfirmed
+    under token_stale et al. The `~` carries the "not reconfirmed" meaning even
+    with NO_COLOR / a non-color terminal — mirrors `_sl_mark_stale`. Mirroring
+    `_fmt_pct` guarantees a per-model number can never look more current than
+    the aggregate 7d it derives from."""
+    txt = f"{val:.0f}%"
+    if _model_pct_is_stale(acct):
+        marked = f"{txt}~"
+        return click.style(marked, dim=True) if color_on else marked
+    return txt
+
+
 def _fmt_duration(seconds: float) -> str:
     """Format seconds as a short human duration: '5m', '1h23m', '3d', '12d6h'."""
     if seconds < 0:
@@ -9111,12 +14822,22 @@ def _five_hour_rolled_since_poll(acct: dict) -> bool:
     if secs_to_reset is None or secs_to_reset > 0:
         return False  # reset still in the future (or unparseable) — nothing rolled
     reset_age = -secs_to_reset                 # seconds since the reset fired
-    last_poll = acct.get("last_poll_ts")
-    if not last_poll:
-        return True                            # never polled → can't have seen post-reset
-    poll_age = _time_since(last_poll)          # seconds since the last poll
-    # Stale iff the last poll predates the reset (poll older than the reset).
-    return poll_age is not None and poll_age > reset_age
+    # Use last real OBSERVATION, not last poll ATTEMPT (2026-07-03 token-stale
+    # blindness incident, GH #130). This is the crux of the bug: a token_stale
+    # account's Branch 0 keeps restamping last_poll_ts every cycle without ever
+    # observing usage, so `poll_age` stayed tiny and this returned False
+    # forever — the account's 5h window rolled over but the GH #59 countdown
+    # inference never fired, leaving it frozen at a stale-high % (rayi2 sat at
+    # ~99% for 3.7h). last_observed_ts only advances on a SUCCESSFUL poll, so
+    # it correctly ages past the reset. `or last_poll_ts` keeps legacy state
+    # files (written before last_observed_ts existed) on today's behavior until
+    # their first successful poll populates the new field.
+    last_observed = acct.get("last_observed_ts") or acct.get("last_poll_ts")
+    if not last_observed:
+        return True                            # never observed → can't have seen post-reset
+    obs_age = _time_since(last_observed)       # seconds since the last real observation
+    # Stale iff the last observation predates the reset (older than the reset).
+    return obs_age is not None and obs_age > reset_age
 
 
 def _apply_countdown_reset_inference(state: dict, config: dict) -> list[str]:
@@ -9341,18 +15062,26 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
     # can always tell render-time staleness regardless of which branch hit.
     render_stamp = _fmt_render_stamp_eastern()
 
-    # SOS takes priority — if human action is needed, surface it loudly
+    # SOS surfacing (2026-07-03): a human-action-needed condition is emitted as
+    # its OWN first line, but we NO LONGER early-return — the normal account /
+    # percentage line still renders below it. Before this, an SOS/warning
+    # REPLACED the usage numbers entirely (early return), so once the lanes
+    # target-starvation warning (diagnose Condition 2b) started firing every
+    # cycle the operator lost sight of their percentages behind the alert.
+    # User request 2026-07-03: "the SOS shouldn't block me from seeing the
+    # percentages — can it be a new line." So the most-severe condition prints
+    # on line 1 (loud), and the usage line always follows on line 2. Only the
+    # top condition is shown here to keep the alert one line; `cus sos` lists
+    # the full set.
     conditions = diagnose(state, config)
     urgent = [c for c in conditions if c.severity == "urgent"]
+    warning = [c for c in conditions if c.severity == "warning"]
     if urgent:
         msg = f"🚨 cus SOS: {urgent[0].summary} — see ~/claude-accounts/SOS.md · {render_stamp}"
         click.echo(click.style(msg, fg="red", bold=True) if color_on else msg, color=color_on)
-        return
-    warning = [c for c in conditions if c.severity == "warning"]
-    if warning:
+    elif warning:
         msg = f"⚠ cus: {warning[0].summary} · {render_stamp}"
         click.echo(click.style(msg, fg="yellow", bold=True) if color_on else msg, color=color_on)
-        return
 
     # Determine THIS session's account (the one this pane's claude actually
     # loaded tokens for) vs machine-wide active.
@@ -9566,7 +15295,12 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         pct7 = "?" if unknown7 else _sl_pct(h7, nxt, color_on)
         if show_resets:
             r5 = _time_until(a.get("five_hour_resets_at"))
-            r7 = _time_until(a.get("seven_day_resets_at"))
+            # 7d reset countdown uses the PROJECTED 72h refresh, not the raw API
+            # resets_at (2026-07-05, gist: monperrus). The API points ~7 days out
+            # at the oldest-tokens-age-off boundary; the real budget refresh lands
+            # at the ~72h anchor, which is the number the operator actually wants.
+            # Falls back to the API value on cold start (no observed drop yet).
+            r7 = _time_until(projected_seven_day_reset(a, config))
             r7_raw = f"·{_fmt_duration(r7)}" if r7 is not None and r7 > 0 and not unknown7 else ""
             r7_str = click.style(r7_raw, dim=True) if color_on and r7_raw else r7_raw
             rolled5 = _five_hour_rolled_since_poll(a)
@@ -9735,7 +15469,13 @@ def sos_cmd(quiet: bool) -> None:
 
     click.echo("🚨 SOS — human action needed:\n")
     for c in conditions:
-        prefix = "[URGENT]" if c.severity == "urgent" else "[WARNING]"
+        # Three tiers: "info" is a soft, non-actionable heads-up (e.g. the premium
+        # lane's only swap targets are idle-stale but WILL refresh on swap — GH
+        # 2026-07-06 false-URGENT fix), so it renders [INFO], not the [WARNING]
+        # that every non-urgent condition used to collapse to.
+        prefix = ("[URGENT]" if c.severity == "urgent"
+                  else "[WARNING]" if c.severity == "warning"
+                  else "[INFO]")
         click.echo(f"  {prefix} {c.summary}")
         for line in c.action.split("\n"):
             click.echo(f"    {line}")
@@ -9891,6 +15631,108 @@ def _login_mount_status_line(rec: dict, config: dict) -> str:
     return f"  {account:<12} {slot:<10} {email:<28} {fp}  {fresh}"
 
 
+def _write_family_provenance(account: str, family_id: str, email: str | None,
+                             bootstrapped: bool = False) -> dict:
+    """Record provenance for a pooled family and return it."""
+    rt = _credential_refresh_token(read_json(login_family_creds_path(account, family_id)))
+    prov = {
+        "account": account,
+        "family_id": family_id,
+        "minted_ts": now_iso(),
+        "source_email": email or "unknown",
+        "refresh_fp": _refresh_fingerprint(rt) if rt else None,
+        "bootstrapped": bootstrapped,
+    }
+    write_json(login_family_provenance_path(account, family_id), prov)
+    return prov
+
+
+def _login_mount_pool(account: str, config: dict, exec_flag: bool, finish_flag: bool,
+                      force: bool, from_existing: bool) -> None:
+    """Account-keyed pool provisioning for `cus login-mount <account>` (2026-07-03).
+
+    Provisions the account's NEXT backup family. Run it pool_size times at
+    onboarding to build a pool a lane can borrow from without per-lane setup."""
+    account_dir = ACCOUNTS_DIR / f"account-{account}"
+    if not account_dir.exists():
+        raise click.ClickException(
+            f"Unknown account '{account}' — no {account_dir}. Run `cus list`, or `cus add {account}` first.")
+    want = config.get("independent_logins", {}).get("pool_size", 3)
+
+    if from_existing:
+        # Seed family-1 from the snapshot (no browser). Only clobber-safe as the
+        # PRIMARY (the account's own live mount) — a 2nd simultaneous mount needs
+        # a real /login for a distinct family. Refuse if a pool already exists.
+        if list_login_families(account):
+            raise click.ClickException(
+                f"{account} already has pooled families; --from-existing only seeds the first. "
+                f"Add more with a real login: `cus login-mount {account}`.")
+        snap = account_creds_path(account)
+        try:
+            ok = _credential_refresh_token(read_json(snap)) is not None
+        except (json.JSONDecodeError, OSError):
+            ok = False
+        if not ok:
+            raise click.ClickException(f"{account}'s snapshot ({snap}) has no usable creds to bootstrap from.")
+        fam = "family-1"
+        scaffold_login_family_dir(account, fam)
+        atomic_copy(snap, login_family_creds_path(account, fam), mode=0o600)
+        snap_cj = account_dir / ".claude.json"
+        if snap_cj.exists():
+            atomic_copy(snap_cj, login_family_dir(account, fam) / ".claude.json", mode=0o600)
+        email = account_canonical_identity(account).get("emailAddress")
+        prov = _write_family_provenance(account, fam, email, bootstrapped=True)
+        click.echo(click.style(f"✓ Seeded {account}/{fam} from the on-disk snapshot (bootstrapped copy).", fg="green"))
+        click.echo(f"  identity: {email or 'unknown'}   fingerprint: {prov['refresh_fp']}")
+        click.echo(f"  This is NOT independent from the snapshot — for a 2nd live mount, add a real login.")
+        return
+
+    if finish_flag:
+        fam = latest_family_id(account)
+        if fam is None or not _family_creds_usable(account, fam):
+            raise click.ClickException(
+                f"No usable freshly-logged-in family for '{account}'. Did the /login complete? "
+                f"Re-run `cus login-mount {account}` and log in as '{account}' first.")
+        logged = family_identity(account, fam)
+        canonical = account_canonical_identity(account)
+        match = _identities_match(logged, canonical)
+        logged_email = logged.get("emailAddress") or "unknown"
+        canon_email = canonical.get("emailAddress") or "unknown"
+        if match is False and not force:
+            raise click.ClickException(
+                f"Login identity mismatch: you logged in as '{logged_email}' but account '{account}' is "
+                f"'{canon_email}' (the wrong-account trap, 2026-07-01). Re-login as '{account}', or --force.")
+        if match is None:
+            click.echo(click.style("  (could not verify identity — recording anyway)", fg="yellow"))
+        prov = _write_family_provenance(account, fam, logged_email)
+        n = len(list_login_families(account))
+        click.echo(click.style(f"✓ Recorded {account}/{fam} (pool now {n} family(ies)).", fg="green"))
+        click.echo(f"  identity: {logged_email}   fingerprint: {prov['refresh_fp']}")
+        if n < want:
+            click.echo(f"  {want - n} more to reach pool_size {want}: run `cus login-mount {account}` again.")
+        if not independent_logins_enabled(config):
+            click.echo("Note: swaps still copy the snapshot until you set "
+                       "independent_logins.use_independent_logins: true.")
+        return
+
+    # --- provision (print/exec) mode: scaffold the next family ---
+    fam = next_family_id(account)
+    dst = scaffold_login_family_dir(account, fam)
+    have = len(list_login_families(account))
+    login_cmd = f"CLAUDE_CONFIG_DIR={dst}/ claude"
+    click.echo(f"Provisioning {account}/{fam} (pool currently {have}, target pool_size {want}).")
+    click.echo(f"Store dir: {dst}")
+    click.echo()
+    click.echo(f"1. Run this and log in AS '{account}' (a NEW independent session for the same account):")
+    click.echo(f"     {login_cmd}")
+    click.echo("2. After the login completes and you /exit, record it:")
+    click.echo(f"     python3 ~/repos/claude-usage-swap/cus.py login-mount {account} --finish")
+    if exec_flag:
+        click.echo()
+        click.echo(f"(--exec) launching claude under {dst} …")
+        os.execvp("claude", ["claude"])
+
+
 @cli.command(name="login-mount")
 @click.argument("slot", required=False)
 @click.argument("account", required=False)
@@ -9939,19 +15781,47 @@ def login_mount_cmd(slot: str | None, account: str | None, exec_flag: bool,
     """
     config = load_config()
 
+    def _is_slot_name(s: str) -> bool:
+        return s.startswith(SLOT_PREFIX) and s.removeprefix(SLOT_PREFIX).isdigit()
+
+    # POOL model (2026-07-03): `cus login-mount <account>` (single positional
+    # that is NOT a slot name) provisions the account's NEXT backup family. Run
+    # it pool_size times per account at onboarding — no per-lane setup. The
+    # legacy two-arg `cus login-mount <slot> <account>` form still works below.
+    if account is None and slot is not None and not _is_slot_name(slot):
+        account, slot = slot, None
+    pool_mode = slot is None and account is not None
+
     if list_flag:
+        # Pool view: families per account (the onboarding-facing shape).
+        root = login_store_root()
+        pool_accts = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.exists() else []
+        pool_accts = [a for a in pool_accts if list_login_families(a)]
+        if pool_accts:
+            click.echo("Independent-login pools (GH #109):")
+            want = config.get("independent_logins", {}).get("pool_size", 3)
+            for a in pool_accts:
+                fams = list_login_families(a)
+                short = "  ".join(f"{f}[{login_expiry_state(a, f, config)[0]}]" for f in fams)
+                flag = "" if len(fams) >= want else click.style(f"  (< pool_size {want})", fg="yellow")
+                click.echo(f"  {a}: {len(fams)} family(ies)  {short}{flag}")
+        # Legacy per-(slot,account) entries, if any remain.
         recs = list_provisioned_logins()
-        if not recs:
+        if recs:
+            click.echo("Legacy per-slot logins:")
+            for rec in recs:
+                click.echo(_login_mount_status_line(rec, config))
+        if not pool_accts and not recs:
             click.echo("No independent logins provisioned yet.")
-            click.echo("Provision one with: cus login-mount <slot> <account>")
-            return
-        click.echo("Independent logins (GH #109):")
-        for rec in recs:
-            click.echo(_login_mount_status_line(rec, config))
+            click.echo("Provision a pool with: cus login-mount <account>   (run pool_size times)")
+        return
+
+    if pool_mode:
+        _login_mount_pool(account, config, exec_flag, finish_flag, force, from_existing)
         return
 
     if not slot or not account:
-        raise click.UsageError("login-mount needs a SLOT and an ACCOUNT (e.g. `cus login-mount slot-3 rayi1`), "
+        raise click.UsageError("login-mount needs an ACCOUNT (e.g. `cus login-mount merkos`), "
                                "or use --list.")
 
     # Validate the slot name shape. We allow a slot dir that doesn't exist yet:
@@ -10522,6 +16392,211 @@ def slot_gc_cmd(slot_name_opt: str | None, force: bool) -> None:
     save_state(state)
 
 
+def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> dict:
+    """Pure planning preview for `cus slot move` — decides, WITHOUT any side
+    effect, what execute_swap would do for the move (slot_name -> target).
+
+    This mirrors the install-source decision inside _execute_swap_locked so that
+    both `--dry-run` and the command's pre-flight double-book guard agree with
+    what the real swap would actually do. Factored out as a pure helper (no
+    execute_swap, no disk writes) precisely so it is unit-testable on its own —
+    the swap primitive itself is awkward to drive through in every branch.
+
+    Verdicts:
+      - "noop"     target is already the slot's account (nothing to move).
+      - "snapshot" target is NOT live on any OTHER mount, so a plain snapshot
+                   copy installs cleanly — no login family needed (today's copy
+                   path; the gate-off default).
+      - "claim"    target IS live on another mount, but the login pool can back
+                   a DISTINCT token family (gate on + a free pooled family).
+                   execute_swap claims that family — two live mounts, two token
+                   families, no clobber (GH #109).
+
+                   NOTE (2026-07-07, GH #104 chats1a): a legacy per-slot
+                   independent login now only yields "claim" if its token is
+                   GENUINELY distinct from every live mount's family. A stale-copy
+                   legacy store (same family as the shared mount — the chats1a
+                   signature) collides, so execute_swap's `_live_family_would_collide`
+                   guard REFUSES it and this preview falls through to "refuse" too.
+                   Before the fix, `has_independent_login` presence alone counted
+                   as "claim", so the dry-run said CLAIM while the real move left
+                   the lane on the shared family and a rotation logged it out.
+      - "refuse"   target IS live on another mount and there is NO distinct
+                   family to claim. Installing a plain copy would put two live
+                   mounts on ONE OAuth refresh-token family; the next rotation
+                   invalidates the other mount's token and logs that session out
+                   (GH #104). The move is refused rather than clobber.
+
+    Returns {current, target, plan, held_by, gate, detail}. `held_by` is a
+    human-readable list of the OTHER live mounts already on `target` (live slots
+    plus the shared ~/.claude mount), for the operator-facing message.
+    """
+    current = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
+    # Ground-truth occupancy (max_age_seconds=0 bypasses the cache) — the same
+    # source the real clobber guard reads, so preview and reality can't diverge.
+    held_by = [s for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(target, []) if s != slot_name]
+    # Shared-mount holder: mode-aware, NOT gated on mount_in_use(CLAUDE_DIR) —
+    # bare sessions on ~/.claude set no CLAUDE_CONFIG_DIR so mount_pids can't see
+    # them (issue #141). _shared_mount_holds treats global/hybrid state["active"]
+    # as an unconditional live holder; per_session keeps the detectable-only rule.
+    if _shared_mount_holds(target, state, config):
+        held_by = held_by + ["~/.claude (shared mount)"]
+    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config)
+    gate = independent_logins_enabled(config)
+    if target == current:
+        plan, detail = "noop", f"{slot_name} is already on '{target}'"
+    elif not held_elsewhere:
+        plan, detail = "snapshot", (
+            f"'{target}' is not live on any other mount — a plain snapshot install, no login family needed")
+    elif gate and (has_free_login_family(target, state)
+                   or (has_independent_login(target, slot_name)
+                       and not _live_family_would_collide(
+                           target, login_store_creds_path(target, slot_name), slot_name, state, config))):
+        # Claimable = a free POOLED family, OR a legacy per-slot login whose token
+        # is GENUINELY distinct from every live mount's family. The legacy branch
+        # is now token-CHECKED (2026-07-07 chats1a): a stale-copy legacy store
+        # shares the shared-mount family, so execute_swap's `_live_family_would_collide`
+        # guard REFUSES it — and the preview must agree, else the dry-run lied
+        # "CLAIM" while the real move refused (the exact divergence that let the
+        # incident's `slot move` print success and then get clobbered). A genuinely
+        # independent legacy login (distinct token) still previews and swaps as a
+        # clean claim, so the supported Track-B behavior is preserved.
+        plan, detail = "claim", (
+            f"'{target}' is live on {held_by} — execute_swap will claim a free login family "
+            f"(distinct token, no clobber; GH #109)")
+    else:
+        plan, detail = "refuse", (
+            f"'{target}' is live on {held_by} and has no free login family to claim — installing a copy "
+            f"would clobber the shared token family and log a session out (GH #104). "
+            f"Provision another family with `cus login-mount {target}`"
+            + ("" if gate else " (and enable the login pool: independent_logins.use_independent_logins)"))
+    return {"current": current, "target": target, "plan": plan, "held_by": held_by, "gate": gate, "detail": detail}
+
+
+@slot.command("move")
+@click.argument("slot_name")
+@click.argument("account")
+@click.option("--dry-run", is_flag=True,
+              help="Print the plan (old account, target, whether a login family would be claimed or the move would refuse) WITHOUT moving anything.")
+@click.option("--force", is_flag=True,
+              help="Bypass cus's pre-flight refusals: move a LOCKED slot (see `cus lock`) and skip the double-book guard. "
+                   "Does NOT override the GH #104 pool-exhaustion safety inside execute_swap — with the login pool on, a "
+                   "genuinely exhausted target still refuses rather than clobber a live token family. Mirrors `cus switch --force`.")
+def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> None:
+    """Move a slot's credential mount onto ACCOUNT, IN PLACE.
+
+    The manual counterpart to the daemon's per-lane rotation. The daemon already
+    moves a live slot's account under a running session without restarting it
+    (decide_slot_swaps -> execute_swap(..., slot=...)); this command exposes that
+    exact primitive for a human who wants to say "put slot-5 on merkos" NOW.
+    Because the swap is in place, the session on top of the slot is never
+    interrupted — it keeps its loaded tokens until the next refresh, then reads
+    the new account's mount. (Contrast a relaunch, which loses the session.)
+
+    Reuses `execute_swap(account, trigger="manual-slot-move", slot=<slot>)` — the
+    same primitive `cus launch` and the daemon call — so the credential-safety is
+    INHERITED, not reinvented:
+
+      * GH #104 double-book: if ACCOUNT is already live on another mount (a live
+        slot or the shared ~/.claude mount), a plain snapshot copy would put two
+        live mounts on ONE OAuth refresh-token family; the next rotation logs one
+        session out. When the login pool is on, execute_swap instead CLAIMS a
+        free, distinct login family (GH #109) so both mounts stay logged in. If
+        the pool is exhausted (no free family), execute_swap REFUSES rather than
+        clobber — this command surfaces that refusal verbatim and points at
+        `cus login-mount ACCOUNT` to provision another family.
+
+    This command adds only the operator ergonomics around that primitive:
+    slot/account validation, bare-number slot normalization (`5` == `slot-5`),
+    the `cus lock` guard, an already-on-target short-circuit, a `--dry-run`
+    preview, and a printed walk-back line. `--force` bypasses the local
+    pre-flight refusals (lock + double-book) exactly as `cus switch --force`
+    does; it can NOT force a pool-exhausted clobber, because execute_swap itself
+    refuses that with no force path (and inventing one would defeat GH #104).
+
+    Walk-back: the move is undone by moving the slot back — `cus slot move
+    <slot> <old-account>`.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+
+    name = _normalize_slot_name(slot_name)
+    state = load_state()
+    config = load_config()
+
+    # Validate account (mirror `switch`'s known-accounts error).
+    if account not in state.get("accounts", {}):
+        click.echo(f"Unknown account '{account}'. Known: {sorted(state.get('accounts', {}).keys())}")
+        sys.exit(1)
+    # Validate slot: a state entry OR an on-disk dir is enough to move it (an
+    # unregistered-but-present dir is a real, movable mount; `cus slot list`
+    # flags the registration gap separately).
+    if name not in (state.get("slots") or {}) and not slot_path(name).exists():
+        known = sorted((state.get("slots") or {}).keys())
+        click.echo(f"Unknown slot '{name}'. Known: {known or '(none)'}. `cus slot list` to see slots.")
+        sys.exit(1)
+
+    current = (state.get("slots", {}).get(name, {}) or {}).get("account")
+
+    # Already on the target — nothing to do (say so, don't error).
+    if account == current:
+        click.echo(f"{name} is already on '{account}', nothing to do.")
+        return
+
+    # Lock guard: a locked slot is frozen for the daemon AND for this command
+    # (locks are user intent — "this slot stays put"). --force overrides once.
+    if name in _locked_slots(config) and not force:
+        click.echo(click.style(
+            f"refusing: {name} is locked (`cus lock`) — the daemon won't move it and neither will this command. "
+            f"`cus unlock {name}` to release it, or pass --force to move it once anyway.", fg="red"))
+        sys.exit(1)
+
+    plan = _slot_move_plan(state, config, name, account)
+
+    if dry_run:
+        # Preview only — reuse the same planning helper the guard uses, and make
+        # ZERO state changes (no execute_swap call).
+        click.echo(f"(dry-run) plan for `cus slot move {name} {account}`:")
+        click.echo(f"  current account: {current or '(empty slot)'}")
+        click.echo(f"  target account:  {account}")
+        click.echo(f"  login pool gate: {'on' if plan['gate'] else 'off'}")
+        click.echo(f"  verdict: {plan['plan'].upper()} — {plan['detail']}")
+        if plan["plan"] == "refuse":
+            click.echo("  (this move would be refused as-is; nothing has changed)")
+        return
+
+    # Pre-flight double-book guard (mirrors `cus switch`): refuse a move that
+    # execute_swap could only satisfy by clobbering a live token family. --force
+    # bypasses THIS local check exactly like switch; the pool safety inside
+    # execute_swap is still absolute when the gate is on (it raises below and we
+    # surface it).
+    if plan["plan"] == "refuse" and not force:
+        click.echo(click.style(f"refusing: {plan['detail']}", fg="red"))
+        click.echo("Pass --force to bypass this pre-flight check (with the login pool on, execute_swap still refuses a pool-exhausted clobber).")
+        sys.exit(1)
+
+    try:
+        execute_swap(account, trigger="manual-slot-move", slot=name)
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        # execute_swap's OWN GH #104 pool-exhaustion refusal lands here as a
+        # RuntimeError ("pool exhausted for '<acct>': ...") — surface its
+        # operator-readable guidance verbatim rather than reformatting it.
+        click.echo(click.style(f"ERROR: {e}", fg="red"))
+        sys.exit(1)
+
+    # Report result. Re-read state to see the lease execute_swap recorded if it
+    # claimed a distinct login family (state.slots[name].login_family).
+    new_state = load_state()
+    lease = (new_state.get("slots", {}).get(name, {}) or {}).get("login_family")
+    click.echo(click.style(
+        f"moved {name}: {current or '(empty)'} -> {account} (in place; session continues uninterrupted)", fg="green"))
+    if lease:
+        click.echo(f"  claimed login family: {lease} (distinct token family — no clobber, GH #109)")
+    if current:
+        click.echo(f"  undo: cus slot move {name} {current}")
+
+
 @cli.command(name="doctor")
 @click.option("--fix-dirs", is_flag=True, help="Heal findings (create/repoint symlinks, fold settings stubs, merge stray dirs).")
 def doctor_cmd(fix_dirs: bool) -> None:
@@ -10616,8 +16691,9 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         target = pick_launch_account(state, _config_for_pool(config, pool))
         if target is None:
             raise click.ClickException(
-                "no launchable account: every account is already on a live mount, expired, or saturated "
-                "(GH #104 — won't double-book a live account). Exit a session, wait for a 5h/weekly reset, "
+                "no launchable account: every account is expired, erroring, or on a live mount with "
+                "per_session.lane_sharing off (GH #104 — won't double-book a live account; lane sharing "
+                "makes live accounts joinable). Exit a session, wait for a 5h/weekly reset, fix logins, "
                 "or add an account. See `cus status` / `cus sos`.")
         account = target.name
         click.echo(f"launch: picked '{account}' ({target.reason})")
@@ -10650,6 +16726,16 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             entry["last_launch_ts"] = now_iso()
             save_state(state)
             return lane, lane_dir, account
+        if account == state.get("active") and mount_in_use(CLAUDE_DIR):
+            # Shared-mount join (2026-07-03): the account's only live mount is
+            # the global ~/.claude pair. A bare session already IS that mount,
+            # so joining it is the same move as joining a slot lane — same dir,
+            # same login family, no second mount, no clobber. The session runs
+            # bare (no CLAUDE_CONFIG_DIR override; launch_cmd skips the env var
+            # for the shared dir) and the daemon manages it with the other bare
+            # sessions. No slot bookkeeping: the shared mount isn't a slot.
+            click.echo(f"launch: joining the shared mount already on '{account}' (lane sharing — bare session, swaps with the shared mount)")
+            return "shared", CLAUDE_DIR, account
 
     if lane is not None and not (lane.startswith(SLOT_PREFIX) and lane.removeprefix(SLOT_PREFIX).isdigit()):
         raise click.ClickException(f"bad --lane '{lane}' — expected slot-<n> (e.g. slot-8).")
@@ -10766,7 +16852,15 @@ def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | N
     slot_name, slot_dir, account = _launch_prepare(account, state, config, pool=pool, force=force, lane=lane)
     click.echo(f"launch: {slot_name} ← {account}; exec claude {' '.join(claude_args)}")
     env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
+    if slot_dir != CLAUDE_DIR:
+        env["CLAUDE_CONFIG_DIR"] = str(slot_dir)
+    else:
+        # Shared-mount join (2026-07-03 lane sharing): run BARE so hooks and
+        # statusline classify the session as shared-mount, exactly like a
+        # hand-launched `claude`. Pop rather than set — a launch issued from
+        # INSIDE a slotted session inherits that slot's CLAUDE_CONFIG_DIR,
+        # which would silently re-slot this "bare" session.
+        env.pop("CLAUDE_CONFIG_DIR", None)
     # execvpe replaces this process — claude runs as if launched directly
     # from the shell (signals, tty, exit code all pass through untouched).
     os.execvpe("claude", ["claude", *claude_args], env)

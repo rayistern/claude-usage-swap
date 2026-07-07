@@ -191,13 +191,20 @@ def test_reactive_429_attributes_to_slot_account():
         _orig_scs = cus.session_current_slot
         cus.session_current_slot = lambda sid: {"sA": s1}.get(sid)
         try:
-            moves = cus.check_rate_limit_reactive_per_session(state, _config())
+            # exclude_accounts = the accounts every OTHER live slot holds, exactly
+            # as _per_session_cycle now supplies (fix 2026-07-05, GH #104): beta is
+            # live on slot-2, so the 429 escape must avoid it (moving onto a live
+            # account double-books its single-use refresh token). Pre-fix the cycle
+            # passed nothing and the escape could clobber beta; now it lands on a
+            # free account (gamma/delta).
+            moves = cus.check_rate_limit_reactive_per_session(state, _config(), exclude_accounts={"beta"})
             assert len(moves) == 1
             assert moves[0]["slot"] == s1 and moves[0]["from"] == "alpha"
+            assert moves[0]["to"] != "beta", f"must not escape onto live beta (GH #104): {moves}"
             assert moves[0]["deferrable"] is False and moves[0]["gate"] == "reactive_429"
 
             # Watermark advanced → same entries don't re-trigger.
-            assert cus.check_rate_limit_reactive_per_session(state, _config()) == []
+            assert cus.check_rate_limit_reactive_per_session(state, _config(), exclude_accounts={"beta"}) == []
         finally:
             cus.session_current_slot = _orig_scs
     finally:
@@ -589,6 +596,103 @@ def test_launch_prepare_refuses_explicit_live_account():
         except Exception as e:  # click.ClickException
             refused = "already running on a live mount" in str(e)
         assert refused, "launching an explicit already-live account must be refused"
+    finally:
+        env.restore()
+
+
+def test_decide_slot_swaps_holds_when_pool_exhausted_no_double_book():
+    """Two hot slots, ONE free target: first slot takes it, second HOLDS on its
+    account instead of doubling up (2026-07-03 — the double-up fallback put one
+    token family on two live mounts, the #104 clobber; slot-3/slot-4 incident)."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 85.0, "current_7d_pct": 20.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(85.0, 20.0), "beta": _usage(10.0, 10.0)}
+
+        moves = cus.decide_slot_swaps(state, _config(), usage)
+        assert len(moves) == 1, f"exactly one slot moves; the other holds — got {moves}"
+        assert moves[0]["to"] == "beta"
+        assert moves[0]["slot"] in {s1, s2}
+    finally:
+        env.restore()
+
+
+def test_ladder_hysteresis_reads_auto_swap_clock_only():
+    """The ladder cooldown is armed by last_auto_swap_ts (daemon swaps), not
+    last_swap_ts (which launches also bump) — 2026-07-03: launches kept
+    re-arming a 50-min cooldown and parked hot slots while they climbed."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({
+            "current_5h_pct": 85.0, "current_7d_pct": 20.0,
+            "last_swap_ts": cus.now_iso(),  # a launch just installed alpha somewhere
+        })
+        state["accounts"]["beta"].update({"current_5h_pct": 10.0, "current_7d_pct": 10.0})
+        usage = {"alpha": _usage(85.0, 20.0), "beta": _usage(10.0, 10.0)}
+        cfg = _config(swap_hysteresis={"enabled": True, "min_seconds_between_swaps": 3000})
+
+        d = cus.decide_swap(state, cfg, usage, {})
+        assert d is not None and d.target == "beta", \
+            "a fresh LAUNCH must not defer the ladder"
+
+        state["accounts"]["alpha"]["last_auto_swap_ts"] = cus.now_iso()
+        d = cus.decide_swap(state, cfg, usage, {})
+        assert d is None, "a fresh DAEMON swap arms the cooldown"
+    finally:
+        env.restore()
+
+
+def test_duplicate_live_mount_families_detects_shared_family():
+    """Two LIVE mounts holding one refresh-token family are the #104 clobber;
+    idle duplicates aren't flagged (nothing refreshes an idle mount).
+    2026-07-03: this condition existed on slot-3/slot-4 while `cus sos` said
+    all-clear — the store-based check only sees provisioned logins."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)  # same snapshot copy → same family
+        state = cus.load_state()
+        dups = cus.duplicate_live_mount_families(state)
+        assert len(dups) == 1, dups
+        assert set(dups[0]["mounts"]) == {f"{s1} (alpha)", f"{s2} (alpha)"}
+
+        env.live_slots.discard(s2)  # session exits → duplicate is idle → no clobber risk
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        assert cus.duplicate_live_mount_families(state) == []
+    finally:
+        env.restore()
+
+
+def test_double_booked_live_accounts_both_phases():
+    """The by-account #104 check catches both clobber phases: identical
+    families (will_clobber — refresh pending) AND diverged families
+    (already_rotated — one mount holds a dead refresh token; the same-family
+    check goes quiet the moment the first rotation lands, which is how
+    slot-3/slot-4 dodged SOS between two scans on 2026-07-03)."""
+    env = _Env()
+    try:
+        s1 = env.make_slot("alpha", live=True)
+        s2 = env.make_slot("alpha", live=True)  # same snapshot copy → same family
+        state = cus.load_state()
+        dbs = cus.double_booked_live_accounts(state)
+        assert len(dbs) == 1 and dbs[0]["account"] == "alpha"
+        assert dbs[0]["phase"] == "will_clobber"
+        assert dbs[0]["mounts"] == sorted([s1, s2])
+
+        # One mount's token rotates → families diverge → still flagged.
+        (cus.slot_path(s2) / ".credentials.json").write_text(json.dumps(_creds("rt-alpha-rotated")))
+        dbs = cus.double_booked_live_accounts(state)
+        assert len(dbs) == 1 and dbs[0]["phase"] == "already_rotated"
+
+        # A single live mount per account is fine.
+        env.live_slots.discard(s2)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        assert cus.double_booked_live_accounts(state) == []
     finally:
         env.restore()
 

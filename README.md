@@ -1,6 +1,12 @@
 # claude-usage-swap (`cus`)
 
+[![CI](https://github.com/rayistern/claude-usage-swap/actions/workflows/ci.yml/badge.svg)](https://github.com/rayistern/claude-usage-swap/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+
 Auto-rotate Claude Code OAuth accounts based on usage thresholds. Single-file Python, Linux-only.
+
+> ⚠️ **Read [`SECURITY.md`](SECURITY.md) first.** `cus` reads and moves your Claude OAuth credentials, and it relies on the *undocumented* `CLAUDE_CONFIG_DIR` and OAuth usage endpoint (Anthropic can change these anytime). Whether multi-account rotation fits your subscription's Terms of Service is yours to determine. MIT, no warranty, use at your own risk.
 
 When one of your Claude Pro/Max accounts approaches its 5-hour or weekly cap, `cus` swaps the active credentials to a different account — atomically, with optional hot-swap of in-flight tmux sessions so conversations preserve via `claude --resume`.
 
@@ -232,7 +238,7 @@ Everything above describes `mode: global` (the default): one live mount (`~/.cla
 
 `global` ignores slots (they freeze on their account); `per_session` ignores bare sessions (observe-only). If a machine has **both** `cus launch` slots and plain `claude` sessions, use `hybrid`: each cycle the daemon moves slots individually (no restart) **and** swaps the shared `~/.claude/` mount for the bare sessions (they follow it together). Reactive 429s are partitioned from a single log read — a slotted session's 429 moves only its slot, a bare session's only the shared mount. Enter with `cus mode hybrid` (same validation as per_session); leave with `cus mode global`.
 
-> **No double-booking (automatic).** Every live mount must stay on a distinct account — two mounts on one account rotate its single-use OAuth refresh token and log one session out. The daemon enforces this: the shared-mount swap never picks an account a live slot holds, and slot swaps never pick the shared mount's (or another slot's) account. `cus switch <acct>` also refuses to move the shared mount onto an account a live slot runs (override with `--force`). So hybrid is safe to run with a mix of slotted and bare sessions (GH #104).
+> **No double-booking (automatic).** Every live mount must stay on a distinct account — two mounts on one account rotate its single-use OAuth refresh token and log one session out. The daemon enforces this: the shared-mount swap never picks an account a live slot holds, and slot swaps never pick the shared mount's (or another slot's) account. `cus switch <acct>` also refuses to move the shared mount onto an account a live slot runs (override with `--force`). So hybrid is safe to run with a mix of slotted and bare sessions (GH #104). When more slots run hot than free accounts exist, the extra slots **hold** on their account rather than double up onto a taken target (2026-07-03 — the old double-up fallback was itself a clobber), and `cus sos` flags any two live mounts caught sharing one login family.
 
 **Passing flags through to `claude` (e.g. `--dangerously-skip-permissions`).** Everything after `--` is forwarded verbatim to the `claude` process the slot execs (`launch` is declared with `ignore_unknown_options`, so unknown flags pass straight through). So a slotted, permission-skipping session is just:
 
@@ -271,6 +277,9 @@ per_session:
 ```bash
 cus launch rayi1      # first session → lane on rayi1 (seeded from rayi1's existing login)
 cus launch rayi1      # second session → JOINS that same lane (shared login)
+cus launch auto       # when EVERY healthy account is already live, joins the lowest-usage
+                      # lane instead of refusing (2026-07-03) — incl. the shared ~/.claude
+                      # mount (that launch runs as a bare session on the active account)
 ```
 
 Both sessions share one config dir and one login; a swap of that lane moves them together (one shared cache-bust). **No extra login, ever** — one account lives on one lane, seeded free from the login it already has. This is the right choice when same-account sessions can swap as a group (they usually can — they're together because that account is best, and they'd leave it together when it gets hot).
