@@ -1208,6 +1208,124 @@ def test_slot_move_non_shared_unheld_account_still_snapshots_in_hybrid():
         env.restore()
 
 
+# ---------------------------------------------------------------------------
+# GH #104 divergence-logout (2026-07-07 chats1a): a lane must never end up on the
+# shared-mount account (or another lane's account) running the SAME OAuth token
+# family without a distinct login family. The incident: `cus slot move slot-2
+# merkos` printed "installed independent login" via a LEGACY per-slot store that
+# was a STALE COPY of merkos's shared family (has_independent_login True but NOT
+# distinct); login_family stayed None; ~5 min later the shared mount's rotation
+# clobbered slot-2 → the live session hit `401 · Please run /login` for an hour.
+# The guard reads actual token BYTES so it refuses a same-family copy while still
+# allowing a genuinely-independent legacy login.
+# ---------------------------------------------------------------------------
+
+def _plant_legacy_login(account: str, slot: str, refresh: str) -> None:
+    """Write a LEGACY per-(account, slot) independent-login store (pre-pool
+    keying) carrying `refresh`. has_independent_login() sees it as present."""
+    cus.login_store_dir(account, slot).mkdir(parents=True, exist_ok=True)
+    cus.login_store_creds_path(account, slot).write_text(json.dumps(_creds(refresh)))
+
+
+def test_swap_onto_shared_mount_stale_copy_legacy_refuses_no_message():
+    """The exact incident: swapping a lane onto the shared-mount account whose
+    ONLY source is a legacy store that is a STALE COPY of the shared family must
+    REFUSE (family collision) — execute_swap raises, the lane stays put, and the
+    "installed independent login" success line is never emitted."""
+    env = _Env(accounts=("merkos", "beta"))          # active = merkos (shared mount)
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        # Bare sessions on ~/.claude run merkos's snapshot family.
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-merkos")))
+        mover = env.make_slot("beta", live=True)      # will try to move onto merkos
+        # Legacy store present but a STALE COPY (same family as the shared mount).
+        _plant_legacy_login("merkos", mover, "rt-merkos")
+        import pytest as _pt
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with _pt.raises(RuntimeError) as ei:
+                cus.execute_swap("merkos", trigger="manual-slot-move", slot=mover)
+        assert "GH #104" in str(ei.value), str(ei.value)
+        assert "installed independent login" not in buf.getvalue(), buf.getvalue()
+        # Lane never moved; its live creds are untouched (still beta's family).
+        assert cus.load_state()["slots"][mover]["account"] == "beta"
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-beta"
+    finally:
+        env.restore()
+
+
+def test_slot_move_stale_copy_legacy_previews_refuse():
+    """The dry-run/pre-flight must AGREE with execute_swap (the divergence that
+    let the incident's move print success): a stale-copy legacy login onto the
+    shared-mount account previews as REFUSE, not CLAIM."""
+    env = _Env(accounts=("merkos", "beta"))
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-merkos")))
+        mover = env.make_slot("beta", live=True)
+        _plant_legacy_login("merkos", mover, "rt-merkos")   # stale copy → collides
+        plan = cus._slot_move_plan(cus.load_state(), cus.load_config(), mover, "merkos")
+        assert plan["plan"] == "refuse", plan
+    finally:
+        env.restore()
+
+
+def test_swap_onto_shared_mount_genuine_distinct_legacy_allowed():
+    """The guard must NOT over-fire: a GENUINELY independent legacy login
+    (distinct token) onto the shared-mount account is clobber-safe and installs
+    cleanly — no family collision with the shared mount."""
+    env = _Env(accounts=("merkos", "beta"))
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-merkos")))
+        mover = env.make_slot("beta", live=True)
+        _plant_legacy_login("merkos", mover, "rt-indep-merkos")   # DISTINCT family
+        cus.execute_swap("merkos", trigger="manual-slot-move", slot=mover)
+        assert cus.load_state()["slots"][mover]["account"] == "merkos"
+        # Installed the DISTINCT family token, not a merkos snapshot copy.
+        assert cus._credential_refresh_token(
+            cus.read_json(cus.slot_path(mover) / ".credentials.json")) == "rt-indep-merkos"
+    finally:
+        env.restore()
+
+
+def test_sos_flags_lane_sharing_shared_mount_family():
+    """SOS divergence detector fires for a LIVE lane whose mount runs the SAME
+    family as the shared-mount account (login_family unset) — the setup that was
+    invisible to the mount_in_use-gated detectors (bare-session blind spot)."""
+    env = _Env(accounts=("merkos", "beta"))          # active = merkos
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-merkos")))   # shared mount = merkos family
+        lane = env.make_slot("merkos", live=True)      # mount creds = rt-merkos (SAME family)
+        conds = cus.diagnose(cus.load_state(), cus.load_config())
+        assert any("divergence/logout risk (GH #104)" in c.summary and lane in c.summary
+                   for c in conds), [c.summary for c in conds]
+    finally:
+        env.restore()
+
+
+def test_sos_does_not_flag_lane_with_distinct_family():
+    """SOS divergence detector stays quiet when the lane's mount runs a DISTINCT
+    token family (a real claimed lease) — no false positive on the safe case."""
+    env = _Env(accounts=("merkos", "beta"))
+    try:
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        cus.CREDS_JSON.write_text(json.dumps(_creds("rt-merkos")))
+        lane = env.make_slot("merkos", live=True, family_id="family-1")
+        # A real claim installs the family's DISTINCT token into the mount.
+        (cus.slot_path(lane) / ".credentials.json").write_text(json.dumps(_creds("rt-merkos-fam1")))
+        env.plant_family("merkos", "family-1", "rt-merkos-fam1")
+        conds = cus.diagnose(cus.load_state(), cus.load_config())
+        assert not any("divergence/logout risk (GH #104)" in c.summary for c in conds), \
+            [c.summary for c in conds]
+    finally:
+        env.restore()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

@@ -1653,6 +1653,58 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
     return _shared_mount_holds(account, state, config)
 
 
+def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: str | None,
+                               state: dict, config: dict | None = None) -> bool:
+    """True iff the refresh-token FAMILY in `candidate_creds` already runs on
+    ANOTHER live mount of `account` — the shared ~/.claude mount or another live
+    lane. That is the GH #104 clobber itself: two live mounts on one refresh-token
+    family, and the next rotation on either side logs the other out.
+
+    Why compare ACTUAL token bytes (not login_family / has_independent_login
+    state): the 2026-07-07 chats1a incident's legacy per-slot store PASSED
+    `has_independent_login` (it carried *a* refresh token) yet that token was a
+    STALE COPY of the account's shared snapshot family — so trusting the state
+    flag judged it "safe" while installing it double-booked the shared family and
+    logged the session out. Conversely a GENUINELY independent legacy login
+    (distinct token, the supported Track-B case) is clobber-safe and must NOT be
+    refused. Only the bytes distinguish the two, so this reads them — the same
+    fingerprint primitive `duplicate_live_mount_families` uses.
+
+    Closes the bare-session blind spot too: the existing live-mount detectors
+    gate the shared mount on `mount_in_use(CLAUDE_DIR)`, which reads False for
+    bare sessions (they set no CLAUDE_CONFIG_DIR — issue #141), so a lane sharing
+    the shared-mount account was invisible to them. Here the shared mount is
+    counted UNCONDITIONALLY in global/hybrid via `_shared_mount_holds`, exactly
+    like the swap-time clobber guard.
+
+    max_age_seconds=0 (ground-truth occupancy) for the same reason as
+    `_account_held_by_other_live_mount`: this is a credential-safety check on the
+    rare swap path, so it must not read a stale cache mid-fan-out.
+    """
+    try:
+        cand_rt = _credential_refresh_token(read_json(candidate_creds))
+    except (json.JSONDecodeError, OSError):
+        return False  # unreadable candidate: not a family-collision (the #141
+                      # install-point guard handles blank/unreadable sources)
+    if not cand_rt:
+        return False
+    cand_fp = _refresh_fingerprint(cand_rt)
+    other_mounts: list[Path] = []
+    if _shared_mount_holds(account, state, config):
+        other_mounts.append(CREDS_JSON)  # ~/.claude/.credentials.json (bare sessions)
+    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+        if s != this_slot:
+            other_mounts.append(mount_creds_path(slot_path(s)))
+    for p in other_mounts:
+        try:
+            rt = _credential_refresh_token(read_json(p))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if rt and _refresh_fingerprint(rt) == cand_fp:
+            return True
+    return False
+
+
 def read_login_provenance(account: str, slot: str) -> dict | None:
     """Provenance record for a provisioned login, or None if unreadable."""
     path = login_store_provenance_path(account, slot)
@@ -5272,6 +5324,55 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 f"Provision another: `cus login-mount {target_name}`.")
     if install_src is None:
         install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # ---- 2026-07-07 divergence-logout guard (GH #104 lane invariant) ----
+    # INVARIANT: a SLOT swap that lands on an account ALSO held by the shared
+    # ~/.claude mount or by another live lane MUST run a DISTINCT login family —
+    # a freshly CLAIMED pooled family, recorded as state.slots[slot].login_family
+    # (claimed_family is not None). Any other source (the shared account snapshot,
+    # OR a legacy per-(account, slot) store) shares ONE OAuth refresh-token family
+    # across two live mounts; each mount rotates it independently on refresh, the
+    # old refresh token dies, and the loser is logged out with
+    # `401 Invalid authentication credentials` (#104).
+    #
+    # The incident (chats1a, verified live 2026-07-07): `cus slot move slot-2
+    # merkos` printed "installed independent login for (slot-2, merkos)" via the
+    # LEGACY fallback below — `claim_verified_login_family` returned None (merkos's
+    # only pooled family was already leased to slot-1, which was ALSO on merkos),
+    # so the code fell to `has_independent_login` / `swap_install_source` and
+    # installed a per-slot store WITHOUT recording a family lease. login_family
+    # stayed None while merkos was simultaneously the shared-mount account AND on
+    # slot-1. ~5 min later the shared mount's token rotation clobbered slot-2's
+    # copy → the live session hit `401 · Please run /login` for an hour. The
+    # printed "installed independent login" line was a lie: no distinct family
+    # persisted, and the legacy store's token was not a genuinely-independent
+    # family (a stale snapshot copy).
+    #
+    # Fix: for a DOUBLE-BOOKED account, refuse to install a source whose
+    # refresh-token FAMILY already runs on another live mount of that account —
+    # option (b) from the task: fail with a clear error, leaving the lane on its
+    # PRIOR good account (nothing is written to live_creds_path until the
+    # atomic_copy further down, so raising here is a clean no-op for the mount).
+    # The check reads actual token bytes (`_live_family_would_collide`), so it
+    # REFUSES the incident's stale-copy legacy store (same family as the shared
+    # mount) while still ALLOWING a genuinely-independent legacy login (distinct
+    # family — the supported Track-B case, whose own tests must keep passing).
+    # A claimed pooled family installs a distinct family by construction, so this
+    # is a no-op on the normal rescue path; it is defense-in-depth that also
+    # catches a mis-provisioned pool family that happens to share the snapshot's
+    # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
+    # does. The login-free remedy is another pooled family (`cus login-mount`).
+    if (slot is not None and independent_logins_enabled(config)
+            and _account_held_by_other_live_mount(state, target_name, slot, config)
+            and _live_family_would_collide(target_name, install_src, slot, state, config)):
+        raise RuntimeError(
+            f"refusing to install '{target_name}' onto lane {slot}: the credentials about to be "
+            f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
+            f"or another lane of '{target_name}'. Two live mounts on one token family log one of "
+            f"them out on the next rotation (GH #104 divergence — the 2026-07-07 chats1a logout). "
+            f"No distinct login family could be claimed (pool empty, all families leased, or the "
+            f"source is a stale snapshot copy). Provision another independent login "
+            f"(`cus login-mount {target_name}`) and retry, or move the lane to a different "
+            f"account. Lane left on its prior account (no creds written).")
     # ---- GH #141 root-cause guard (definitive install-point gate) ----
     # This is THE line that writes creds to the live mount; every swap path
     # (snapshot copy, claimed pool family, legacy per-slot login) funnels through
@@ -7704,6 +7805,102 @@ def _lane_mount_sos(slot: str, account: str) -> SOSCondition:
     )
 
 
+def _divergence_risk_lanes(state: dict, config: dict) -> list[tuple[str, str, bool]]:
+    """(slot, account, mount_token_expired) for every LIVE lane whose OWN mount
+    runs the SAME OAuth refresh-token family as another live mount of its account
+    — the shared ~/.claude mount or another live lane. This is the GH #104
+    divergence-logout SETUP (2026-07-07 chats1a): two live mounts on one family,
+    logged out on the next rotation with `401 Invalid authentication credentials`.
+
+    This is the DETECTOR twin of the swap-time `_live_family_would_collide` guard:
+    the guard stops a NEW swap from creating the setup; this surfaces a setup that
+    already exists (a lane provisioned before the guard shipped, a manual mount
+    edit, a state where login_family was never recorded) so an operator sees it
+    BEFORE the rotation bites.
+
+    Why it reads token BYTES rather than keying on login_family being None:
+      * It must CATCH the incident — whose lane had a legacy store that PASSED
+        `has_independent_login` but carried a stale COPY of the shared family. A
+        state-only check that trusted has_independent_login (like
+        `double_booked_live_accounts._covered`) would have judged it safe and
+        stayed silent — exactly why `cus sos` reported all-clear during the
+        incident.
+      * It must NOT false-positive on a GENUINELY independent legacy login
+        (distinct token, login_family unset but clobber-safe — the supported
+        Track-B case with its own passing tests). Comparing actual families keeps
+        that lane quiet (its family matches no other mount).
+    So the discriminator is the true invariant — a shared LIVE family — not a
+    proxy for it. A lane holding a distinct pooled lease installs a distinct
+    family, so it never matches and is never flagged.
+
+    Closes the bare-session blind spot the existing live-mount detectors have:
+    `duplicate_live_mount_families` / `double_booked_live_accounts` gate the
+    shared mount on `mount_in_use(CLAUDE_DIR)` (False for bare sessions — #141),
+    so a lane sharing the shared-mount account was invisible to them.
+    `_live_family_would_collide` counts the shared mount unconditionally in
+    global/hybrid.
+
+    Scoping (mirrors `_blanked_live_lanes`, deliberately quiet elsewhere): only
+    when the independent-logins gate is ON, only lane-serving modes
+    (per_session/hybrid), and only LIVE lanes (`occupied_slot_accounts` is
+    /proc-gated, so idle/observe-only slots — which hold no session to refresh a
+    token — are excluded).
+
+    The bool is whether the lane's OWN mount is already blank/expired
+    (`_live_mount_creds_invalid`) — the caller tiers severity on it (already
+    clobbered ⇒ urgent, still valid ⇒ warning early nudge).
+    """
+    if not independent_logins_enabled(config):
+        return []
+    if config.get("mode", "global") not in ("per_session", "hybrid"):
+        return []
+    out: list[tuple[str, str, bool]] = []
+    for account, slots in occupied_slot_accounts(state).items():
+        for slot in slots:
+            mount_path = mount_creds_path(slot_path(slot))
+            # Does THIS lane's live family already run on another mount of `account`?
+            if not _live_family_would_collide(account, mount_path, slot, state, config):
+                continue
+            try:
+                mount_creds = read_json(mount_path)
+            except (json.JSONDecodeError, OSError):
+                mount_creds = None
+            out.append((slot, account, _live_mount_creds_invalid(mount_creds)))
+    return out
+
+
+def _lane_divergence_sos(slot: str, account: str, mount_expired: bool) -> SOSCondition:
+    """SOS for a lane whose live mount shares one OAuth token family with the
+    shared-mount account (or another lane's account) — the GH #104
+    divergence-logout setup (2026-07-07 chats1a). See `_divergence_risk_lanes`.
+
+    Severity: urgent if the lane's mount token is ALREADY blank/expired (the
+    clobber has likely already fired and the session is/soon logged out);
+    warning otherwise (the setup exists but the rotation hasn't bitten yet — an
+    early nudge to re-provision before it does).
+    """
+    return SOSCondition(
+        severity="urgent" if mount_expired else "warning",
+        summary=(f"lane {slot} shares one OAuth token family for account '{account}' with another "
+                 f"live mount and has NO distinct login family — divergence/logout risk (GH #104)"
+                 + ("; its mount token is already blank/expired" if mount_expired else "")),
+        action=(
+            f"Lane {slot} is live on '{account}' and its mount runs the SAME refresh-token family "
+            f"as the shared ~/.claude mount or another live lane of '{account}' (its "
+            f"state.slots.{slot}.login_family is unset / it never claimed a distinct family). Two "
+            f"live mounts on one token family is the #104 clobber: the next refresh on either "
+            f"side rotates the shared refresh token and logs the other out with "
+            f"'401 Invalid authentication credentials' (the 2026-07-07 chats1a logout, which "
+            f"cost a live session an hour). Fix it by re-running the move so it CLAIMS a distinct "
+            f"pooled family:\n"
+            f"      cus login-mount {account}     # add a pooled family if none is free\n"
+            f"      cus slot move {slot} {account}   # re-claims a distinct family lease\n"
+            f"    or move the lane to a different account:\n"
+            f"      cus slot move {slot} <other-account>"),
+        affected=account,
+    )
+
+
 def _auto_heal_live_lanes(state: dict, config: dict, no_execute: bool = False) -> list[str]:
     """Self-heal blanked live LANE mounts in-daemon (GH #141 follow-up, 2026-07-05).
 
@@ -8371,6 +8568,19 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # needed); an ad-hoc `cus sos` still reports the blank so an operator sees it.
     for _lane_slot, _lane_acct in _blanked_live_lanes(state, config):
         out.append(_lane_mount_sos(_lane_slot, _lane_acct))
+
+    # Condition 0c (2026-07-07, GH #104): a LIVE LANE shares its account with the
+    # shared mount (or another live lane) but holds NO distinct login family —
+    # the divergence-logout SETUP. Conditions 0/0b only fire AFTER a mount is
+    # already blanked; this fires on the SETUP, before the token rotation clobbers
+    # anyone, so an operator can re-provision a distinct family first. Exactly the
+    # 2026-07-07 chats1a shape: slot-2 landed on merkos (also the shared-mount
+    # account and on slot-1) with login_family=None, and ~5 min later a rotation
+    # logged the live session out for an hour. `_divergence_risk_lanes` self-gates
+    # on the independent-logins pool feature + lane-serving mode and never flags a
+    # lane that holds a distinct family.
+    for _dv_slot, _dv_acct, _dv_expired in _divergence_risk_lanes(state, config):
+        out.append(_lane_divergence_sos(_dv_slot, _dv_acct, _dv_expired))
 
     # Condition 1: token expired anywhere
     for name, acct in accounts.items():
@@ -14429,10 +14639,19 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
                    copy installs cleanly — no login family needed (today's copy
                    path; the gate-off default).
       - "claim"    target IS live on another mount, but the login pool can back
-                   a DISTINCT token family (gate on + a free pooled family, or a
-                   legacy per-slot independent login). execute_swap claims that
-                   family — two live mounts, two token families, no clobber
-                   (GH #109).
+                   a DISTINCT token family (gate on + a free pooled family).
+                   execute_swap claims that family — two live mounts, two token
+                   families, no clobber (GH #109).
+
+                   NOTE (2026-07-07, GH #104 chats1a): a legacy per-slot
+                   independent login now only yields "claim" if its token is
+                   GENUINELY distinct from every live mount's family. A stale-copy
+                   legacy store (same family as the shared mount — the chats1a
+                   signature) collides, so execute_swap's `_live_family_would_collide`
+                   guard REFUSES it and this preview falls through to "refuse" too.
+                   Before the fix, `has_independent_login` presence alone counted
+                   as "claim", so the dry-run said CLAIM while the real move left
+                   the lane on the shared family and a rotation logged it out.
       - "refuse"   target IS live on another mount and there is NO distinct
                    family to claim. Installing a plain copy would put two live
                    mounts on ONE OAuth refresh-token family; the next rotation
@@ -14460,7 +14679,19 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     elif not held_elsewhere:
         plan, detail = "snapshot", (
             f"'{target}' is not live on any other mount — a plain snapshot install, no login family needed")
-    elif gate and (has_free_login_family(target, state) or has_independent_login(target, slot_name)):
+    elif gate and (has_free_login_family(target, state)
+                   or (has_independent_login(target, slot_name)
+                       and not _live_family_would_collide(
+                           target, login_store_creds_path(target, slot_name), slot_name, state, config))):
+        # Claimable = a free POOLED family, OR a legacy per-slot login whose token
+        # is GENUINELY distinct from every live mount's family. The legacy branch
+        # is now token-CHECKED (2026-07-07 chats1a): a stale-copy legacy store
+        # shares the shared-mount family, so execute_swap's `_live_family_would_collide`
+        # guard REFUSES it — and the preview must agree, else the dry-run lied
+        # "CLAIM" while the real move refused (the exact divergence that let the
+        # incident's `slot move` print success and then get clobbered). A genuinely
+        # independent legacy login (distinct token) still previews and swaps as a
+        # clean claim, so the supported Track-B behavior is preserved.
         plan, detail = "claim", (
             f"'{target}' is live on {held_by} — execute_swap will claim a free login family "
             f"(distinct token, no clobber; GH #109)")
