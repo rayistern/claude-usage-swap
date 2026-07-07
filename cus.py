@@ -8389,12 +8389,23 @@ def _diagnose_premium_headroom(
     #    becomes a usable target and it alone (with over-cap/blocked candidates) can
     #    still produce the URGENT line.
     premium_config = _config_for_pool(config, "premium")
+    disabled = _disabled_accounts(config)   # operator-parked: never a target, not lost capacity
     valid_targets: list[str] = []       # fresh, below every cap → clean swap
     stale_refreshable: list[str] = []   # idle token_stale, below caps → refresh-on-swap
     lost: list[str] = []                # reachable-but-unusable = visible lost capacity
     for name, acct in sorted(accounts.items()):
         if name in blocking:
             continue  # held by a live mount, no free family → would double-book
+        if name in disabled:
+            # Operator took this account OUT of rotation (`cus disable`). It is
+            # not a swap target, so it can't be valid_targets — and it is also
+            # NOT "lost capacity" to be revived (naming a deliberately-parked
+            # account as lost would tell the operator to un-park it, the opposite
+            # of what they asked). Skip it entirely: neither counted nor named.
+            # (pick_swap_target already excludes it, so _candidate_is_valid would
+            # return False regardless; this makes the intent explicit and keeps
+            # it out of the `lost` list.)
+            continue
         leavers = [a for a in premium_lanes if a != name]
         if not leavers:
             continue  # the only premium lane IS this account; nothing swaps onto it
@@ -9044,6 +9055,41 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         "today — they just can't be a rescue target."),
                 affected="system",
             ))
+
+    # ---- Operator-disabled accounts: silence their per-account klaxon -------
+    # An account the operator deliberately took out of rotation (`cus disable`)
+    # must not scream. The motivating case is a POISONED canonical store (rayi1,
+    # 2026-07-06): before it's disabled it emits an URGENT "canonical store is
+    # clobbered" line every poll; disabling it means the operator has SEEN that
+    # and chosen to park it until a browser relogin. So for any disabled account
+    # that has an outstanding URGENT/WARNING per-account condition (token
+    # expired, poisoned canonical, ...), drop ALL of that account's conditions
+    # and emit ONE soft INFO line instead. Non-loud disabled accounts (only INFO
+    # or nothing) are left untouched — no new noise. SYSTEM-scoped conditions
+    # (affected="system"/"daemon": all-accounts-blocked, premium-headroom
+    # scarcity, ...) are never account-matched here, so a REAL capacity problem
+    # that disabling this account causes still fires at full severity.
+    disabled = _disabled_accounts(config)
+    if disabled:
+        loud = {c.affected for c in out
+                if c.affected in disabled and c.severity in ("urgent", "warning")}
+        if loud:
+            cfg_accounts = {a.get("name"): a for a in config.get("accounts", [])
+                            if isinstance(a, dict)}
+            kept = [c for c in out if c.affected not in loud]
+            for name in sorted(loud):
+                reason = (cfg_accounts.get(name, {}) or {}).get("disabled_reason")
+                rtxt = f", reason: {reason}" if reason else ""
+                kept.append(SOSCondition(
+                    severity="info",
+                    summary=f"{name} is disabled and out of rotation{rtxt}",
+                    action=(f"'{name}' was deliberately taken out of rotation with `cus disable` "
+                            f"(its own alarms are suppressed while disabled). Re-enable with "
+                            f"`cus enable {name}` after fixing (e.g. `cus relogin {name}` for a "
+                            f"poisoned/expired store, then `cus force-poll {name}` to confirm)."),
+                    affected=name,
+                ))
+            out = kept
 
     return out
 
@@ -11758,6 +11804,7 @@ def sessions_cmd(as_json: bool) -> None:
         return
 
     mode = config.get("mode", "global")
+    disabled_set = _disabled_accounts(config)
     click.echo(f"Mode: {mode}   Machine-active (bare-launch) account: {state.get('active', '?')}")
     click.echo()
     if not rows:
@@ -11769,6 +11816,11 @@ def sessions_cmd(as_json: bool) -> None:
             where = r["slot"] or (r["mount"] or click.style("bare", fg="yellow"))
             pool = f" [{r['pool']}]" if r["pool"] else ""
             acct = r["account"] or "?"
+            # Mark an account the operator disabled — a lane already on it keeps
+            # running (disable is future-rotation-only), so it CAN show up live;
+            # the tag stops the operator wondering why a "disabled" account is in use.
+            if r["account"] and r["account"] in disabled_set:
+                acct = f"{acct} {click.style('[disabled]', fg='yellow')}"
             # Line 1: identity + where mounted.
             drift_tag = ""
             if r["drift"]:
@@ -12200,6 +12252,185 @@ def force_poll(account: str) -> None:
     update_state_with_usage(state, {account: u})
     maybe_reset_thresholds(state, config)
     save_state(state)
+
+
+def _known_account_names() -> set[str]:
+    """Every account name cus knows about, from any of its three ledgers.
+
+    disable/enable must accept a name the operator can plausibly reference even
+    if it isn't in every ledger yet:
+      - state.json accounts  — has been polled at least once,
+      - config.yaml accounts — registered for strategy/priority,
+      - account-<name>/ dir  — a snapshot exists on disk (e.g. freshly `cus add`ed
+        but never polled, or the poisoned rayi1 whose canonical store is bad).
+    Union of all three, so `cus disable rayi1` works the moment the dir exists.
+    """
+    names: set[str] = set()
+    try:
+        names |= set(load_state().get("accounts", {}).keys())
+    except (json.JSONDecodeError, OSError):
+        pass
+    if CONFIG_YAML.exists():
+        try:
+            for a in read_yaml(CONFIG_YAML).get("accounts", []):
+                if isinstance(a, dict) and a.get("name"):
+                    names.add(str(a["name"]))
+        except (yaml.YAMLError, OSError):
+            pass
+    if ACCOUNTS_DIR.exists():
+        for d in ACCOUNTS_DIR.glob("account-*"):
+            if d.is_dir():
+                names.add(d.name[len("account-"):])
+    return names
+
+
+def _live_lanes_for_account(name: str) -> list[str]:
+    """Where `name` is currently mounted live (shared active + occupied slots).
+
+    Used to WARN on `cus disable`: disabling governs FUTURE rotation only — it
+    never evicts a lane that is already running on the account (a locked slot
+    especially must be untouched). This just tells the operator which live
+    mounts will keep using the account until they exit on their own. Best-effort
+    / degrade-to-empty; never blocks the disable on an I/O hiccup.
+    """
+    try:
+        state = load_state()
+    except (json.JSONDecodeError, OSError):
+        return []
+    where: list[str] = []
+    if state.get("active") == name:
+        where.append("shared mount (active)")
+    try:
+        for slot in occupied_slot_accounts(state).get(name, []):
+            where.append(slot)
+    except Exception:
+        pass
+    return where
+
+
+@cli.command()
+@click.argument("account", required=True)
+@click.option("--reason", default=None, help="Free-text note on WHY this account is disabled (e.g. 'poisoned canonical store — needs relogin'). Shown in `cus status` and the disabled-account SOS line.")
+def disable(account: str, reason: str | None) -> None:
+    """Take an account OUT of rotation, persistently and reversibly.
+
+    Motivating case (2026-07-06): rayi1's canonical store got clobbered with
+    ANOTHER account's identity, so polling it returns the WRONG account's usage
+    and it cannot be trusted as a swap target until a browser relogin repairs
+    it. `cus disable rayi1` removes it cleanly until then; `cus enable rayi1`
+    puts it back.
+
+    What disabling does (writes `disabled: true` to the account's entry in
+    config.yaml — the durable config, so it survives daemon restarts):
+      - the account is NEVER chosen as a swap/launch target, for any strategy,
+        even as the only candidate and with no degraded-pool fallback (operator
+        mandate outranks "swap somewhere rather than sit hot") — see
+        `_disabled_accounts` / `pick_swap_target`;
+      - it stops counting toward premium-headroom "valid target" scarcity math;
+      - any outstanding URGENT/WARNING SOS for it (poisoned canonical store,
+        token expired, ...) is DOWNGRADED to one soft INFO line — a deliberately
+        parked account should not scream.
+
+    What disabling deliberately does NOT do — it governs FUTURE rotation only:
+      - it does not delete the account dir, credentials, or state;
+      - it does not move or evict a lane already mounted on the account (a
+        locked slot especially is left alone) — those keep running until they
+        exit on their own;
+      - it does not stop `cus force-poll <account>` (so you can check the
+        account after a relogin, before `cus enable`).
+
+    Backward-compatible: absent/false key ⇒ enabled, so existing configs are
+    unaffected. Idempotent: disabling an already-disabled account is a friendly
+    no-op. Reverse with `cus enable <account>`.
+    """
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    known = _known_account_names()
+    if account not in known:
+        click.echo(click.style(
+            f"Unknown account '{account}'. Known: {', '.join(sorted(known)) or '(none)'}", fg="red"))
+        sys.exit(1)
+
+    user_cfg = read_yaml(CONFIG_YAML)
+    accounts = user_cfg.setdefault("accounts", [])
+    entry = next((a for a in accounts if isinstance(a, dict) and a.get("name") == account), None)
+    if entry is None:
+        # The account exists on disk / in state but was never registered in
+        # config.yaml's accounts list (the disabled flag has to live SOMEWHERE
+        # the picker reads it — `_disabled_accounts` scans exactly this list).
+        # Add a minimal entry, mirroring the `cus init` auto-registration path.
+        entry = {"name": account, "priority": 1}
+        accounts.append(entry)
+
+    if entry.get("disabled"):
+        # Idempotent no-op — do not re-stamp disabled_at or clobber the original
+        # reason (that history is more useful than "re-disabled just now").
+        prior = entry.get("disabled_reason")
+        click.echo(f"{account} is already disabled"
+                   + (f" (reason: {prior})" if prior else "")
+                   + f". Re-enable with `cus enable {account}`.")
+        return
+
+    entry["disabled"] = True
+    if reason:
+        entry["disabled_reason"] = reason
+    entry["disabled_at"] = now_iso()
+    write_yaml(CONFIG_YAML, user_cfg)
+
+    click.echo(click.style(f"Disabled '{account}' — it is now OUT of rotation.", fg="yellow", bold=True))
+    if reason:
+        click.echo(f"  reason: {reason}")
+    click.echo(f"  The daemon will never swap or launch ONTO '{account}' until you re-enable it.")
+    click.echo(f"  Re-enable with: cus enable {account}")
+    # Live-lane warning: disable is future-rotation-only, so a lane already on
+    # the account keeps running — say so, or the operator wonders why a live
+    # session is still using a "disabled" account.
+    live = _live_lanes_for_account(account)
+    if live:
+        click.echo(click.style(
+            f"  note: '{account}' is CURRENTLY live on: {', '.join(live)}. "
+            f"These are left running (disable governs future rotation only); "
+            f"they'll release the account when they exit.", fg="yellow"))
+    # The daemon re-reads config every cycle, but a systemd-managed daemon does
+    # not pick up mid-cycle file edits instantly — nudge a restart for immediacy.
+    click.echo("  (running daemon picks this up next cycle; `systemctl --user restart cus.service` to apply now.)")
+
+
+@cli.command()
+@click.argument("account", required=True)
+def enable(account: str) -> None:
+    """Put a previously `cus disable`d account BACK into rotation.
+
+    Clears the `disabled` flag (and its `disabled_reason` / `disabled_at`
+    companions) from the account's config.yaml entry. Idempotent: enabling an
+    account that is already enabled is a friendly no-op. Errors if the account
+    name is unknown.
+    """
+    if not CONFIG_YAML.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    known = _known_account_names()
+    if account not in known:
+        click.echo(click.style(
+            f"Unknown account '{account}'. Known: {', '.join(sorted(known)) or '(none)'}", fg="red"))
+        sys.exit(1)
+
+    user_cfg = read_yaml(CONFIG_YAML)
+    accounts = user_cfg.get("accounts", []) or []
+    entry = next((a for a in accounts if isinstance(a, dict) and a.get("name") == account), None)
+    if entry is None or not entry.get("disabled"):
+        # Absent entry or absent/false key both mean "already in rotation" — a
+        # no-op, not an error (backward-compat: unknown/absent key ⇒ enabled).
+        click.echo(f"{account} is already enabled (in rotation). Nothing to do.")
+        return
+
+    entry.pop("disabled", None)
+    entry.pop("disabled_reason", None)
+    entry.pop("disabled_at", None)
+    write_yaml(CONFIG_YAML, user_cfg)
+    click.echo(click.style(f"Enabled '{account}' — it is back IN rotation.", fg="green", bold=True))
+    click.echo("  (running daemon picks this up next cycle; `systemctl --user restart cus.service` to apply now.)")
 
 
 # GH #76: fd holding the daemon single-instance flock. Module-level on
