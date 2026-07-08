@@ -67,6 +67,152 @@ def test_account_row_est_only_on_divergence():
     assert cus._account_row("a", {"current_5h_pct": 50.0}, {}, 50)["est"] == {}
 
 
+# --- --pretty: fixture env ---------------------------------------------------
+
+
+class _PrettyEnv:
+    """Throwaway state/config with every host-touching helper stubbed, so
+    --pretty renders deterministically from the fixture alone."""
+
+    STATE = {
+        "active": "alpha",
+        "accounts": {
+            "alpha": {
+                "current_5h_pct": 7.0,
+                "current_7d_pct": 78.0,
+                "last_swap_ts": "2026-01-01T00:00:00Z",
+                "per_model_weekly_pct": {"Fable": 74.0},
+            },
+            "bravo": {
+                "current_5h_pct": 82.0,
+                "current_7d_pct": 30.0,
+                "token_stale": True,
+                "next_swap_at_pct": 75,
+            },
+            "charlie": {},
+        },
+        "swap_history": [
+            {"ts": "2026-01-01T00:00:00Z", "from": "alpha", "to": "bravo",
+             "trigger": "auto-ladder"},
+        ],
+        "slots": {"slot-1": {"account": "alpha"}},
+    }
+    CONFIG = (
+        "mode: per_session\n"
+        "accounts:\n"
+        "  - name: alpha\n"
+        "  - name: bravo\n"
+        "  - name: charlie\n"
+        "    disabled: true\n"
+        "session_locks:\n"
+        "  pinned:\n"
+        "    sess-x: alpha\n"
+    )
+
+    def __init__(self, state: dict | None = None, config: str | None = None,
+                 families: dict | None = None, with_slot_dir: bool = True,
+                 sessions: list | None = None):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        (root / "state.json").write_text(json.dumps(state if state is not None else self.STATE))
+        (root / "config.yaml").write_text(config if config is not None else self.CONFIG)
+        self._families = families if families is not None else {"alpha": ["family-1", "family-2"]}
+        self._sessions = sessions if sessions is not None else [
+            cus.LiveSession(session_id="26f23a57beef", account="alpha",
+                            pane="%1", cwd="/home/yaz/code/chabad-commons/GabAI",
+                            started_at="2026-01-01T00:00:00Z",
+                            last_stop_at=None, transcript_path=None),
+            cus.LiveSession(session_id="5c0e416adead", account="alpha",
+                            pane="%3", cwd="/home/yaz",
+                            started_at="2026-01-01T00:00:00Z",
+                            last_stop_at=None, transcript_path=None),
+        ]
+        slot_dirs = []
+        if with_slot_dir:
+            (root / "slot-1").mkdir()
+            slot_dirs = [root / "slot-1"]
+        stubs = {
+            "STATE_JSON": root / "state.json",
+            "CONFIG_YAML": root / "config.yaml",
+            "diagnose": lambda state, config: [],
+            "find_live_sessions": lambda *a, **k: self._sessions,
+            "list_slot_dirs": lambda: slot_dirs,
+            "mount_pids": lambda d: [11, 12] if d.name == "slot-1" else [],
+            "pane_mount_name": lambda pane, tmux_socket=None: "slot-1" if pane == "%1" else None,
+            "list_login_families": lambda a: self._families.get(a, []),
+            "leased_families": lambda a, st: set(),
+            "slot_leased_family": lambda st, slot: None,
+            "has_independent_login": lambda a, slot: False,
+            "list_provisioned_logins": lambda: [],
+        }
+        self._saved = {k: getattr(cus, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(cus, k, v)
+
+    def restore(self):
+        for k, v in self._saved.items():
+            setattr(cus, k, v)
+        self._tmp.cleanup()
+
+
+def _pretty(env_kwargs: dict | None = None, columns: str = "160") -> str:
+    env = _PrettyEnv(**(env_kwargs or {}))
+    try:
+        res = CliRunner().invoke(cus.status, ["--pretty"], env={"COLUMNS": columns},
+                                 catch_exceptions=False)
+        return res.output
+    finally:
+        env.restore()
+
+
+# --- --pretty: header + accounts table --------------------------------------
+
+
+def test_pretty_header_mode_and_ladder():
+    out = _pretty()
+    assert "per_session" in out
+    assert "bare-launch: alpha" in out
+    assert "50% → 75% → 90%" in out
+
+
+def test_pretty_accounts_table_core():
+    out = _pretty()
+    assert "● alpha" in out                      # active marker replaces ' *'
+    assert "Fable 74%" in out                    # per-model column
+    assert " ago" in out                         # relative last swap
+    assert "never" in out                        # bravo/charlie never swapped
+    assert "█" in out                            # bars at 160 cols
+
+
+def test_pretty_staleness_markers_survive():
+    out = _pretty()
+    assert "82%~" in out                         # stale-known 5h keeps ~
+    assert "?" in out                            # unknown 7d keeps ?
+    assert "TOKEN_STALE" in out
+
+
+def test_pretty_disabled_and_next_swap():
+    out = _pretty()
+    assert "DISABLED" in out
+    assert "next@75%" in out
+
+
+def test_pretty_pool_column_and_gate_caption():
+    out = _pretty()
+    assert "2/2 free" in out
+    assert "gate OFF" in out                     # pools exist, gate not enabled
+
+
+def test_pretty_plain_mode_untouched_by_flag_addition():
+    env = _PrettyEnv()
+    try:
+        out = CliRunner().invoke(cus.status, catch_exceptions=False).output
+        assert "●" not in out
+        assert "alpha *" in out                  # plain active marker survives
+    finally:
+        env.restore()
+
+
 def _run_all() -> int:
     import types
     tests = [v for k, v in globals().items()

@@ -4,6 +4,7 @@
 # dependencies = [
 #     "click>=8.0",
 #     "pyyaml>=6.0",
+#     "rich>=13.0",
 # ]
 # ///
 """claude-usage-swap (cus) — auto-rotate Claude Code OAuth accounts.
@@ -10697,7 +10698,8 @@ def _account_row(name: str, acct: dict, config: dict, first_step: float) -> dict
 
 
 @cli.command()
-def status() -> None:
+@click.option("--pretty", is_flag=True, help="Rich, width-adaptive tables (color, usage bars).")
+def status(pretty: bool) -> None:
     """Show active account, per-account usage state, locks, and recent activity."""
     if not STATE_JSON.exists():
         click.echo("Not initialized. Run `cus init` first.")
@@ -10705,6 +10707,9 @@ def status() -> None:
 
     state = read_json(STATE_JSON)
     config = load_config()
+    if pretty:
+        _render_status_pretty(state, config)
+        return
     color_on = sys.stdout.isatty()
     mode = config.get("mode", "global")
     per_session = mode == "per_session"
@@ -10871,6 +10876,140 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+def _render_status_pretty(state: dict, config: dict) -> None:
+    """`cus status --pretty` — rich one-shot render, sized to the terminal.
+
+    Spec: docs/plans/2026-07-07-status-pretty.md. Same data as plain status,
+    restructured for scanning: bracket-notes become cells, login pools fold
+    into a Pool column, Lanes+Live-sessions merge into one table.
+
+    rich imports stay INSIDE this function so the daemon / statusline hot
+    paths (and every non-pretty `cus` invocation) never pay for them.
+    """
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console(highlight=False)
+    width = console.width
+    show_bars = width >= 110      # spec breakpoints: bars only when roomy,
+    fold_models = width < 80      # by-model folds under the account when tight
+
+    mode = config.get("mode", "global")
+    cfg_steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    first_step = cfg_steps[0] if cfg_steps else 50
+    last_step = cfg_steps[-1] if cfg_steps else 90
+
+    if mode == "per_session":
+        head = f"per_session · bare-launch: {state['active']}"
+    elif mode == "hybrid":
+        head = f"hybrid · shared-mount: {state['active']}"
+    else:
+        head = f"global · active: {state['active']}"
+    ladder = " → ".join(f"{s}%" for s in cfg_steps)
+    console.print(Text.assemble((head, "bold"), ("  ·  ladder ", "dim"), (ladder, "dim")))
+    console.print()
+
+    def rel_ts(iso: str | None) -> str:
+        if not iso or iso == "never":
+            return "never"
+        secs = _time_since(iso)
+        return iso if secs is None else _fmt_duration(secs) + " ago"
+
+    def ladder_style(val: float) -> str:
+        # Colors mean "how close to a swap": the ladder's own thresholds.
+        if val >= last_step:
+            return "red"
+        if val >= first_step:
+            return "yellow"
+        return "green"
+
+    def usage_cell(acct: dict, key: str, row: dict) -> Text:
+        win = "5h" if key == "current_5h_pct" else "7d"
+        if _pct_is_unknown(acct, key):
+            return Text("?", style="dim")
+        val = acct.get(key, 0.0)
+        stale = _pct_is_stale_known(acct, key)
+        style = "dim" if stale else ladder_style(val)
+        t = Text()
+        if show_bars:
+            filled = min(8, max(0, round(val / 100 * 8)))
+            t.append("█" * filled + "░" * (8 - filled) + " ", style=style)
+        t.append(f"{val:.0f}%" + ("~" if stale else ""), style=style)
+        if win in row["est"]:
+            est_val, rate = row["est"][win]
+            t.append(f" ↗{est_val:.0f} +{rate:.1f}/m", style="dim")
+        return t
+
+    def per_model_text(acct: dict, row: dict) -> Text:
+        stale = _model_pct_is_stale(acct)
+        t = Text()
+        for i, (m, p) in enumerate(row["per_model"]):
+            if i:
+                t.append("  ")
+            t.append(f"{m} {p:.0f}%" + ("~" if stale else ""),
+                     style="dim" if stale else "")
+        return t
+
+    def status_cell(row: dict) -> Text:
+        t = Text()
+        if not row["flags"]:
+            t.append("ok", style="green")
+        else:
+            for i, f in enumerate(row["flags"]):
+                if i:
+                    t.append(",")
+                t.append(f, style="red dim" if f == "DISABLED" else "yellow")
+        if row["next_swap_pct"] is not None:
+            t.append(f" next@{row['next_swap_pct']:.0f}%", style="dim")
+        return t
+
+    pool_want = config.get("independent_logins", {}).get("pool_size", 3)
+
+    def pool_cell(name: str) -> Text:
+        fams = list_login_families(name)
+        if not fams:
+            return Text("")
+        free = [f for f in fams if f not in leased_families(name, state)]
+        return Text(f"{len(free)}/{len(fams)} free",
+                    style="yellow" if len(fams) < pool_want else "")
+
+    tbl = Table(box=box.SIMPLE_HEAD, pad_edge=False)
+    tbl.add_column("Account", no_wrap=True)
+    tbl.add_column("5h")
+    tbl.add_column("7d")
+    if not fold_models:
+        tbl.add_column("7d by model")
+    tbl.add_column("Status")
+    tbl.add_column("Last swap")
+    tbl.add_column("Pool")
+    for name, a in sorted(state["accounts"].items()):
+        row = _account_row(name, a, config, first_step)
+        acct_cell = Text()
+        active = name == state["active"]
+        acct_cell.append("● " if active else "  ")
+        acct_cell.append(name, style="bold" if active else "")
+        pm = per_model_text(a, row)
+        if fold_models and row["per_model"]:
+            acct_cell.append("\n    ")
+            acct_cell.append_text(pm)
+        cells = [acct_cell,
+                 usage_cell(a, "current_5h_pct", row),
+                 usage_cell(a, "current_7d_pct", row)]
+        if not fold_models:
+            cells.append(pm)
+        cells += [status_cell(row), Text(rel_ts(row["last"])), pool_cell(name)]
+        tbl.add_row(*cells)
+    console.print(tbl)
+
+    il_on = config.get("independent_logins", {}).get("use_independent_logins", False)
+    if not il_on and any(list_login_families(n) for n in state["accounts"]):
+        console.print(Text("  (login-pool gate OFF — swaps still copy; "
+                           "set use_independent_logins: true)", style="yellow"))
+    console.print()
 
 
 # --------------------------------------------------------------------------
