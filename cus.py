@@ -2541,20 +2541,32 @@ def _reserve(entry: dict) -> dict:
     return entry
 
 
-def _allocate_slot_unlocked(state: dict) -> tuple[str, Path]:
+def _allocate_slot_unlocked(state: dict, config: dict | None = None) -> tuple[str, Path]:
     """Lowest-free-index allocation + scaffold + reservation, NO lock/save.
 
     Inner helper so acquire_slot (already holding the swap lock) can allocate
     without re-taking the lock (flock is not reentrant across fds in one
     process — a nested take would deadlock).
+
+    `config` (optional): when supplied, indices whose slot name is in
+    `session_locks.locked_slots` are skipped so a brand-new allocation never
+    creates/returns a locked slot name. This closes the launch-path asymmetry
+    where every daemon-side slot-mover honored locked_slots but the launch /
+    slot-allocation path did not (a new pane could land on a locked slot — e.g.
+    slot-3, already held by the watchdog session). None ⇒ no lock filtering
+    (legacy callers that legitimately have no config in scope).
     """
     slots = state.setdefault("slots", {})
+    locked = _locked_slots(config) if config else set()
     n = 1
     while True:
         name = f"{SLOT_PREFIX}{n}"
-        # Free index = no state entry AND no dir on disk. A dir with no entry is
-        # an orphan (SOS flags it); skip its index rather than colliding.
-        if name not in slots and not slot_path(name).exists():
+        # Free index = no state entry AND no dir on disk AND not locked. A dir
+        # with no entry is an orphan (SOS flags it); skip its index rather than
+        # colliding. A locked index is user intent ("this slot stays put") — the
+        # launch path must respect session_locks.locked_slots like the daemon
+        # movers do, so never allocate a NEW slot onto a locked name.
+        if name not in slots and not slot_path(name).exists() and name not in locked:
             break
         n += 1
     d = slot_path(name)
@@ -2563,7 +2575,7 @@ def _allocate_slot_unlocked(state: dict) -> tuple[str, Path]:
     return name, d
 
 
-def create_slot(state: dict) -> tuple[str, Path]:
+def create_slot(state: dict, config: dict | None = None) -> tuple[str, Path]:
     """Allocate the lowest free slot index, scaffold, register + reserve it.
 
     Runs under the swap lock and persists state itself (then syncs the caller's
@@ -2571,16 +2583,22 @@ def create_slot(state: dict) -> tuple[str, Path]:
     can't allocate the same index — the loser reloads inside the lock and picks
     the next free one. The reservation makes the new slot look busy until its
     launch attaches a PID.
+
+    `config` (optional): threaded through to `_allocate_slot_unlocked` so a new
+    slot never lands on a `session_locks.locked_slots` index — the launch /
+    allocation path must honor locks like the daemon movers do. None ⇒ no lock
+    filtering.
     """
     with _swap_lock():
         fresh = load_state()
-        name, d = _allocate_slot_unlocked(fresh)
+        name, d = _allocate_slot_unlocked(fresh, config)
         save_state(fresh)
     state["slots"] = fresh.get("slots", {})
     return name, d
 
 
-def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, Path]:
+def acquire_slot(state: dict, prefer_account: str | None = None,
+                 config: dict | None = None) -> tuple[str, Path]:
     """Find a free slot for a launch (create one if none), reserving it.
 
     Runs the free-scan + reservation under the swap lock on a freshly-reloaded
@@ -2592,14 +2610,29 @@ def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, P
     Preference order: a free slot ALREADY holding prefer_account (no swap
     needed), then any free slot, then a new slot. Orphan dirs (on disk, no
     state entry) are adopted. Persists state and syncs the caller's view.
+
+    `config` (optional): when supplied, slots named in
+    `session_locks.locked_slots` are EXCLUDED from the free-candidate list and
+    from the new-allocation fallback. This closes a launch-path asymmetry — the
+    daemon-side slot-movers (ladder / hard-cap / reactive-429 / idle-gc) all
+    skip locked slots, but the launch path never received `config`, so it would
+    happily auto-pick a locked slot. Incident 2026-07-08: a new `cus launch`
+    pane landed on slot-3, a locked slot already held by the watchdog session.
+    None ⇒ no lock filtering (legacy callers with no config in scope).
     """
     with _swap_lock():
         fresh = load_state()
         slots_state = fresh.setdefault("slots", {})
+        # A locked slot must never be auto-picked or freshly allocated — locks
+        # are user intent ("this slot stays put"), and the launch path must honor
+        # them exactly like the daemon movers do.
+        locked = _locked_slots(config) if config else set()
         free: list[Path] = []
         for d in list_slot_dirs():
             entry = slots_state.setdefault(d.name, {"account": None, "created_ts": now_iso()})
             if _slot_busy(d.name, entry):
+                continue
+            if d.name in locked:
                 continue
             free.append(d)
         chosen: Path | None = None
@@ -2614,7 +2647,9 @@ def acquire_slot(state: dict, prefer_account: str | None = None) -> tuple[str, P
             _reserve(slots_state[chosen.name])
             name, d = chosen.name, chosen
         else:
-            name, d = _allocate_slot_unlocked(fresh)  # already locked — use inner
+            # already locked (flock) — use inner; pass config so the new-index
+            # allocation also skips locked slot names.
+            name, d = _allocate_slot_unlocked(fresh, config)
         save_state(fresh)
     state["slots"] = fresh.get("slots", {})
     return name, d
@@ -16424,7 +16459,10 @@ def slot_create_cmd() -> None:
     account into it. Walk-back: `cus slot gc --slot <name>`.
     """
     state = load_state()
-    name, d = create_slot(state)
+    # Pass config so an explicit `cus slot create` also skips locked-slot
+    # indices — the allocation path honors session_locks.locked_slots
+    # everywhere, not just on `cus launch`.
+    name, d = create_slot(state, load_config())
     save_state(state)
     sync_result = None
     if CLAUDE_JSON.exists():
@@ -16953,14 +16991,24 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         slot_dir = slot_path(lane)
         if slot_dir.exists() and mount_in_use(slot_dir) and cur not in (None, account):
             raise click.ClickException(f"--lane {lane} is live on '{cur}', not '{account}'. Pick a free lane.")
+        # Lock guard: a locked lane is frozen for the daemon movers, so a launch
+        # must not pin onto it either (locks are user intent — "this slot stays
+        # put no matter what"). --force overrides once, mirroring `cus slot move`.
+        if lane in _locked_slots(config) and not force:
+            raise click.ClickException(
+                f"refusing to launch onto locked slot '{lane}' (session_locks.locked_slots); "
+                f"pass --force to override or `cus unlock {lane}`")
         scaffold_mount_dir(slot_dir)  # idempotent
         slot_name = lane
     else:
         # acquire_slot persists the reservation itself (under the swap lock), so
         # a concurrent launch / the daemon's gc already see this slot as claimed
         # — no save_state here (it would re-write our possibly-staler `state`
-        # over acquire's fresh persist).
-        slot_name, slot_dir = acquire_slot(state, prefer_account=account)
+        # over acquire's fresh persist). Pass `config` so the auto-pick honors
+        # session_locks.locked_slots like the daemon slot-movers do (a locked
+        # slot must never be auto-picked — incident 2026-07-08: a new pane
+        # landed on locked slot-3, the watchdog session's slot).
+        slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config)
 
     # Pre-flight: heal the slot's layout quietly (a launch should never come
     # up bare-hooked because a symlink rotted), then align its .claude.json
@@ -17120,7 +17168,9 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
                 click.echo(f"  - {p}")
             sys.exit(1)
         if not any(not mount_in_use(d) for d in list_slot_dirs()):
-            name, _ = create_slot(state)
+            # config is in scope here — pass it so the first slot never lands on
+            # a locked-slot index (honors session_locks.locked_slots).
+            name, _ = create_slot(state, config)
             save_state(state)
             click.echo(f"  created first slot: {name}")
         _set_config_mode(new_mode)
