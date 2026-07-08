@@ -299,6 +299,7 @@ def test_pretty_minimal_state_hides_sections():
     assert "Recent swaps" not in out
     assert "Locks" not in out
     assert "gate OFF" not in out
+    assert "bare-launch: a" in out               # header still renders
 
 
 def _run_all() -> int:
