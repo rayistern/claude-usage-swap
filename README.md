@@ -1,10 +1,28 @@
 # claude-usage-swap (`cus`)
 
-Auto-rotate Claude Code OAuth accounts based on usage thresholds. Single-file Python, Linux-only, ~2000 LOC.
+[![CI](https://github.com/rayistern/claude-usage-swap/actions/workflows/ci.yml/badge.svg)](https://github.com/rayistern/claude-usage-swap/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+
+Auto-rotate Claude Code OAuth accounts based on usage thresholds. Single-file Python, Linux-only.
+
+> ⚠️ **Read [`SECURITY.md`](SECURITY.md) first.** `cus` reads and moves your Claude OAuth credentials, and it relies on the *undocumented* `CLAUDE_CONFIG_DIR` and OAuth usage endpoint (Anthropic can change these anytime). Whether multi-account rotation fits your subscription's Terms of Service is yours to determine. MIT, no warranty, use at your own risk.
 
 When one of your Claude Pro/Max accounts approaches its 5-hour or weekly cap, `cus` swaps the active credentials to a different account — atomically, with optional hot-swap of in-flight tmux sessions so conversations preserve via `claude --resume`.
 
 > **Status:** v0.1, ready to use. Production-tested on the author's setup. No external maintainers; PRs welcome.
+
+## Is this for you?
+
+`cus` fits a narrow but real profile. It's worth your time if **all** of these are true:
+
+- You have **two or more** Claude Pro/Max accounts (e.g. work + personal, or multiple plans) and legitimately want to spread your own work across them.
+- You're on **Linux** (macOS/Windows are out of scope — see [Limitations](#limitations)).
+- You're comfortable with a **background daemon** that reads and swaps Claude Code's credential files, plus `systemd --user` and (optionally) `tmux`.
+
+If you just want to *manually* switch between accounts, a lighter tool is a better fit — see [Existing tools](#existing-tools-and-why-this-one). If you're on one account, you don't need this. If any of the above is a "no," `cus` is probably more machinery than you want.
+
+**Before you install, please read [Is this allowed?](#is-this-allowed-anthropics-terms) below.** Rotating accounts to manage caps sits in a gray area of how subscriptions are meant to be used; that section lays out where the line is and why `cus` is designed to stay on the safe side of it.
 
 ## What problem this solves
 
@@ -24,12 +42,39 @@ Across many concurrent sessions and many machines, this gets old. `cus` automate
 
 ## Existing tools, and why this one
 
-`cus` exists because no single tool does *all* of: per-account progressive thresholds + tmux-aware hot-swap + `CLAUDE_CONFIG_DIR`-style file swap + N-account pool. Closest competitors:
+The multi-account space is not empty, but the tools cluster into buckets that each stop short of what `cus` does. `cus` exists because no single tool does *all* of: **poll-based** per-account progressive thresholds + tmux-aware hot-swap + `CLAUDE_CONFIG_DIR`-style file swap + N-account pool balancing. Where the others land:
 
-- [cux](https://github.com/inulute/cux) — Go wrapper, in-place credential keystore swap (single global threshold). Methodology lifted; reimplemented in Python without the keystore manipulation (unnecessary on Linux).
-- [AIMUX](https://github.com/Digital-Threads/aimux) — manual `CLAUDE_CONFIG_DIR` profile switcher; no auto-rotation.
-- [teamclaude](https://github.com/KarpelesLab/teamclaude), [ccflare](https://github.com/snipeship/claude-balancer) — proxy-based, different architecture.
-- [ccusage](https://ccusage.com) — usage display only; doesn't switch.
+**Manual switchers** — you run a command when *you* notice the limit; no daemon, no usage polling:
+- [ccrotate](https://github.com/somersby10ml/ccrotate) — JS CLI, `next` / `switch <email>` by hand.
+- [claude-swap / `cswap`](https://umesh-malik.com/blog/claude-swap-multi-account-switcher-guide) — fast registered-account switching, no auto-rotation.
+- [AIMUX](https://github.com/Digital-Threads/aimux) — manual `CLAUDE_CONFIG_DIR` profile switcher.
+
+**Single-session auto-rotator** — the closest in spirit:
+- [cux](https://github.com/inulute/cux) — wraps one session, rotates on an approaching limit with `--resume`, single global threshold. Methodology lifted here and reimplemented in Python; `cus` adds poll-based per-account ladders, an N-account pool, per-session slots, and per-model caps on top.
+
+**Proxy-based** (different architecture — route through a local balancer):
+- [teamclaude](https://github.com/KarpelesLab/teamclaude), [ccflare](https://github.com/snipeship/claude-balancer).
+
+**Display-only:**
+- [ccusage](https://ccusage.com) — shows usage; doesn't switch.
+
+## Is this allowed? (Anthropic's terms)
+
+Short version: **holding multiple accounts is not itself a Terms of Service violation**, and `cus` is deliberately built to avoid the specific behaviors Anthropic *has* enforced against. But rotating accounts to stay under caps is a gray area, so read this and decide for yourself — this is a personal workflow tool, not something Anthropic endorses.
+
+**What Anthropic has actually enforced against** (January 2026): tools that **extract OAuth tokens from a Claude Code subscription and route them through their own API clients** — OpenCode, Roo Code, Goose and similar had their consumer OAuth tokens blocked. The line Anthropic polices is token exfiltration / reselling / running subscription credentials through third-party clients, plus account *sharing* (multiple people on one plan).
+
+**Why `cus` is designed to stay on the safe side of that line:**
+- It **never extracts tokens and never runs its own API client.** It swaps the same `.credentials.json` + `~/.claude.json` keys that Claude Code itself reads, and all traffic goes through the normal `claude` process using Anthropic's own OAuth flow. There is no proxy and no third-party client in the path.
+- It uses **your own accounts for your own work** — not shared, not resold. Anthropic's stated position is that holding more than one account is not against the terms; enforcement targets misuse, not ordinary multi-account users.
+- Usage is read from the **same OAuth usage endpoint Claude Code uses for `/usage`** — no scraping, no undocumented private API abuse beyond what the client already does.
+
+**Honest caveats:**
+- The *purpose* — rotating to avoid hitting a cap — is "limit management" that some would read as "limit evasion." That is the gray part. Use your own judgment.
+- Because `cus` depends on Claude Code's on-disk credential format and OAuth endpoints, Anthropic could change either at any release and break it — or decide to discourage multi-account rotation directly. Its usefulness is tied to that posture not changing.
+- Don't point two live mounts at *copies* of one login family — that rotates a single-use refresh token and logs one session out. `cus` guards against this automatically (see [No double-booking](#mode-hybrid--manage-slots-and-the-shared-mount-together-2026-07-02)), but it's the mechanical reason account-sharing setups get flagged, so don't defeat the guard.
+
+If any of that is more risk than you want to carry, don't run it. If it's a fit, the rest of this README is the manual.
 
 ## Installation
 

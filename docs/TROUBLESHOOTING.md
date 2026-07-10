@@ -47,6 +47,36 @@ cus sos                      # should print "✓ All clear"
 
 Same fix as "All accounts blocked" — usually a symptom of the same underlying problem.
 
+### `lane slot-N, slot-M on '<acct>' at 100% (≥90%) with no swap target` (per_session / hybrid)
+
+**What:** one or more per-session lanes are pinned to an account that has crossed its ladder step, but the lane cannot rotate — every other account is either **held by another live mount** (GH #104 forbids double-booking one account across two live mounts; it clobbers the shared OAuth refresh token) or is itself **saturated**. This is the designed degradation when you run more concurrent live sessions than you have headroom accounts: the hot lane holds and its usage climbs (it will start hitting user-facing 429s), rather than the daemon making an unsafe swap.
+
+**Resolutions (any one):**
+
+1. **Provision an independent login for a headroom account** so the stuck lane can *borrow* it without double-booking. Look at `cus status` for an account with low usage (5h/7d **and** its per-model `Fable=` line) whose login pool is exhausted (`0 free`) — that low-usage account is unusable as a target *only* because it has no spare login family. Give it one:
+   ```bash
+   cus login-mount slot-N <headroom-account>          # run the printed browser /login AS that account
+   cus login-mount slot-N <headroom-account> --finish
+   ```
+   This is the no-session-lost fix: nothing exits, the stuck lane rotates onto the borrowed login.
+2. **Add another account:** `cus add <name>` (then log in). More headroom = more rotation targets.
+3. **Free a live lane by exiting an idle session.** If one of the stuck lanes is a session you're not actively using, `/exit` it. Exiting the `claude` process **keeps the tmux pane open** (it returns to a shell) and immediately frees that account as a rotation target. See the idle-lane note below.
+4. **Wait** for another account's 5h or 7d window to reset (`cus status` shows reset times).
+
+### Can an idle lane be "dropped" automatically without closing its tmux pane?
+
+**Not today.** cus decides a lane is *live* by whether its mount directory has running processes (`mount_pids`). An open tmux pane running `claude` is a live process, therefore a live mount — even if the session is idle (you're not prompting it). Consequences:
+
+- `cus slot gc` will **not** reclaim it — gc only reaps slots with **no** live process after `slot_gc_idle_hours` (default 72h).
+- The idle lane keeps occupying its account and blocks that account from being a rotation/rescue target, which is what produces the SOS above.
+
+A running `claude` process holds its credential mount and can make requests at any time, so cus cannot safely "drop" its account allocation while the process is alive. The only ways to free the account are:
+
+- **Exit the idle session** — `/exit` in that pane. This ends the `claude` process but leaves the **tmux pane open** at a shell prompt, and frees the account immediately. (Exiting ≠ closing the pane.)
+- **Rotate it to a headroom account** — which requires an available target / independent login (resolutions 1–2 above).
+
+Automatic reclaim of an idle-but-open lane (ending the idle `claude` process under capacity pressure while preserving the pane) is a proposed feature — see [issue #133](https://github.com/rayistern/claude-usage-swap/issues/133). Until it lands, freeing an idle lane is a manual `/exit` (pane-preserving) or an independent-login provision.
+
 ### `Stale usage data for: <names> (no fresh poll in >NN min)`
 
 **What:** the daemon hasn't successfully polled these accounts in the last 4 poll-intervals. Daemon may be down, or the polling endpoint is down.
@@ -86,6 +116,15 @@ python3 -c "import json; print(json.load(open('$HOME/claude-accounts/slot-N/.cla
 # NOT run a swap first; its save-back would write one account's tokens into
 # another's snapshot).
 ```
+
+**If the drift came from a crashed swap** (a `swap.journal` file is present), you don't have to hand-edit `state.json` — trigger the built-in crash-recovery, which records reality and clears the journal for you:
+```bash
+python3 ~/repos/claude-usage-swap/cus.py daemon --once --no-execute   # runs _recover_pending_swap() at startup
+```
+
+**Two known robustness gaps this drift class exposes** (2026-07-05 incident):
+- The crash-recovery above runs only on a swap or daemon start, so a drift can **persist silently** between them until you trigger it manually — tracked in [issue #135](https://github.com/rayistern/claude-usage-swap/issues/135).
+- A swap that fires *while a slot is drifted* can **clobber the wrong account's snapshot** (its save-back trusts the stale `from` label) — tracked in [issue #134](https://github.com/rayistern/claude-usage-swap/issues/134). If a snapshot got clobbered, recover with `cus restore-creds <name> --list` or a fresh `cus relogin <name>`.
 
 ### `Bare session(s) on ~/.claude/ are burning '<name>'` (per_session)
 
