@@ -211,6 +211,98 @@ def test_reactive_429_attributes_to_slot_account():
         env.restore()
 
 
+def test_reactive_429_event_binding_refuses_new_slot_account():
+    """A delayed event from alpha must never move beta after alpha→beta rescue."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        slot = env.make_slot("beta", live=True)
+        state = cus.load_state()
+        original = cus.session_current_slot
+        cus.session_current_slot = lambda sid: slot if sid == "sA" else None
+        event = {"ts": cus.now_iso(), "session_id": "sA", "match": "rate_limit",
+                 "source": "stopfailure", "slot": slot, "account": "alpha"}
+        try:
+            assert cus.check_rate_limit_reactive_per_session(state, _config(), entries=[event]) == []
+            assert not event.get("_retry"), "stale generation is settled, not replayed"
+        finally:
+            cus.session_current_slot = original
+    finally:
+        env.restore()
+
+
+def test_reactive_429_hysteresis_persists_pending_event():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({
+            "current_5h_pct": 100.0, "last_swap_ts": cus.now_iso(),
+        })
+        cus.save_state(state)
+        original = cus.session_current_slot
+        cus.session_current_slot = lambda sid: slot if sid == "sA" else None
+        event_ts = cus.now_iso()
+        cus.RATE_LIMIT_LOG.write_text(
+            f"{event_ts},sA,rate_limit,stopfailure,{slot},alpha\n"
+        )
+        try:
+            cfg = _config(swap_hysteresis={
+                "enabled": True, "min_seconds_between_reactive_swaps": 300,
+            })
+            assert cus.check_rate_limit_reactive_per_session(state, cfg) == []
+            assert state["pending_429_entries"][0]["account"] == "alpha"
+            assert state["last_429_check_ts"], "disk cursor advances only after pending is persisted"
+        finally:
+            cus.session_current_slot = original
+    finally:
+        env.restore()
+
+
+def test_reactive_429_refuses_degraded_immediate_retrip_target():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 10.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 98.0, "current_7d_pct": 10.0})
+        original = cus.session_current_slot
+        cus.session_current_slot = lambda sid: slot if sid == "sA" else None
+        event = {"ts": cus.now_iso(), "session_id": "sA", "match": "rate_limit",
+                 "source": "stopfailure", "slot": slot, "account": "alpha"}
+        try:
+            assert cus.check_rate_limit_reactive_per_session(state, _config(), entries=[event]) == []
+            assert event.get("_retry") is True
+        finally:
+            cus.session_current_slot = original
+    finally:
+        env.restore()
+
+
+def test_reactive_resume_targets_each_pane_once():
+    sessions = [
+        type("S", (), {"pane": "%1"})(),
+        type("S", (), {"pane": "%1"})(),
+        type("S", (), {"pane": "%2"})(),
+    ]
+    original_live = cus.live_sessions_on_slot
+    original_keys = cus.tmux_send_keys
+    original_text = cus.tmux_send_text
+    keys: list[tuple] = []
+    texts: list[tuple] = []
+    cus.live_sessions_on_slot = lambda slot: sessions
+    cus.tmux_send_keys = lambda pane, *sent: keys.append((pane, *sent)) or True
+    cus.tmux_send_text = lambda pane, message: texts.append((pane, message)) or True
+    try:
+        panes = cus._resume_reactive_slot_sessions("slot-2", _config())
+        assert panes == ["%1", "%2"]
+        assert keys == [("%1", "Escape", "Escape"), ("%2", "Escape", "Escape")]
+        assert len(texts) == 2 and all("Continue from exactly where" in msg for _, msg in texts)
+    finally:
+        cus.live_sessions_on_slot = original_live
+        cus.tmux_send_keys = original_keys
+        cus.tmux_send_text = original_text
+
+
 def test_fast_cadence_tracks_occupancy_in_per_session():
     env = _Env()
     try:
