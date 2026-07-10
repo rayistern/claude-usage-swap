@@ -2689,6 +2689,125 @@ def sync_mount_claude_json(mount: Path, canonical: dict) -> dict:
     return {"changed": bool(updated), "keys_updated": updated}
 
 
+# ---------------------------------------------------------------------------
+# MCP OAuth carry-over (2026-07-10).
+#
+# Claude Code stores OAuth tokens for REMOTE MCP servers (atlassian,
+# singlemcp-*) in the SAME .credentials.json as the account OAuth, under a
+# sibling "mcpOAuth" key, keyed "serverName|configHash". Those tokens are
+# bound to the MCP server (its URL + a dynamically-registered OAuth client),
+# NOT to the Claude account or the config dir — so one authentication is
+# valid on every mount. But because cus installs .credentials.json wholesale
+# (execute_swap copies the account snapshot over the slot's live file), every
+# swap silently clobbered the slot's MCP tokens with whatever stale/empty
+# mcpOAuth the snapshot happened to carry: a session that had authenticated
+# atlassian kept working from its in-memory token, while ON DISK the tokens
+# were gone — and every NEW session on that slot opened to "needs
+# authentication" (the 2026-07-10 jira2a/slot-11 report; at that point not
+# one of the 13 slots held a live MCP token on disk, only registration stubs).
+#
+# Fix: a canonical per-machine store (~/claude-accounts/mcp-oauth.json, 0600)
+# that
+#   (a) HARVESTS live mcpOAuth entries whenever cus reads a mount's creds
+#       (swap-out at the install point, every save-back, and a periodic
+#       daemon pass), freshest expiresAt winning, and
+#   (b) INJECTS the canonical entries whenever cus writes creds to a live
+#       mount (the swap install point) plus the periodic pass over all live
+#       mounts — so authenticating an MCP server ONCE in ANY session
+#       propagates to every current and future slot within one poll cycle.
+#
+# claudeAiOauth (the account token, with its whole #3/#77/#104/#141 guard
+# stack) is NEVER touched by any of this — mcpOAuth is a disjoint key.
+MCP_OAUTH_STORE = ACCOUNTS_DIR / "mcp-oauth.json"
+
+
+def _mcp_entry_live(entry: Any) -> bool:
+    """A usable mcpOAuth entry: carries an access token or at least a refresh
+    token (expired-but-refreshable is still valuable — Claude Code refreshes
+    it silently on connect). Registration-only stubs (clientId +
+    discoveryState with empty token fields) are what a needs-auth server
+    looks like on disk — those are NOT live and must never overwrite a real
+    token during a merge."""
+    return isinstance(entry, dict) and bool(entry.get("accessToken") or entry.get("refreshToken"))
+
+
+def _mcp_entry_score(entry: Any) -> float:
+    """Freshness ordering between two LIVE entries for the same server key:
+    expiresAt (ms epoch) when present. A live entry without expiresAt (rare:
+    a non-expiring grant) scores 0 so it never beats a dated token — a
+    non-expiring token doesn't rotate, so losing that comparison is harmless,
+    whereas letting it win could pin a long-revoked token forever."""
+    exp = entry.get("expiresAt") if isinstance(entry, dict) else None
+    return float(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else 0.0
+
+
+def _mcp_merge(dst: dict, src: dict) -> int:
+    """Merge src's LIVE mcpOAuth entries into dst (both are mcpOAuth-shaped
+    dicts, mutating dst). Returns how many keys changed. Never deletes a dst
+    entry, never downgrades a fresher live entry, and an identical entry is a
+    no-op — so repeated merges are idempotent and backup-rotation-friendly."""
+    changed = 0
+    for key, entry in (src or {}).items():
+        if not _mcp_entry_live(entry):
+            continue
+        cur = dst.get(key)
+        if cur == entry:
+            continue
+        if _mcp_entry_live(cur) and _mcp_entry_score(cur) >= _mcp_entry_score(entry):
+            continue
+        dst[key] = entry
+        changed += 1
+    return changed
+
+
+def _load_mcp_oauth_store() -> dict:
+    """The canonical mcpOAuth map, {} when absent/unreadable. Unreadable is
+    treated as empty rather than fatal: the store is a cache rebuilt every
+    daemon cycle from the mounts, so losing it costs one re-harvest, while
+    raising here would break swaps over an observability file."""
+    if not MCP_OAUTH_STORE.exists():
+        return {}
+    try:
+        data = read_json(MCP_OAUTH_STORE)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    mo = data.get("mcpOAuth")
+    return mo if isinstance(mo, dict) else {}
+
+
+def harvest_mcp_oauth(creds: Any) -> int:
+    """Fold a credentials blob's live mcpOAuth entries into the canonical
+    store. Returns how many store keys changed. Read-modify-write without a
+    lock is acceptable here: a lost update is self-healing because the next
+    daemon cycle re-harvests from the same source files."""
+    if not isinstance(creds, dict):
+        return 0
+    src = creds.get("mcpOAuth")
+    if not isinstance(src, dict) or not src:
+        return 0
+    merged = dict(_load_mcp_oauth_store())
+    n = _mcp_merge(merged, src)
+    if n:
+        atomic_write_bytes(MCP_OAUTH_STORE,
+                           json.dumps({"mcpOAuth": merged}, indent=2).encode(), mode=0o600)
+    return n
+
+
+def inject_mcp_oauth(creds: dict) -> int:
+    """Merge the canonical store's live entries into a credentials blob
+    (mutating it in place; claudeAiOauth untouched). Returns the number of
+    entries injected/upgraded — 0 means the blob was already current and the
+    caller can skip its write entirely."""
+    canonical = _load_mcp_oauth_store()
+    if not canonical:
+        return 0
+    merged = dict(creds.get("mcpOAuth") or {})
+    n = _mcp_merge(merged, canonical)
+    if n:
+        creds["mcpOAuth"] = merged
+    return n
+
+
 def saveback_mount_credentials(mount: Path, expected_account: str | None, state: dict,
                                only_if_fresher: bool = False) -> dict:
     """Save a mount's live credentials back to the owning account dir, with the
@@ -2713,6 +2832,17 @@ def saveback_mount_credentials(mount: Path, expected_account: str | None, state:
         live_creds = json.loads(creds_path.read_bytes())
     except (json.JSONDecodeError, OSError) as e:
         return {"action": "skipped", "account": expected_account, "detail": f"unreadable live creds: {e}"}
+
+    # MCP OAuth carry-over (2026-07-10): fold any live MCP-server tokens out
+    # of this mount into the canonical store BEFORE the guards below can skip
+    # the save — they reason about claudeAiOauth freshness/identity, which
+    # says nothing about mcpOAuth, and a skipped snapshot save-back must not
+    # drop a freshly-authenticated atlassian token. Best-effort: a harvest
+    # failure never blocks the account-token save.
+    try:
+        harvest_mcp_oauth(live_creds)
+    except OSError:
+        pass
 
     # Pool model (#109): a LEASED mount's live tokens belong to its claimed
     # login family, not the account snapshot — route the save-back to the
@@ -6319,7 +6449,32 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             f"(empty accessToken or expiresAt<=0) — writing it would blank the live mount and lock "
             f"out bare sessions (GH #141). Re-login (`cus relogin {target_name}`) or restore a "
             f"backup (`cus restore-creds {target_name}`).")
-    atomic_copy(install_src, live_creds_path, mode=0o600)
+    # ---- MCP OAuth carry-over (2026-07-10) ----
+    # This wholesale install is exactly the write that used to clobber the
+    # mount's MCP-server tokens (mcpOAuth rides in the same file as
+    # claudeAiOauth). Harvest the outgoing live file's tokens into the
+    # canonical store first, then install the source WITH the canonical
+    # tokens merged in — so a swap never downgrades a mount's MCP auth, and
+    # an MCP authentication done on any mount survives onto whichever
+    # account lands here next. Both steps are best-effort: MCP carry-over
+    # must never block or fail an account swap.
+    try:
+        if live_creds_path.exists():
+            harvest_mcp_oauth(read_json(live_creds_path))
+    except (json.JSONDecodeError, OSError):
+        pass  # unreadable outgoing file: nothing to harvest
+    try:
+        _mcp_injected = inject_mcp_oauth(_install_src_creds)
+    except (json.JSONDecodeError, OSError):
+        _mcp_injected = 0
+    if _mcp_injected:
+        # Write the merged payload instead of the raw source bytes. Only the
+        # mcpOAuth key differs from install_src; claudeAiOauth is byte-for-
+        # byte the validated source tokens, so every guard above still holds.
+        atomic_write_bytes(live_creds_path,
+                           json.dumps(_install_src_creds, indent=2).encode(), mode=0o600)
+    else:
+        atomic_copy(install_src, live_creds_path, mode=0o600)
     # THE install-point: the target account's creds are now live on this mount.
     # source = which store we copied from (claimed pool family / legacy / snapshot);
     # existing = target's trusted anchor identity; token_fp names the family that is
@@ -7886,9 +8041,76 @@ def _lazy_warm_slot_sessions(move: dict, config: dict) -> list:
     return [s for s in sessions if s.transcript_path and cache_warm(s.transcript_path, window)]
 
 
+def _sync_mcp_oauth(state: dict, no_execute: bool) -> None:
+    """Periodic MCP-token sync (2026-07-10, see the MCP_OAUTH_STORE block):
+    harvest live mcpOAuth entries from every mount and account snapshot into
+    the canonical store, then inject the store back into every LIVE mount
+    that is missing them or holds staler ones. Runs every daemon cycle, so
+    authenticating an MCP server once in ANY session reaches all slots (and
+    the bare shared mount) within one poll interval — including mounts whose
+    tokens a pre-fix swap already clobbered.
+    """
+    slot_names = sorted(state.get("slots", {}))
+    live_paths = [CREDS_JSON] + [mount_creds_path(slot_path(n)) for n in slot_names]
+    # Snapshots are harvest-only: they receive tokens naturally via the next
+    # save-back/install, and writing them here would churn the GH #79 backup
+    # rotation for no benefit. (They matter as SOURCES because pre-fix
+    # save-backs parked the only surviving copies of some MCP refresh tokens
+    # inside whichever account snapshot the slot happened to hold.)
+    harvest_paths = live_paths + sorted(ACCOUNTS_DIR.glob("account-*/.credentials.json"))
+    for p in harvest_paths:
+        try:
+            if p.exists():
+                harvest_mcp_oauth(read_json(p))
+        except (json.JSONDecodeError, OSError):
+            continue  # unreadable file: nothing to harvest, next cycle retries
+
+    for p in live_paths:
+        if not p.exists():
+            continue
+        try:
+            creds = read_json(p)
+        except (json.JSONDecodeError, OSError):
+            continue
+        try:
+            n = inject_mcp_oauth(creds)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not n:
+            continue
+        mount_name = p.parent.name if p.parent.name.startswith(SLOT_PREFIX) else "shared-mount"
+        if no_execute:
+            click.echo(f"  mcp-oauth (--no-execute): WOULD inject {n} MCP-server token(s) into {mount_name}")
+            continue
+        # Serialize against execute_swap so this rewrite can't interleave
+        # with a swap's install/save-back on the same file. The residual race
+        # against Claude Code itself refreshing claudeAiOauth in the same
+        # window is the same one every existing cus write path carries, and
+        # the read→write window here is milliseconds; a lost MCP injection
+        # simply retries next cycle. Lock contention (a swap in flight) is a
+        # skip, not an error.
+        try:
+            with _swap_lock(timeout_seconds=5.0):
+                backup_credentials_file(p)  # GH #79 choke point
+                atomic_write_bytes(p, json.dumps(creds, indent=2).encode(), mode=0o600)
+        except RuntimeError:
+            continue
+        _cred_audit("mcp-oauth-inject", "wrote",
+                    f"injected {n} canonical MCP-server token(s) (mcpOAuth only; claudeAiOauth untouched)",
+                    mount=mount_name, token_fp=_audit_token_fp(creds))
+        click.echo(f"  mcp-oauth: injected {n} MCP-server token(s) into {mount_name}")
+
+
 def _slot_saveback_and_gc(state: dict, config: dict, no_execute: bool) -> None:
     """Periodic per-slot credential save-back + long-idle slot gc. Shared by
     the per_session and hybrid cycles (extracted 2026-07-02, GH #99)."""
+    # MCP OAuth carry-over sync (2026-07-10): run FIRST so freshly harvested
+    # tokens ride along in this same cycle's snapshot save-backs. Best-effort:
+    # a sync failure must never take down save-back/gc.
+    try:
+        _sync_mcp_oauth(state, no_execute)
+    except OSError as e:
+        click.echo(f"  mcp-oauth sync failed (non-fatal): {e}")
     # 3.5 — periodic save-back: a live session refreshes OAuth tokens into its
     # slot's .credentials.json; without this, a machine crash loses the newest
     # refresh token for every slotted account. only_if_fresher keeps it a
