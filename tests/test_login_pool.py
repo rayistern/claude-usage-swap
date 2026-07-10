@@ -64,6 +64,13 @@ class _Env:
         self._saved_mount_pids = cus.mount_pids
         self.live_slots: set[str] = set()
         cus.mount_pids = lambda mount: [1] if Path(mount).name in self.live_slots else []
+        # A live_slots holder models a LIVE claude session. Since the gc-reap and
+        # pool-family DECISIONS became session-aware (orphan-holds-slot bug,
+        # 2026-07-10), the fixture must declare its fake holder's comm as claude,
+        # or mount_has_live_session would read it as an orphan and these live
+        # mounts would look free.
+        self._saved_pid_comm = cus._pid_comm
+        cus._pid_comm = lambda pid: "claude"
         cus._OCCUPIED_SLOTS_CACHE.clear()
 
         # #127: never let a test hit the real OAuth endpoint. Default verdict
@@ -105,6 +112,7 @@ class _Env:
         for k, v in self._saved.items():
             setattr(cus, k, v)
         cus.mount_pids = self._saved_mount_pids
+        cus._pid_comm = self._saved_pid_comm
         cus._OCCUPIED_SLOTS_CACHE.clear()
         self._tmp.cleanup()
 
