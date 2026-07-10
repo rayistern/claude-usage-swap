@@ -3323,6 +3323,16 @@ def _refresh_account_token(account_name: str, creds_path: Path | None = None) ->
 
     if creds_path is None:
         creds_path = account_creds_path(account_name)
+        # Aliased snapshot guard (2026-07-10 heal-from-family): if the SNAPSHOT's
+        # refresh token belongs to a pooled login family, a snapshot-side refresh
+        # grant would rotate the family's single-use token and clobber its live
+        # holder (#104). Only the default (snapshot) target is gated — the
+        # blank-preempt path passes an explicit lane `creds_path` and refreshes
+        # that mount's OWN family, which is exactly the safe direction. Callers
+        # treat False as "fall back to token_stale behavior"; the daemon's
+        # heal-from-family pass refreshes the snapshot safely instead.
+        if _snapshot_alias_family(account_name) is not None:
+            return False
     if not creds_path.exists():
         return False
     try:
@@ -3452,6 +3462,21 @@ def _unstale_account_snapshot(account: str, state: dict, config: dict | None = N
         _cred_audit("unstale-refresh", "failed", "no usable refresh token in account snapshot",
                     account=account, token_fp="none")
         return False
+
+    # Aliased snapshot (2026-07-10 heal-from-family): the snapshot's refresh token
+    # BELONGS to a pooled login family (a heal reseed or a `--from-existing`
+    # bootstrap copy). Probing it from the snapshot side would rotate the family's
+    # single-use token and log the family's live holder out (#104). Reseed from the
+    # family store instead — same outcome (a fresh, valid snapshot access token)
+    # with zero rotation risk; heal failure degrades to the plain token_stale flag.
+    if _snapshot_alias_family(account, state) is not None:
+        res = heal_snapshot_from_live_family(account, state, config)
+        _cred_audit("unstale-refresh", "skipped-aliased",
+                    "snapshot refresh token belongs to a pooled login family — skipped the "
+                    "snapshot-side refresh grant (#104 rotation hazard) and attempted "
+                    f"heal-from-family instead: {res['action']}",
+                    account=account, token_fp=_audit_token_fp(creds))
+        return bool(res.get("healed"))
 
     verdict, tok = _oauth_refresh_grant(rt)
     if verdict != "alive" or not isinstance(tok, dict):
@@ -6274,7 +6299,18 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # catches a mis-provisioned pool family that happens to share the snapshot's
     # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
     # does. The login-free remedy is another pooled family (`cus login-mount`).
-    if (slot is not None and independent_logins_enabled(config)
+    #
+    # 2026-07-10 (heal-from-family follow-up): the guard now ALSO covers the
+    # SHARED-mount install (slot is None) — previously slot-scoped. A snapshot
+    # reseeded from a live family (heal-from-family) or a `--from-existing`
+    # bootstrap carries a family that may be LIVE on a lane; installing that copy
+    # into ~/.claude while the lane runs is the same #104 double-book, just with
+    # the shared mount as the second holder. `_account_held_by_other_live_mount` /
+    # `_live_family_would_collide` both accept this_slot=None (they then compare
+    # against every live lane of the target), so the same bytes-level check
+    # applies unchanged; a non-aliased snapshot (its own family, live nowhere)
+    # still installs exactly as before.
+    if (independent_logins_enabled(config)
             and _account_held_by_other_live_mount(state, target_name, slot, config)
             and _live_family_would_collide(target_name, install_src, slot, state, config)):
         # The refusal that prevents the divergence-logout: this install source's
@@ -6286,10 +6322,12 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             _collide_fp = "unreadable"
         _cred_audit("family-collision-refuse", "refused-collision",
                     "install source shares a live family on another mount (#104)",
-                    slot=slot, account=target_name, login_family=(claimed_family or "legacy/snapshot"),
+                    slot=slot, mount=(slot or "shared-mount"), account=target_name,
+                    login_family=(claimed_family or "legacy/snapshot"),
                     shared=True, token_fp=_collide_fp)
         raise RuntimeError(
-            f"refusing to install '{target_name}' onto lane {slot}: the credentials about to be "
+            f"refusing to install '{target_name}' onto {('lane ' + slot) if slot else 'the shared mount'}: "
+            f"the credentials about to be "
             f"installed carry the SAME OAuth refresh-token family already live on the shared mount "
             f"or another lane of '{target_name}'. Two live mounts on one token family log one of "
             f"them out on the next rotation (GH #104 divergence — the 2026-07-07 chats1a logout). "
@@ -8711,6 +8749,12 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
     only the refresh grant can (the same lesson as #127 / classify_live_creds_owner).
 
     Verdict:
+      * snapshot ALIASES a pooled login family (`_snapshot_alias_family` — the
+        2026-07-10 heal-from-family reseed, or a legacy `--from-existing`
+        bootstrap copy) → dead-FOR-INSTALL, checked FIRST and with zero network:
+        installing it would double-book that family (#104) and probing it would
+        rotate the family's single-use token out from under its live holder.
+        The install fallback then claims a family properly (leased, distinct).
       * access token currently VALID (non-blank, within expiry) → NOT dead: the
         snapshot authenticates right now, so no (token-rotating) probe is needed.
         This cheap path keeps the common healthy-account case network-free.
@@ -8739,6 +8783,18 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
         # Unreadable snapshot: the #141 install-point guard already refuses it as
         # blank. Not our (dead-refresh) call to make.
         return False
+    # ---- Aliased snapshot (2026-07-10 heal-from-family) — check FIRST, before the
+    # cheap valid-access path and before any token-rotating probe. A snapshot whose
+    # refresh token belongs to a pooled login FAMILY (the heal-from-family reseed, or
+    # a legacy `--from-existing` bootstrap copy) must be treated as NOT independently
+    # installable even while its access token is valid: installing it double-books
+    # that family (#104 — the next rotation on either side logs the other out), and
+    # PROBING its refresh token from the snapshot side would itself rotate the
+    # family's single-use token and clobber the live holder. Returning True here
+    # routes the install fallback to claim_verified_login_family, which leases the
+    # (same or another) family properly — the #104-safe path — with zero network.
+    if _snapshot_alias_family(account) is not None:
+        return True
     # Cheap path: a currently-valid access token means the snapshot authenticates
     # right now — definitively not dead, and no token-rotating probe needed. The 30s
     # grace mirrors poll_account_usage so we don't probe a token about to expire.
@@ -8799,6 +8855,296 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
     # endpoint isn't hammered, but never let a transient refuse a swap.
     _SNAPSHOT_DEAD_PROBE[account] = (now, False)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Dead-snapshot self-heal from a live login family (2026-07-10 rayi2 incident)
+#
+# THE INCIDENT: rayi2's canonical snapshot (account-rayi2/.credentials.json)
+# held a DEAD refresh token (invalid_grant) while BOTH of its pooled login
+# families (family-1 on slot-9, family-2 on slot-5) were live, valid, and being
+# refreshed every cycle (blank-preempt + pooled-store save-back kept the family
+# stores fresh). Because every family was LEASED to a live lane,
+# has_free_login_family() was False, so SOS condition 10.6 screamed
+# "[URGENT] relogin required" for DAYS — even though a perfectly valid,
+# identity-verified rayi2 token sat on disk the whole time.
+#
+# WHY THE SNAPSHOT ROTS IN THE POOL MODEL: the #109 pooled save-back
+# deliberately routes a leased lane's token rotations to the FAMILY store, never
+# the canonical snapshot (routing them to the snapshot was the 2026-07-03
+# regression that stomped account-rayi3). So while all activity happens on
+# leased lanes, NOTHING refreshes the snapshot; its refresh-token family ages
+# out or is rotated away (e.g. by a shared-mount session that was seeded from
+# it) and eventually probes invalid_grant. That is a NORMAL end state for a
+# pool-model account, not a logout — the account itself is fine.
+#
+# THE HEAL: reseed the dead snapshot from the freshest VALID family store of the
+# SAME account, with the full clobber-guard stack: identity anchor verification
+# (guard_canonical_identity_write — never save a clobbered/foreign token, the
+# 2026-07-06 wrong-account incident), structural validity (a currently-valid,
+# non-blank access token + a refresh token), the GH #77 freshness guard (never
+# let an older file clobber a fresher snapshot, e.g. one just re-logged-in), and
+# the GH #79 backup rotation.
+#
+# THE ALIASING INVARIANT (#104) — the reason the helpers below travel together:
+# after a heal, the snapshot is a byte-copy of a family's creds, i.e. the
+# snapshot ALIASES that family's single-use OAuth refresh-token lineage. Two
+# things must then never happen:
+#   (a) the snapshot must never be INSTALLED onto a mount while that family is
+#       live elsewhere (double-booking → rotation logout, the chats1a shape);
+#   (b) cus must never REFRESH the snapshot's token from the snapshot side
+#       (the rotation would invalidate the live family's copy and log the lane
+#       out at its next refresh).
+# `_snapshot_alias_family` detects the aliasing from token bytes (fingerprints,
+# never raw tokens) so it needs no state marker and self-corrects the moment a
+# browser relogin gives the snapshot its own family again. The probe/refresh
+# paths (`_account_snapshot_dead`, `_unstale_account_snapshot`,
+# `_refresh_account_token`) consult it and skip; the install path already
+# refuses double-booked installs (`_account_held_by_other_live_mount` +
+# `_live_family_would_collide`) and `_account_snapshot_dead`'s alias-first
+# verdict routes new-lane installs to a properly LEASED family claim instead of
+# the raw snapshot copy.
+# ---------------------------------------------------------------------------
+
+def _snapshot_alias_family(account: str, state: dict | None = None) -> str | None:
+    """Which pooled login family the canonical snapshot's refresh token belongs
+    to, or None when the snapshot carries its own independent lineage.
+
+    Compares refresh-token FINGERPRINTS (never raw tokens) between
+    account-<X>/.credentials.json and (a) every usable family STORE under
+    logins/<X>/family-*/ and (b) the live MOUNT of every slot leasing a family
+    of this account (the mount can be one rotation ahead of its store, and a
+    heal that copied mount-fresh bytes must still be recognized as aliased).
+
+    Purely computed from bytes on every call — deliberately NOT a state marker,
+    so a browser relogin (which mints a brand-new family for the snapshot)
+    clears the aliasing automatically and stale markers can't refuse a healthy
+    snapshot."""
+    snap = account_creds_path(account)
+    if not snap.exists():
+        return None
+    try:
+        snap_rt = _credential_refresh_token(read_json(snap))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not snap_rt:
+        return None
+    snap_fp = _refresh_fingerprint(snap_rt)
+    # (a) family stores — the canonical persisted copy of each family's lineage.
+    for fam in list_login_families(account):
+        try:
+            fam_rt = _credential_refresh_token(read_json(login_family_creds_path(account, fam)))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if fam_rt and _refresh_fingerprint(fam_rt) == snap_fp:
+            return fam
+    # (b) leased live mounts — catches a snapshot healed from a mount that had
+    # rotated past its store's copy (save-back lag of up to one cycle).
+    if state is None:
+        try:
+            state = load_state()
+        except (json.JSONDecodeError, OSError):
+            return None
+    for slot_name, entry in (state.get("slots", {}) or {}).items():
+        if not isinstance(entry, dict) or entry.get("account") != account:
+            continue
+        lease = slot_leased_family(state, slot_name)
+        if lease is None or lease[0] != account:
+            continue
+        try:
+            m_rt = _credential_refresh_token(read_json(mount_creds_path(slot_path(slot_name))))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if m_rt and _refresh_fingerprint(m_rt) == snap_fp:
+            return lease[1]
+    return None
+
+
+def _snapshot_heal_candidate(account: str, state: dict, config: dict | None = None) -> dict | None:
+    """PURE finder (no writes, no network): the freshest usable family-store
+    creds of `account` that could reseed its dead canonical snapshot, or None.
+
+    A candidate family store must clear every guard the actual heal applies:
+      * structural validity — parses, non-blank access token, positive expiry
+        (`_live_mount_creds_invalid` is the same bar the install-point uses);
+      * the access token is CURRENTLY valid (expiresAt at least a minute out) —
+        the point is to reseed from a token that provably authenticates right
+        now, not to gamble on another refresh lineage of unknown health;
+      * a refresh token is present (an access-only file can't sustain a store);
+      * identity — the family dir's own /login-recorded .claude.json identity
+        must pass guard_canonical_identity_write against the account's trusted
+        anchor (meta.yaml + families). A family clobbered with a FOREIGN
+        account's login makes the anchor ambiguous, and the guard refuses —
+        exactly the never-save-a-clobbered-token rule (2026-07-06 incident).
+
+    Reads the family STORE (not the live lane mount): the pooled save-back +
+    blank-preempt keep the store within one rotation of the mount, and copying
+    store bytes guarantees `_snapshot_alias_family`'s store comparison
+    recognizes the healed snapshot immediately. Returns
+    {"family", "path", "creds", "bytes", "expires_at", "leased_live"} for the
+    freshest (max expiresAt) qualifying family."""
+    if not independent_logins_enabled(config):
+        return None
+    now_ms = int(time.time() * 1000)
+    live_leases = leased_families(account, state)
+    best: dict | None = None
+    for fam in list_login_families(account):
+        path = login_family_creds_path(account, fam)
+        try:
+            raw = path.read_bytes()
+            creds = json.loads(raw)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _live_mount_creds_invalid(creds):
+            continue  # blank-shaped — nothing worth seeding from
+        if not _credential_refresh_token(creds):
+            continue
+        exp = _creds_expires_at(creds)
+        # 60s margin: a token seconds from expiry is not a useful reseed — the
+        # snapshot would be dead-again before the next daemon cycle sees it.
+        if exp is None or int(exp) <= now_ms + 60_000:
+            continue
+        ok, why = guard_canonical_identity_write(account, family_identity(account, fam))
+        if not ok:
+            _cred_audit("snapshot-heal-from-family", "refused-identity", why,
+                        account=account, login_family=f"{account}/{fam}",
+                        incoming_identity=family_identity(account, fam), emit_identity=True,
+                        existing_identity=account_identity_anchor(account)[0],
+                        token_fp=_audit_token_fp(creds))
+            continue
+        if best is None or int(exp) > int(best["expires_at"]):
+            best = {"family": fam, "path": path, "creds": creds, "bytes": raw,
+                    "expires_at": int(exp), "leased_live": fam in live_leases}
+    return best
+
+
+def heal_snapshot_from_live_family(account: str, state: dict, config: dict | None = None,
+                                   no_execute: bool = False) -> dict:
+    """Reseed a refresh-DEAD canonical snapshot from a live, valid, identity-
+    verified login family of the SAME account — the self-heal that replaces the
+    false "[URGENT] relogin required" SOS when the account is actually fine
+    (2026-07-10 rayi2: dead snapshot, two live valid families, days of SOS).
+
+    Mutates `state` (clears snapshot_refresh_dead / token_stale on success);
+    the CALLER persists via save_state. Returns
+    {"healed": bool, "action": str, "reason": str, "family": str | None}.
+
+    Guard stack (see the section comment above):
+      * pool-gate on; snapshot file must already EXIST (a missing snapshot is
+        `cus init` / relogin territory — this never creates account dirs);
+      * "already valid" short-circuit — a snapshot with a currently-valid,
+        non-blank access token needs no reseed; just clear the stale flags
+        (makes the daemon's heal pass idempotent: re-runs are read-only);
+      * candidate guards — structural validity + identity anchor
+        (`_snapshot_heal_candidate`);
+      * GH #77 freshness — never let an older family copy clobber a FRESHER
+        snapshot (e.g. a browser relogin that landed between flag and heal);
+      * GH #79 — rotated backup of the snapshot before the write.
+
+    Never raises into the caller — a heal failure leaves the flag set and the
+    existing URGENT SOS path intact (degrade-to-report, never degrade-to-blank)."""
+    cfg = config if config is not None else load_config()
+    if not independent_logins_enabled(cfg):
+        return {"healed": False, "action": "skipped", "family": None,
+                "reason": "independent-logins gate off — pool-model heal does not apply"}
+    snap = account_creds_path(account)
+    if not snap.exists():
+        return {"healed": False, "action": "skipped", "family": None,
+                "reason": "no canonical snapshot on disk (cus init / relogin territory)"}
+    acct = state.get("accounts", {}).get(account)
+    acct = acct if isinstance(acct, dict) else {}
+
+    def _clear_dead_flags() -> None:
+        acct.pop("snapshot_refresh_dead", None)
+        acct.pop("token_stale", None)
+        acct["token_expired"] = False
+        # Reset the dead-probe cooldown cache so the next install-point check
+        # re-reads the (now healed) snapshot instead of a cached "dead".
+        _SNAPSHOT_DEAD_PROBE.pop(account, None)
+
+    # Already-valid short-circuit: a currently-valid access token means the
+    # snapshot authenticates right now (same 30s grace as poll/_account_snapshot_dead)
+    # — nothing to reseed; just reconcile the flags. Keeps repeated heal passes
+    # byte-for-byte read-only on a healthy snapshot.
+    try:
+        snap_creds = read_json(snap)
+    except (json.JSONDecodeError, OSError):
+        return {"healed": False, "action": "skipped", "family": None,
+                "reason": "snapshot unreadable — owned by the #141 blank/restore guards"}
+    snap_exp = _creds_expires_at(snap_creds)
+    now_ms = int(time.time() * 1000)
+    _oauth = snap_creds.get("claudeAiOauth") if isinstance(snap_creds, dict) else None
+    _access = _oauth.get("accessToken") if isinstance(_oauth, dict) else None
+    if (isinstance(_access, str) and _access.strip()
+            and snap_exp is not None and int(snap_exp) > now_ms - 30_000):
+        if acct.get("snapshot_refresh_dead") or acct.get("token_stale"):
+            _clear_dead_flags()
+        return {"healed": True, "action": "already-valid", "family": None,
+                "reason": "snapshot access token is currently valid — cleared stale flags only"}
+
+    cand = _snapshot_heal_candidate(account, state, cfg)
+    if cand is None:
+        return {"healed": False, "action": "no-source", "family": None,
+                "reason": "no live, valid, identity-verified login family to reseed from — "
+                          "genuine relogin territory"}
+    # GH #77: never let an older family copy clobber a fresher snapshot (a
+    # browser relogin may have restored the snapshot after the flag was set).
+    if snap_exp is not None and int(snap_exp) > cand["expires_at"]:
+        return {"healed": False, "action": "skipped-stale", "family": cand["family"],
+                "reason": "snapshot is fresher than the best family source (GH #77) — not clobbering"}
+    if no_execute:
+        return {"healed": False, "action": "would-heal", "family": cand["family"],
+                "reason": f"dry-run: would reseed snapshot from {account}/{cand['family']}"}
+    try:
+        backup_credentials_file(snap)
+        atomic_write_bytes(snap, cand["bytes"], mode=0o600)
+    except OSError as e:
+        return {"healed": False, "action": "write-failed", "family": cand["family"],
+                "reason": f"could not write snapshot: {e}"}
+    _clear_dead_flags()
+    _cred_audit("snapshot-heal-from-family", "wrote",
+                "canonical snapshot refresh token was DEAD but a live login family of the same "
+                "account holds a valid token — reseeded the snapshot from the family store "
+                "(no browser relogin needed; 2026-07-10 rayi2 incident)",
+                account=account, login_family=f"{account}/{cand['family']}",
+                incoming_identity=family_identity(account, cand["family"]), emit_identity=True,
+                existing_identity=account_identity_anchor(account)[0],
+                token_fp=_audit_token_fp(cand["creds"]),
+                extra=f"new_expiry={_expiry_repr(cand['creds'])}")
+    return {"healed": True, "action": "healed", "family": cand["family"],
+            "reason": f"reseeded snapshot from live family {account}/{cand['family']}"}
+
+
+def _auto_heal_dead_snapshots(state: dict, config: dict, no_execute: bool = False) -> list[str]:
+    """Daemon pass: heal every account flagged `snapshot_refresh_dead` whose
+    live login families can vouch for it (heal_snapshot_from_live_family).
+
+    Runs in `_emit_sos_after` BEFORE `diagnose()` — the same funnel as the
+    blank-mount/lane heals — so a healable dead snapshot never reaches the
+    operator as an "[URGENT] relogin required" SOS: the heal reseeds the
+    snapshot, clears the flag, and diagnose then sees a healthy account. Only
+    an account with NO valid family source falls through to the URGENT SOS
+    (genuine human/browser needed).
+
+    Persists state itself when anything changed: `_emit_sos_after`'s callers
+    pass throwaway load_state() copies, so without a save the cleared flag
+    would resurrect each cycle and re-trigger heal attempts forever. Returns
+    the healed account names."""
+    healed: list[str] = []
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict) or not acct.get("snapshot_refresh_dead"):
+            continue
+        try:
+            res = heal_snapshot_from_live_family(name, state, config, no_execute=no_execute)
+        except Exception as e:  # never let a heal failure break the SOS cycle
+            click.echo(f"  snapshot-heal: unexpected error healing '{name}': {e}")
+            continue
+        if res.get("healed"):
+            healed.append(name)
+            click.echo(f"  snapshot-heal: '{name}' canonical snapshot {res['action']} — {res['reason']}")
+    if healed and not no_execute:
+        save_state(state)
+    return healed
 
 
 def _lane_lastvalid_path(mount_creds: Path) -> Path:
@@ -10443,10 +10789,35 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # the operator reloginss before the account silently drops out of rotation. An
     # account that is dead-snapshot but HAS a free family is deliberately NOT alarmed
     # here — the install-point seeds new lanes from the family, so it's still usable.
+    #
+    # 2026-07-10 (rayi2 incident, heal-from-family): "no FREE family" is NOT the same
+    # as "no valid login" — rayi2 sat urgent-flagged for DAYS while BOTH its families
+    # were live, valid, and refreshed every cycle (merely LEASED, so
+    # has_free_login_family was False). When a live, valid, identity-verified family
+    # source exists, the daemon's `_auto_heal_dead_snapshots` pass reseeds the
+    # snapshot automatically — so report that as a self-healing WARNING, not a
+    # "relogin required" URGENT. Only an account whose families can't vouch for it
+    # (no valid source at all) still needs the browser and keeps the URGENT.
     for acct_name, acct in state.get("accounts", {}).items():
         if not isinstance(acct, dict):
             continue
         if acct.get("snapshot_refresh_dead") and not has_free_login_family(acct_name, state):
+            _heal_cand = _snapshot_heal_candidate(acct_name, state, config)
+            if _heal_cand is not None:
+                out.append(SOSCondition(
+                    severity="warning",
+                    summary=(f"'{acct_name}' snapshot creds are dead — auto-heal from live login "
+                             f"family {acct_name}/{_heal_cand['family']} pending (no relogin needed)"),
+                    action=(f"account-{acct_name}/.credentials.json's refresh token is dead, but "
+                            f"login family {acct_name}/{_heal_cand['family']} holds a live, valid, "
+                            f"identity-verified token. The daemon reseeds the snapshot from that "
+                            f"family automatically on its next cycle "
+                            f"(heal-from-family, 2026-07-10). Existing lanes keep working "
+                            f"throughout. If the daemon is not running, `cus daemon --once` "
+                            f"performs the heal; a browser relogin is NOT required."),
+                    affected=acct_name,
+                ))
+                continue
             out.append(SOSCondition(
                 severity="urgent",
                 summary=(f"'{acct_name}' snapshot creds are dead and no valid login family remains — "
@@ -14218,6 +14589,16 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
         # global mode / when no lane is blanked.
         _auto_heal_live_lanes(state, config, no_execute=no_execute)
+        # Dead-snapshot heal (2026-07-10 rayi2 incident): BEFORE diagnose, reseed
+        # any account whose canonical snapshot is refresh-DEAD
+        # (snapshot_refresh_dead) from a live, valid, identity-verified login
+        # family of the SAME account. Same funnel-placement rationale as the two
+        # heals above: a healable dead snapshot never reaches the operator as an
+        # "[URGENT] relogin required" SOS — the heal reseeds the snapshot and
+        # clears the flag, and diagnose() then sees a healthy account. Only an
+        # account with NO valid family source (a genuine full logout) falls
+        # through to the URGENT relogin SOS.
+        _auto_heal_dead_snapshots(state, config, no_execute=no_execute)
         conditions = diagnose(state, config)
         # PRE-EMPTIVE creds-health early-warning (2026-07-06): AFTER the reactive
         # auto-heals above (so a just-healed mount reads valid, not near-blank) and
