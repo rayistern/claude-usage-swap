@@ -4,6 +4,7 @@
 # dependencies = [
 #     "click>=8.0",
 #     "pyyaml>=6.0",
+#     "rich>=13.0",
 # ]
 # ///
 """claude-usage-swap (cus) — auto-rotate Claude Code OAuth accounts.
@@ -10648,8 +10649,57 @@ def whoami_cmd() -> None:
         click.echo(f"  flags:        {', '.join(flags)}")
 
 
+def _account_row(name: str, acct: dict, config: dict, first_step: float) -> dict:
+    """Shared per-account display derivation for `status` (plain + --pretty).
+
+    Pure data — no printing, no click.style — so both renderers consume the
+    SAME flags/estimator/next-swap/per-model semantics and cannot drift.
+
+    - flags: operator DISABLED (config, not polled state — surfaced so nobody
+      wonders why the picker skips the account) + the polled health flags, in
+      fixed order.
+    - est: estimator (C) — extrapolated CURRENT usage per window, included
+      only when it diverges >= 1.0pct from the last poll, so a fast-climbing
+      account is visible between polls. Insertion order 5h then 7d matches
+      the plain-output note order.
+    - next_swap_pct: None while on the shared first ladder step (the status
+      header already prints the ladder once as a legend); a value only for a
+      mid-ladder / non-default account, the only case worth a per-row callout.
+    - per_model: 7d-by-model, sorted highest-first so a model nearing its own
+      weekly cap is the first thing the eye lands on.
+    """
+    flags = []
+    if name in _disabled_accounts(config):
+        flags.append("DISABLED")
+    if acct.get("token_expired"):
+        flags.append("TOKEN_EXPIRED")
+    if acct.get("rate_limited"):
+        flags.append("RATE_LIMITED")
+    if acct.get("poll_error"):
+        flags.append("POLL_ERROR")
+    if acct.get("token_stale"):
+        flags.append("TOKEN_STALE")
+    est: dict = {}
+    for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
+        polled = acct.get(key, 0.0)
+        est_val = estimate_window_pct(acct, win, config)
+        if est_val - polled >= 1.0:
+            est[win] = (est_val, acct.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0)
+    nxt = acct.get("next_swap_at_pct", first_step)
+    return {
+        "flags": flags,
+        "status_col": ",".join(flags) if flags else "ok",
+        "est": est,
+        "next_swap_pct": nxt if nxt != first_step else None,
+        "per_model": sorted((acct.get("per_model_weekly_pct") or {}).items(),
+                            key=lambda kv: -kv[1]),
+        "last": acct.get("last_swap_ts") or "never",
+    }
+
+
 @cli.command()
-def status() -> None:
+@click.option("--pretty", is_flag=True, help="Rich, width-adaptive tables (color, usage bars).")
+def status(pretty: bool) -> None:
     """Show active account, per-account usage state, locks, and recent activity."""
     if not STATE_JSON.exists():
         click.echo("Not initialized. Run `cus init` first.")
@@ -10657,6 +10707,9 @@ def status() -> None:
 
     state = read_json(STATE_JSON)
     config = load_config()
+    if pretty:
+        _render_status_pretty(state, config)
+        return
     color_on = sys.stdout.isatty()
     mode = config.get("mode", "global")
     per_session = mode == "per_session"
@@ -10679,53 +10732,19 @@ def status() -> None:
     click.echo()
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 91)
-    disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
+        row = _account_row(name, a, config, first_step)
         marker = " *" if name == state["active"] else ""
-        last = a.get("last_swap_ts") or "never"
-        flags = []
-        # Operator out-of-rotation flag (config, not polled state) — surfaced
-        # here so nobody wonders why the picker never chooses this account.
-        if name in disabled:
-            flags.append("DISABLED")
-        if a.get("token_expired"):
-            flags.append("TOKEN_EXPIRED")
-        if a.get("rate_limited"):
-            flags.append("RATE_LIMITED")
-        if a.get("poll_error"):
-            flags.append("POLL_ERROR")
-        if a.get("token_stale"):
-            flags.append("TOKEN_STALE")
-        status_col = ",".join(flags) if flags else "ok"
-        # Estimator (C): annotate the extrapolated CURRENT usage when it diverges
-        # from the last poll, so a fast-climbing account is visible between polls
-        # (this is what the picker now uses to judge target fullness).
-        est_note = ""
-        for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
-            polled = a.get(key, 0.0)
-            est = estimate_window_pct(a, win, config)
-            if est - polled >= 1.0:
-                rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
-                est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        # Show next_swap_at_pct ONLY when it's advanced off the shared first
-        # ladder step (the legend above already prints that) — i.e. this account
-        # is mid-ladder / carries a non-default value, which is the only case
-        # worth a per-row callout.
-        nxt_val = a.get("next_swap_at_pct", first_step)
-        nxt_note = f"  [next-swap: {nxt_val:.0f}%]" if nxt_val != first_step else ""
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {status_col:<24} {last:<28}{nxt_note}{est_note}")
-        # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
-        # sub-line only for accounts that have any, sorted highest-first so a
-        # model nearing its own weekly cap is the first thing the eye lands on.
-        # 5h is intentionally absent — the API has no per-model 5h window.
-        pm = a.get("per_model_weekly_pct") or {}
-        if pm:
-            # Mark per-model numbers stale (dim + trailing '~') for any account
-            # we couldn't freshly observe — a token_stale account's cached
-            # `Fable=100%` printed bare read as an authoritative current value
-            # and drove a wrong swap (2026-07-05 incident). See _fmt_model_pct.
+        est_note = "".join(f"  [{win} est {e:.0f}% @ +{rate:.1f}%/min]"
+                           for win, (e, rate) in row["est"].items())
+        nxt_note = (f"  [next-swap: {row['next_swap_pct']:.0f}%]"
+                    if row["next_swap_pct"] is not None else "")
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}")
+        # Stale/unknown per-model treatment lives in _fmt_model_pct; which
+        # models to show and their order comes from _account_row.
+        if row["per_model"]:
             parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
-                              for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+                              for m, p in row["per_model"])
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
@@ -10857,6 +10876,297 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+def _render_status_pretty(state: dict, config: dict) -> None:
+    """`cus status --pretty` — rich one-shot render, sized to the terminal.
+
+    Spec: docs/plans/2026-07-07-status-pretty.md. Same data as plain status,
+    restructured for scanning: bracket-notes become cells, login pools fold
+    into a Pool column, Lanes+Live-sessions merge into one table.
+
+    rich imports stay INSIDE this function so the daemon / statusline hot
+    paths (and every non-pretty `cus` invocation) never pay for them.
+    """
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console(highlight=False)
+    width = console.width
+    show_bars = width >= 110      # spec breakpoints: bars only when roomy,
+    fold_models = width < 80      # by-model folds under the account when tight
+
+    mode = config.get("mode", "global")
+    cfg_steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    first_step = cfg_steps[0] if cfg_steps else 50
+    last_step = cfg_steps[-1] if cfg_steps else 90
+
+    if mode == "per_session":
+        head = f"per_session · bare-launch: {state['active']}"
+    elif mode == "hybrid":
+        head = f"hybrid · shared-mount: {state['active']}"
+    else:
+        head = f"global · active: {state['active']}"
+    ladder = " → ".join(f"{s}%" for s in cfg_steps)
+    console.print(Text.assemble((head, "bold"), ("  ·  ladder ", "dim"), (ladder, "dim")))
+    console.print()
+
+    def rel_ts(iso: str | None) -> str:
+        if not iso or iso == "never":
+            return "never"
+        secs = _time_since(iso)
+        return iso if secs is None else _fmt_duration(secs) + " ago"
+
+    def ladder_style(val: float) -> str:
+        # Colors mean "how close to a swap": the ladder's own thresholds.
+        if val >= last_step:
+            return "red"
+        if val >= first_step:
+            return "yellow"
+        return "green"
+
+    def usage_cell(acct: dict, key: str, row: dict) -> Text:
+        win = "5h" if key == "current_5h_pct" else "7d"
+        if _pct_is_unknown(acct, key):
+            # Intentionally NO estimator note here (plain mode prints one):
+            # an extrapolation beside an unobservable base reads as current
+            # data — the 2026-07-05 stale-reading trap. '?' stays bare.
+            return Text("?", style="dim")
+        val = acct.get(key, 0.0)
+        stale = _pct_is_stale_known(acct, key)
+        style = "dim" if stale else ladder_style(val)
+        t = Text()
+        if show_bars:
+            filled = min(8, max(0, round(val / 100 * 8)))
+            t.append("█" * filled + "░" * (8 - filled) + " ", style=style)
+        t.append(f"{val:.0f}%" + ("~" if stale else ""), style=style)
+        if win in row["est"]:
+            est_val, rate = row["est"][win]
+            t.append(f" ↗{est_val:.0f} +{rate:.1f}/m", style="dim")
+        return t
+
+    def per_model_text(acct: dict, row: dict) -> Text:
+        stale = _model_pct_is_stale(acct)
+        t = Text()
+        for i, (m, p) in enumerate(row["per_model"]):
+            if i:
+                t.append("  ")
+            t.append(f"{m} {p:.0f}%" + ("~" if stale else ""),
+                     style="dim" if stale else "")
+        return t
+
+    def status_cell(row: dict) -> Text:
+        t = Text()
+        if not row["flags"]:
+            t.append("ok", style="green")
+        else:
+            for i, f in enumerate(row["flags"]):
+                if i:
+                    t.append(",")
+                t.append(f, style="red dim" if f == "DISABLED" else "yellow")
+        if row["next_swap_pct"] is not None:
+            t.append(f" next@{row['next_swap_pct']:.0f}%", style="dim")
+        return t
+
+    pool_want = config.get("independent_logins", {}).get("pool_size", 3)
+
+    def pool_cell(name: str) -> Text:
+        fams = list_login_families(name)
+        if not fams:
+            return Text("")
+        free = [f for f in fams if f not in leased_families(name, state)]
+        short = len(fams) < pool_want
+        return Text(f"{len(free)}/{len(fams)} free" + (f" (<{pool_want})" if short else ""),
+                    style="yellow" if short else "")
+
+    tbl = Table(box=box.SIMPLE_HEAD, pad_edge=False)
+    tbl.add_column("Account", no_wrap=True)
+    tbl.add_column("5h")
+    tbl.add_column("7d")
+    if not fold_models:
+        tbl.add_column("7d by model")
+    tbl.add_column("Status")
+    tbl.add_column("Last swap")
+    tbl.add_column("Pool")
+    for name, a in sorted(state["accounts"].items()):
+        row = _account_row(name, a, config, first_step)
+        acct_cell = Text()
+        active = name == state["active"]
+        acct_cell.append("● " if active else "  ")
+        acct_cell.append(name, style="bold" if active else "")
+        pm = per_model_text(a, row)
+        if fold_models and row["per_model"]:
+            acct_cell.append("\n    ")
+            acct_cell.append_text(pm)
+        cells = [acct_cell,
+                 usage_cell(a, "current_5h_pct", row),
+                 usage_cell(a, "current_7d_pct", row)]
+        if not fold_models:
+            cells.append(pm)
+        cells += [status_cell(row), Text(rel_ts(row["last"])), pool_cell(name)]
+        tbl.add_row(*cells)
+    console.print(tbl)
+
+    il_on = config.get("independent_logins", {}).get("use_independent_logins", False)
+    if not il_on and any(list_login_families(n) for n in state["accounts"]):
+        console.print(Text("  (login-pool gate OFF — swaps still copy; "
+                           "set use_independent_logins: true)", style="yellow"))
+    console.print()
+
+    # --- Lanes & sessions (merged) ---------------------------------------
+    # Mirrors the plain Lanes + Live-sessions logic (see status()); the lane
+    # annotations are re-derived here from the same helpers rather than
+    # extracted, per the spec's refactor boundary (_account_row only).
+    per_session = mode == "per_session"
+    slots_state = state.get("slots", {}) or {}
+    slot_dirs = list_slot_dirs()
+    live = find_live_sessions()
+    machine_active = state.get("active", "?")
+    hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
+    cwd_max = max(20, width - 60)
+
+    def trunc_cwd(cwd: str) -> str:
+        # Left-truncate: tails distinguish (home prefixes are shared).
+        return cwd if len(cwd) <= cwd_max else "…" + cwd[-(cwd_max - 1):]
+
+    buckets: dict = {}
+    for s in live:
+        if per_session:
+            mnt = pane_mount_name(s.pane, s.tmux_socket)
+            if mnt and mnt.startswith(SLOT_PREFIX):
+                key, eff = mnt, (slots_state.get(mnt, {}).get("account") or s.account)
+            elif mnt:  # account-dir launch (relogin flow)
+                key, eff = f"mount:{mnt}", mnt.removeprefix("account-")
+            else:
+                key, eff = "(bare)", machine_active
+        else:
+            key = "(global)"
+            eff = s.account if hot_swap_on else machine_active
+        buckets.setdefault(key, []).append((s, eff))
+
+    def session_lines(entries, show_acct: bool = False) -> Text:
+        t = Text()
+        for i, (s, eff) in enumerate(entries):
+            if i:
+                t.append("\n")
+            t.append(f"{(s.session_id or '?')[:8]} {s.pane} ")
+            if show_acct:
+                t.append(f"{eff} ")
+            if not per_session and eff != s.account:
+                t.append(f"(start:{s.account}) ", style="dim")
+            t.append(trunc_cwd(s.cwd), style="dim")
+        return t
+
+    locked = _locked_slots(config)
+    il_cfg = config.get("independent_logins", {})
+    il_flag = il_cfg.get("use_independent_logins", False)
+    il_visible = (il_flag or bool(list_provisioned_logins())
+                  or any(list_login_families(a) for a in state["accounts"]))
+    default_pool = config.get("per_session", {}).get("default_pool", "premium")
+
+    lane_rows = []
+    seen = set()
+    for d in slot_dirs:
+        seen.add(d.name)
+        entry = slots_state.get(d.name, {})
+        acct = entry.get("account")
+        pids = mount_pids(d)
+        state_txt = Text(f"live {len(pids)} pids", style="green") if pids else Text("idle", style="dim")
+        notes = []
+        if d.name in locked:
+            notes.append(("🔒locked", "yellow"))
+        pool = _slot_pool(state, d.name, config)
+        if pool != default_pool:
+            notes.append((pool, "cyan"))
+        if il_visible and acct:
+            lease = slot_leased_family(state, d.name)
+            if lease and lease[0] == acct:
+                notes.append((f"pool {lease[1]}", "green"))
+            elif list_login_families(acct):
+                notes.append(("pool avail", "green"))
+            elif has_independent_login(acct, d.name):
+                notes.append(("indep-login ✓", "green"))
+            elif il_flag:
+                notes.append(("indep-login MISSING", "yellow"))
+            else:
+                notes.append(("copy", "cyan"))
+        if d.name not in slots_state:
+            notes.append(("orphan — not in state", "yellow"))
+        notes_txt = Text(" · ").join(Text(n, style=st) for n, st in notes) if notes else Text("")
+        lane_rows.append((Text(d.name), Text(acct or "(empty)"), state_txt,
+                          notes_txt, session_lines(buckets.pop(d.name, []))))
+    for name in sorted(set(slots_state) - seen):
+        lane_rows.append((Text(name), Text(slots_state[name].get("account") or "(empty)"),
+                          Text("state entry, dir missing", style="yellow"), Text(""), Text("")))
+    for key in sorted(buckets):
+        entries = buckets[key]
+        if key == "(bare)":
+            lane_rows.append((Text("(bare)", style="yellow"), Text(machine_active),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("observe-only", style="yellow"),
+                              session_lines(entries)))
+        elif key.startswith(SLOT_PREFIX):
+            # Mount ground truth says slot-N, but the dir is gone from
+            # list_slot_dirs() (removed/renamed under a live pane). Keep the
+            # session grounded to its real slot — plain mode prints slot=<mnt>
+            # from the same mount — rather than mislabeling it "(global)".
+            lane_rows.append((Text(key), Text(entries[0][1]),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("slot dir missing", style="yellow"),
+                              session_lines(entries)))
+        elif key.startswith("mount:"):
+            lane_rows.append((Text(key.removeprefix("mount:")), Text(entries[0][1]),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("account-dir mount", style="cyan"),
+                              session_lines(entries)))
+        else:  # (global) — background/hybrid modes
+            acct_label = "(per-pane)" if hot_swap_on else machine_active
+            lane_rows.append((Text("(global)"), Text(acct_label),
+                              Text(f"{len(entries)} session(s)"), Text(""),
+                              session_lines(entries, show_acct=hot_swap_on)))
+
+    if lane_rows:
+        lt = Table(box=box.SIMPLE_HEAD, pad_edge=False,
+                   title="Lanes & sessions", title_justify="left", title_style="bold")
+        lt.add_column("Lane", no_wrap=True)
+        lt.add_column("Account")
+        lt.add_column("State")
+        lt.add_column("Notes")
+        lt.add_column("Sessions")
+        for r in lane_rows:
+            lt.add_row(*r)
+        console.print(lt)
+        console.print()
+
+    # --- Locks -------------------------------------------------------------
+    pins = config.get("session_locks", {}).get("pinned", {}) or {}
+    patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
+    locked_cfg = sorted(locked)
+    if pins or patterns or locked_cfg:
+        console.print(Text("Locks", style="bold"))
+        for k, v in pins.items():
+            console.print(f"  pinned: {k} → {v}")
+        for s_ in locked_cfg:
+            console.print(f"  locked slot: {s_}")
+        for p in patterns:
+            console.print(f"  never_restart: {p}")
+        console.print()
+
+    # --- Recent swaps --------------------------------------------------------
+    history = state.get("swap_history", [])
+    if history:
+        st = Table(box=box.SIMPLE_HEAD, pad_edge=False,
+                   title=f"Recent swaps ({min(5, len(history))} of {len(history)})",
+                   title_justify="left", title_style="bold")
+        st.add_column("When", no_wrap=True)
+        st.add_column("Swap")
+        st.add_column("Trigger")
+        for e in history[-5:]:
+            st.add_row(rel_ts(e["ts"]), f"{e['from']} → {e['to']}",
+                       Text(e.get("trigger", "unknown"), style="dim"))
+        console.print(st)
 
 
 # --------------------------------------------------------------------------

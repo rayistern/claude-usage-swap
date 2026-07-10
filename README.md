@@ -87,6 +87,7 @@ cus uninstall                 # reverse install
 # Daily inspection
 cus whoami                    # which account am I on right now (+ its usage)
 cus status                    # active + per-account state + live sessions
+cus status --pretty           # same data, rich width-adaptive tables (color, usage bars)
 cus sos                       # exit 1 + actions if anything needs you
 cus list                      # configured accounts with OAuth identities
 cus statusline                # one-line (for CC statusLine — usually wired automatically)
