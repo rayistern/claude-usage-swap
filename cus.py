@@ -1749,7 +1749,8 @@ def _shared_mount_holds(account: str, state: dict, config: dict | None = None) -
 
 
 def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str | None,
-                                      config: dict | None = None) -> bool:
+                                      config: dict | None = None,
+                                      session_aware: bool = False) -> bool:
     """True iff `account` is currently live on a mount OTHER than `this_slot` — a
     live slot or the shared ~/.claude mount.
 
@@ -1769,8 +1770,18 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
     _shared_mount_holds). Optional/back-compat: None re-loads it. The daemon's
     slot targets never include state["active"] (it's in exclude_for_slots), so
     the shared-mount clause is a no-op there — it only bites the manual
-    `cus slot move` path, which has no such exclusion (issue #141)."""
-    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+    `cus slot move` path, which has no such exclusion (issue #141).
+
+    session_aware (default False, opt-in): when True, a slot counts as an
+    occupied mount only if a live claude SESSION holds it, not merely any process
+    that inherited CLAUDE_CONFIG_DIR. The pool-family DECISION sites (slot-move
+    preview + execute_swap) pass True so an orphaned dev-server that outlived its
+    session no longer makes the account's family look occupied (orphan-holds-slot
+    bug, 2026-07-10). Default False keeps every OTHER caller (lane-capacity, the
+    divergence detector) reading "any holder", unchanged."""
+    occ = (occupied_slot_accounts_live_session(state) if session_aware
+           else occupied_slot_accounts(state, max_age_seconds=0.0))
+    for s in occ.get(account, []):
         if s != this_slot:
             return True
     # The shared mount counts too: a slot copying merkos while the shared mount
@@ -1779,7 +1790,8 @@ def _account_held_by_other_live_mount(state: dict, account: str, this_slot: str 
 
 
 def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: str | None,
-                               state: dict, config: dict | None = None) -> bool:
+                               state: dict, config: dict | None = None,
+                               session_aware: bool = False) -> bool:
     """True iff the refresh-token FAMILY in `candidate_creds` already runs on
     ANOTHER live mount of `account` — the shared ~/.claude mount or another live
     lane. That is the GH #104 clobber itself: two live mounts on one refresh-token
@@ -1805,6 +1817,13 @@ def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: s
     max_age_seconds=0 (ground-truth occupancy) for the same reason as
     `_account_held_by_other_live_mount`: this is a credential-safety check on the
     rare swap path, so it must not read a stale cache mid-fan-out.
+
+    session_aware (default False, opt-in): when True, only slots with a live
+    claude SESSION are counted as other live mounts, so an orphaned subprocess
+    holding a slot after its session closed doesn't manufacture a phantom family
+    collision (orphan-holds-slot bug, 2026-07-10). The pool-family DECISION sites
+    pass True; the divergence detector (`_divergence_risk_lanes`) keeps the
+    default so its "any holder" semantics are unchanged.
     """
     try:
         cand_rt = _credential_refresh_token(read_json(candidate_creds))
@@ -1817,7 +1836,9 @@ def _live_family_would_collide(account: str, candidate_creds: Path, this_slot: s
     other_mounts: list[Path] = []
     if _shared_mount_holds(account, state, config):
         other_mounts.append(CREDS_JSON)  # ~/.claude/.credentials.json (bare sessions)
-    for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
+    occ = (occupied_slot_accounts_live_session(state) if session_aware
+           else occupied_slot_accounts(state, max_age_seconds=0.0))
+    for s in occ.get(account, []):
         if s != this_slot:
             other_mounts.append(mount_creds_path(slot_path(s)))
     for p in other_mounts:
@@ -2238,6 +2259,82 @@ def mount_pids(mount: Path) -> list[int]:
         if val is not None and val.rstrip("/") == want:
             pids.append(int(p.name))
     return pids
+
+
+# The comm values a genuinely-live claude SESSION top process reports. The
+# launcher sets CLAUDE_CONFIG_DIR and then execs claude, so a live session
+# ALWAYS has one of these among a mount's env holders; "claude.exe" is the
+# node-binary variant seen live. comm is kernel-truncated to 15 chars — both
+# fit — so this is an exact, not a prefix, match.
+CLAUDE_SESSION_COMMS = ("claude", "claude.exe")
+
+
+def _is_claude_session_comm(comm: str) -> bool:
+    """True iff `comm` names a live claude SESSION top process (see
+    CLAUDE_SESSION_COMMS).
+
+    Ground truth for "is this env holder a real session, or a leftover?"
+    (orphan-holds-slot bug, 2026-07-10). After a session closes, a subprocess it
+    spawned — a `vite`/`next dev` dev server, a `tail -f`, etc. — can reparent to
+    init (ppid 1) while still carrying the CLAUDE_CONFIG_DIR it inherited, which
+    keeps the slot "in use" forever. Those orphans carry OTHER comms (bash, node,
+    vite, python, tail), so a comm test cleanly separates them from the session.
+
+    Why comm and NOT a cmdline substring: a subagent's `/bin/bash -c source
+    /home/rayi/claude-accounts/slot-N/shell-snapshots/...` contains the literal
+    string "claude" via the mount PATH, so cmdline matching false-positives on
+    every subagent shell. comm is the executable name only, so it doesn't.
+
+    Pure (no /proc), so it's unit-testable in isolation."""
+    return comm in CLAUDE_SESSION_COMMS
+
+
+def _pid_comm(pid: int) -> str | None:
+    """A process's comm (executable name), read robustly from /proc/<pid>/stat.
+
+    The comm field is wrapped in parens and may itself contain spaces or parens,
+    so it is parsed between the FIRST '(' and the LAST ')' — the same robust
+    parse `_find_descendant_claude_pid` uses. Returns None if the process is gone
+    or its stat is unreadable/malformed."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, PermissionError):
+        return None
+    open_paren = stat_text.find("(")
+    close_paren = stat_text.rfind(")")
+    if open_paren == -1 or close_paren == -1 or close_paren < open_paren:
+        return None
+    return stat_text[open_paren + 1 : close_paren]
+
+
+def mount_session_pids(mount: Path) -> list[int]:
+    """Subset of mount_pids(mount) that represent a live claude SESSION.
+
+    A mount is session-occupied iff at least one of its env holders has a claude
+    session comm (see _is_claude_session_comm). Rationale: the launch sets
+    CLAUDE_CONFIG_DIR then execs claude, so a live session ALWAYS has its own
+    claude-comm process among the holders. When the only holders are non-claude
+    comms, the session is already dead and those holders are orphaned leftovers
+    (a dev server / tail reparented to init that kept the inherited env var) —
+    the orphan-holds-slot bug (2026-07-10) that kept a slot's login family pinned
+    forever after its session closed.
+
+    Returns the claude-comm holder pids (empty ⇒ no live session)."""
+    return [pid for pid in mount_pids(mount)
+            if _is_claude_session_comm(_pid_comm(pid) or "")]
+
+
+def mount_has_live_session(mount: Path) -> bool:
+    """True iff a live claude SESSION holds this mount — NOT merely any process
+    that inherited CLAUDE_CONFIG_DIR (which `mount_in_use` reports).
+
+    Session-aware counterpart of mount_in_use. Used ONLY at the gc-reap and
+    pool-family DECISION sites, so an orphaned dev-server that outlived its
+    session neither blocks slot gc nor makes the account's login family look
+    occupied (orphan-holds-slot bug, 2026-07-10). Every OTHER caller of
+    mount_in_use/mount_pids (swap-window detection, SOS double-mount detectors,
+    status display) legitimately means "any holder" and is left unchanged."""
+    return bool(mount_session_pids(mount))
 
 
 def pane_mount_name(pane: str) -> str | None:
@@ -2791,24 +2888,45 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
     force=True skips only the in-use refusal (for cleaning up after a
     /proc-invisible holder the operator knows is dead) — the save-back and
     its guards always run.
+
+    Session-aware in-use gate (orphan-holds-slot bug, 2026-07-10): the refusal
+    triggers on a live claude SESSION (mount_has_live_session), NOT on any process
+    that inherited CLAUDE_CONFIG_DIR (mount_in_use). After a session closes, a
+    subprocess it spawned — a `vite`/`next dev` dev server, a `tail -f` — can
+    reparent to init and keep the env var, holding the slot "in use" forever and
+    permanently blocking gc (which never released the slot's login family, GH
+    #104 repro: onemitzvah2a's orphaned vite pinned slot-11/rayi3). When only such
+    orphans remain, the slot has no live session and IS reaped; the stepped-over
+    orphan pids are reported so the caller can surface them and the operator can
+    kill them. `force` still skips the whole gate.
     """
     d = slot_path(name)
     entry = state.get("slots", {}).get(name, {})
     if not d.exists():
         state.get("slots", {}).pop(name, None)
         return {"action": "dropped_stale_entry", "slot": name}
-    if not force and mount_in_use(d):
-        return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
+    if not force and mount_has_live_session(d):
+        return {"action": "refused_in_use", "slot": name, "pids": mount_session_pids(d)}
+    # No live claude session. Any remaining env holders are orphaned non-session
+    # leftovers (see the session-aware note above); record them so the reap can be
+    # reported as "stepped over N orphaned holders" and the operator can clean up.
+    orphan_pids = [] if force else mount_pids(d)
     if not force and _slot_reserved(entry):
         # An in-flight launch has claimed this slot but not exec'd claude yet
         # (no PID). rmtree'ing it now would pull the dir out from under the
         # launch that's mid-install (review finding 2026-07-02: gc-mid-launch).
+        # NOTE: this guard stays AFTER the session gate so the launch window is
+        # still protected even when only orphans hold the slot.
         return {"action": "refused_reserved", "slot": name, "reserved_until": entry.get("reserved_until")}
     expected = state.get("slots", {}).get(name, {}).get("account")
     saveback = saveback_mount_credentials(d, expected, state)
     shutil.rmtree(d)
     state.get("slots", {}).pop(name, None)
-    return {"action": "reaped", "slot": name, "saveback": saveback}
+    result = {"action": "reaped", "slot": name, "saveback": saveback}
+    if orphan_pids:
+        # Reaped over orphaned non-session holders (no live claude among them).
+        result["orphan_pids"] = orphan_pids
+    return result
 
 
 def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
@@ -6124,7 +6242,13 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     install_src = None
     used_independent = False
     if (slot is not None and independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config)):
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)):
+        # session_aware=True (orphan-holds-slot bug, 2026-07-10): only a slot with
+        # a LIVE claude session counts as double-booking the account here. An
+        # orphaned dev-server that inherited CLAUDE_CONFIG_DIR after its session
+        # closed refreshes no token, so it must not force a needless family claim /
+        # pool-exhaustion refuse onto an account whose family is actually free.
         # #127: liveness-verified claim — probes each free family's refresh
         # token, retires dead stores (the pre-PR#126 poisoning landmines), and
         # persists the rotation into the store this install copies from.
@@ -6240,8 +6364,15 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # token. Degrade-to-safe: refusing a swap never logs anyone out; clobbering
     # does. The login-free remedy is another pooled family (`cus login-mount`).
     if (slot is not None and independent_logins_enabled(config)
-            and _account_held_by_other_live_mount(state, target_name, slot, config)
-            and _live_family_would_collide(target_name, install_src, slot, state, config)):
+            and _account_held_by_other_live_mount(state, target_name, slot, config,
+                                                  session_aware=True)
+            and _live_family_would_collide(target_name, install_src, slot, state, config,
+                                           session_aware=True)):
+        # session_aware=True (orphan-holds-slot bug, 2026-07-10): an orphaned
+        # holder on another slot is not a live mount that could rotate the token
+        # out from under this one, so it must not trigger the family-collision
+        # refuse. Keeps this execute-time guard consistent with the slot-move
+        # preview, which also judges occupancy session-aware.
         # The refusal that prevents the divergence-logout: this install source's
         # token family is already live on another mount of `target_name`. shared=true
         # is the whole reason we refuse; token_fp names the colliding family.
@@ -7358,6 +7489,35 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
         if d.exists() and mount_in_use(d):
             out.setdefault(acct, []).append(name)
     _OCCUPIED_SLOTS_CACHE[key] = (now, out)
+    return out
+
+
+def occupied_slot_accounts_live_session(state: dict) -> dict[str, list[str]]:
+    """Like occupied_slot_accounts, but counts a slot only when a live claude
+    SESSION holds it (mount_has_live_session), not merely any process that
+    inherited CLAUDE_CONFIG_DIR (mount_in_use).
+
+    The credential-safety pool-family DECISION reads this instead of
+    occupied_slot_accounts so an orphaned subprocess that outlived its session —
+    a `vite`/`next dev` dev server or `tail -f` reparented to init while still
+    carrying the inherited env var — does NOT make the account's login family
+    look occupied (orphan-holds-slot bug, 2026-07-10; GH #104 repro: onemitzvah2a
+    closed but its orphaned vite held slot-11/rayi3, so `cus slot move slot-1
+    rayi3` refused "no free login family"). No holder-inheriting orphan ever
+    refreshes the account's OAuth token, so it can't cause the #104 clobber the
+    pool-family gate exists to prevent — treating it as occupancy is a false
+    positive that strands a genuinely-free family.
+
+    Always ground-truth (no cache): only the rare swap/move path calls it, and it
+    mirrors the max_age_seconds=0.0 the credential guards already used."""
+    out: dict[str, list[str]] = {}
+    for name, entry in sorted(state.get("slots", {}).items()):
+        acct = entry.get("account")
+        if not acct:
+            continue
+        d = slot_path(name)
+        if d.exists() and mount_has_live_session(d):
+            out.setdefault(acct, []).append(name)
     return out
 
 
@@ -16480,12 +16640,21 @@ def slot_gc_cmd(slot_name_opt: str | None, force: bool) -> None:
         result = gc_slot(name, state, force=force)
         action = result["action"]
         if action == "refused_in_use":
-            click.echo(f"  {name}: in use (pids {result['pids']}) — skipped")
+            click.echo(f"  {name}: live claude session (pids {result['pids']}) — skipped")
+        elif action == "refused_reserved":
+            click.echo(f"  {name}: reserved by an in-flight launch (until {result.get('reserved_until')}) — skipped")
         elif action == "dropped_stale_entry":
             click.echo(f"  {name}: state entry with no dir — dropped")
         else:
             sb = result["saveback"]
-            click.echo(f"  {name}: reaped (creds save-back: {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")")
+            msg = f"  {name}: reaped (creds save-back: {sb['action']}" + (f" → account-{sb['account']}" if sb.get("account") else "") + ")"
+            # Orphan-holds-slot bug (2026-07-10): if the slot had no live session
+            # but leftover env-inheriting holders (a dev server / tail reparented
+            # to init), we reaped over them — surface the pids so the operator can
+            # kill the stragglers.
+            if result.get("orphan_pids"):
+                msg += click.style(f" (stepped over {len(result['orphan_pids'])} orphaned non-session holders: {result['orphan_pids']})", fg="yellow")
+            click.echo(msg)
     save_state(state)
 
 
@@ -16529,16 +16698,20 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     plus the shared ~/.claude mount), for the operator-facing message.
     """
     current = (state.get("slots", {}).get(slot_name, {}) or {}).get("account")
-    # Ground-truth occupancy (max_age_seconds=0 bypasses the cache) — the same
-    # source the real clobber guard reads, so preview and reality can't diverge.
-    held_by = [s for s in occupied_slot_accounts(state, max_age_seconds=0.0).get(target, []) if s != slot_name]
+    # Ground-truth, SESSION-aware occupancy — the same source the real clobber
+    # guard reads (session_aware=True below), so preview and reality can't diverge.
+    # Session-aware (orphan-holds-slot bug, 2026-07-10): a slot whose only holder
+    # is an orphaned dev-server that outlived its session is NOT a live mount, so
+    # it must not appear as an occupant that forces a family claim / refuse.
+    held_by = [s for s in occupied_slot_accounts_live_session(state).get(target, []) if s != slot_name]
     # Shared-mount holder: mode-aware, NOT gated on mount_in_use(CLAUDE_DIR) —
     # bare sessions on ~/.claude set no CLAUDE_CONFIG_DIR so mount_pids can't see
     # them (issue #141). _shared_mount_holds treats global/hybrid state["active"]
     # as an unconditional live holder; per_session keeps the detectable-only rule.
     if _shared_mount_holds(target, state, config):
         held_by = held_by + ["~/.claude (shared mount)"]
-    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config)
+    held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config,
+                                                       session_aware=True)
     gate = independent_logins_enabled(config)
     if target == current:
         plan, detail = "noop", f"{slot_name} is already on '{target}'"
@@ -16548,7 +16721,8 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     elif gate and (has_free_login_family(target, state)
                    or (has_independent_login(target, slot_name)
                        and not _live_family_would_collide(
-                           target, login_store_creds_path(target, slot_name), slot_name, state, config))):
+                           target, login_store_creds_path(target, slot_name), slot_name, state, config,
+                           session_aware=True))):
         # Claimable = a free POOLED family, OR a legacy per-slot login whose token
         # is GENUINELY distinct from every live mount's family. The legacy branch
         # is now token-CHECKED (2026-07-07 chats1a): a stale-copy legacy store

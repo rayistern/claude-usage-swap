@@ -81,11 +81,19 @@ class _Env:
         # Slot occupancy comes from /proc in production; tests control it.
         self._saved_mount_pids = cus.mount_pids
         cus.mount_pids = lambda mount: []
+        # The gc-reap in-use gate is session-aware (orphan-holds-slot bug,
+        # 2026-07-10): a holder counts only if its comm is claude. Default the
+        # fake holders to a claude comm so a test that plants a holder to mean
+        # "live session" reads as one; a test exercising the orphan case can
+        # override cus._pid_comm to a non-claude comm.
+        self._saved_pid_comm = cus._pid_comm
+        cus._pid_comm = lambda pid: "claude"
 
     def restore(self) -> None:
         for k, v in self._saved.items():
             setattr(cus, k, v)
         cus.mount_pids = self._saved_mount_pids
+        cus._pid_comm = self._saved_pid_comm
         self._tmp.cleanup()
 
 
@@ -273,6 +281,34 @@ def test_gc_slot_refuses_in_use_then_reaps():
         state.setdefault("slots", {})["slot-9"] = {"account": None}
         r = cus.gc_slot("slot-9", state)
         assert r["action"] == "dropped_stale_entry"
+    finally:
+        env.restore()
+
+
+def test_gc_slot_reaps_over_orphan_nonsession_holder():
+    """Orphan-holds-slot bug (2026-07-10): a slot whose ONLY holder is a
+    non-claude orphan (a dev server / tail that outlived its session and kept the
+    inherited CLAUDE_CONFIG_DIR) has no live session, so gc must REAP it — not
+    refuse forever — and report the stepped-over orphan pids."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        name, d = cus.create_slot(state)
+        (d / ".credentials.json").write_text(json.dumps(_creds("rt-alpha", expires_at=3_000_000_000_000)))
+        state["slots"][name]["account"] = "alpha"
+
+        # A leftover vite dev server (pid 4242) still holds the mount, but its
+        # comm is NOT claude → not a live session. Clear the fresh create_slot
+        # reservation first so the in-flight-launch guard (which still fires even
+        # when only orphans hold the slot) doesn't mask the reap under test.
+        state["slots"][name].pop("reserved_until", None)
+        cus.mount_pids = lambda mount: [4242]
+        cus._pid_comm = lambda pid: "vite"
+        r = cus.gc_slot(name, state)
+        assert r["action"] == "reaped", r
+        assert r.get("orphan_pids") == [4242], r
+        assert not d.exists()
+        assert name not in state["slots"]
     finally:
         env.restore()
 
