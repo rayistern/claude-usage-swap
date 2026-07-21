@@ -211,6 +211,93 @@ def test_reactive_429_attributes_to_slot_account():
         env.restore()
 
 
+def test_parse_sessions_log_preserves_tmux_socket_and_legacy_rows():
+    """The 6-col line (…,<pane>,<tmux_socket>,<cwd>) surfaces the socket and
+    keeps cwd greedy-last; a legacy 5-col line (no socket column) still parses
+    with tmux_socket=None. Backward-compat for logs written before the migration.
+    """
+    env = _Env()
+    try:
+        cus.SESSIONS_LOG.write_text(
+            "2026-07-06T00:00:00Z,new,alpha,%0,/tmp/tmux-1000/committee-loop,/work,tree\n"
+            "2026-07-06T00:00:01Z,old,beta,%1,/legacy\n"
+            "2026-07-06T00:00:02Z,notmux,gamma,no-tmux,no-tmux,/x\n"
+        )
+        entries = cus._parse_sessions_log()
+        # 6-col: socket parsed, cwd is the greedy remainder (comma preserved).
+        assert entries[0]["tmux_socket"] == "/tmp/tmux-1000/committee-loop"
+        assert entries[0]["cwd"] == "/work,tree"
+        # legacy 5-col: no socket column → None, cwd = last field.
+        assert entries[1]["tmux_socket"] is None
+        assert entries[1]["cwd"] == "/legacy"
+        # explicit "no-tmux" socket normalizes to None.
+        assert entries[2]["tmux_socket"] is None
+        assert entries[2]["cwd"] == "/x"
+    finally:
+        env.restore()
+
+
+def test_session_current_slot_uses_tmux_socket_to_disambiguate_duplicate_panes():
+    """session_current_slot must pass the recorded socket to pane_mount_name so
+    a %0 on one tmux server resolves to that server's mount, not a same-named
+    pane on the default socket."""
+    orig_parse = cus._parse_sessions_log
+    orig_pane_mount_name = cus.pane_mount_name
+    seen = []
+    try:
+        cus._parse_sessions_log = lambda: [{
+            "ts": "2026-07-06T00:00:00Z",
+            "session_id": "sess",
+            "account": "alpha",
+            "pane": "%0",
+            "tmux_socket": "/tmp/tmux-1000/committee-loop",
+            "cwd": "/worktree",
+        }]
+
+        def fake_pane_mount_name(pane, tmux_socket=None):
+            seen.append((pane, tmux_socket))
+            return "slot-2" if tmux_socket == "/tmp/tmux-1000/committee-loop" else "slot-1"
+
+        cus.pane_mount_name = fake_pane_mount_name
+        assert cus.session_current_slot("sess") == "slot-2"
+        assert seen == [("%0", "/tmp/tmux-1000/committee-loop")]
+    finally:
+        cus._parse_sessions_log = orig_parse
+        cus.pane_mount_name = orig_pane_mount_name
+
+
+def test_pane_mount_name_disambiguates_same_pane_across_tmux_sockets():
+    """Core cross-server fix: the SAME pane id (%3) on two tmux servers must
+    resolve to DIFFERENT mounts. The socket selects which server's pane PID is
+    read; without it both %3s hit the default socket and collapse to one mount
+    → wrong account attribution."""
+    env = _Env()
+    try:
+        sock_a = "/tmp/tmux-1000/default"
+        sock_b = "/tmp/tmux-1000/committee-loop"
+        pid_by_socket = {sock_a: 101, sock_b: 202}
+        mount_by_pid = {101: cus.ACCOUNTS_DIR / "slot-1", 202: cus.ACCOUNTS_DIR / "slot-2"}
+        orig = (cus._pane_pid, cus._find_descendant_claude_pid, cus._pid_config_dir)
+        # A None socket means "the default tmux server" — pane_mount_name runs
+        # bare `tmux` (no -S), which connects to the default socket, modeled here
+        # as sock_a. So resolve None the same way _pane_pid would on the default
+        # server, rather than leaving a stub gap that masks the real behavior.
+        cus._pane_pid = lambda pane, tmux_socket=None: pid_by_socket.get(tmux_socket if tmux_socket is not None else sock_a)
+        cus._find_descendant_claude_pid = lambda pid: pid
+        cus._pid_config_dir = lambda pid: str(mount_by_pid[pid])
+        try:
+            assert cus.pane_mount_name("%3", sock_a) == "slot-1"
+            assert cus.pane_mount_name("%3", sock_b) == "slot-2"
+            # No socket → the DEFAULT tmux server (bare `tmux`), modeled as sock_a
+            # → slot-1; an EXPLICIT sock_b still resolves independently (%3 does
+            # not collapse across servers).
+            assert cus.pane_mount_name("%3", None) == "slot-1"
+        finally:
+            cus._pane_pid, cus._find_descendant_claude_pid, cus._pid_config_dir = orig
+    finally:
+        env.restore()
+
+
 def test_fast_cadence_tracks_occupancy_in_per_session():
     env = _Env()
     try:
@@ -381,7 +468,153 @@ def test_config_for_pool_disables_model_gate_for_standard():
     std = cus._config_for_pool(cfg, "standard")
     assert prem is cfg  # premium: unchanged object
     assert std["per_model_weekly"]["gate_enabled"] is False
+    assert std["per_model_weekly"]["reserve_safe_for_premium"] is True
     assert cfg["per_model_weekly"]["gate_enabled"] is True  # original untouched
+
+
+def test_standard_pool_prefers_model_exhausted_target_to_preserve_safe_accounts():
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 10.0,
+                                          "per_model_weekly_pct": {"Fable": 20.0}})
+        # gamma: Fable-exhausted (model-spent) but HEALTHY — aggregate headroom
+        # AND below the first ladder step (won't immediately re-trip), so the
+        # reserve narrows the standard lane onto it. (7d=40, adapted from the
+        # pre-fix 60: the required not-re-trip guard now excludes a model-spent
+        # target that sits at/over steps[0]=50, so it must be genuinely healthy.)
+        state["accounts"]["gamma"].update({"current_5h_pct": 9.0, "current_7d_pct": 40.0,
+                                           "per_model_weekly_pct": {"Fable": 100.0}})
+
+        target = cus.pick_swap_target(state, cus._config_for_pool(_pool_config(), "standard"))
+
+        assert target is not None
+        assert target.name == "gamma"
+    finally:
+        env.restore()
+
+
+def test_standard_pool_falls_back_to_safe_account_when_model_exhausted_target_degraded():
+    # reserve_safe_for_premium is a PREFERENCE, not a wall. When every
+    # model-exhausted (Fable-spent) account is itself over the 7d cap (or would
+    # immediately re-trip), a standard lane must fall back to a Fable-fresh
+    # account that still has aggregate headroom rather than starve on the
+    # degraded model-spent one. Regression for the 2026-07-06 slot-5 SOS: all
+    # headroom accounts were Fable-fresh, so reserve narrowed the lane to a lone
+    # 81%-7d account and pick_swap_target returned DEGRADED → a false "no swap
+    # target" alarm while idle capacity sat reserved.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        # alpha: the standard lane's own account, leaving on 5h.
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        # beta: Fable-fresh AND aggregate headroom — the correct fallback target.
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 10.0,
+                                          "per_model_weekly_pct": {"Fable": 20.0}})
+        # gamma: Fable-exhausted (model-spent) but over the 80% 7d cap → degraded.
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 85.0,
+                                           "per_model_weekly_pct": {"Fable": 100.0}})
+
+        target = cus.pick_swap_target(state, cus._config_for_pool(_pool_config(), "standard"))
+
+        assert target is not None
+        assert target.name == "beta", f"expected fallback to Fable-fresh beta, got {target.name}"
+        assert "DEGRADED" not in target.reason, target.reason
+    finally:
+        env.restore()
+
+
+def test_non_gated_install_does_not_reserve_model_exhausted_targets():
+    # REQUIRED-FIX regression (reviewer 2026-07-06): reserve_safe_for_premium
+    # must be INACTIVE when the per-model gate is off (a non-gated install, the
+    # default). The key lives only in the standard-pool VIEW that _config_for_pool
+    # builds for a GATED install — it is not in DEFAULT_CONFIG — so a non-gated
+    # install never steers toward model-exhausted accounts. pick_swap_target here
+    # must pick by usage (gamma, lowest), NOT the model-exhausted beta.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        # beta: model-exhausted (Fable=100) but aggregate-healthy — a non-gated
+        # install must NOT prefer it just because its per-model week is spent.
+        state["accounts"]["beta"].update({"current_5h_pct": 5.0, "current_7d_pct": 12.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        # gamma: Fable-fresh and lowest usage — the correct lowest_usage pick.
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 8.0,
+                                           "per_model_weekly_pct": {"Fable": 10.0}})
+        # _config() is a non-gated install (per_model_weekly.gate_enabled False).
+        target = cus.pick_swap_target(state, _config())
+        assert target is not None
+        assert target.name == "gamma", f"non-gated install must not reserve; got {target.name}"
+    finally:
+        env.restore()
+
+
+def test_reserve_skips_would_re_trip_model_spent_target():
+    # REQUIRED-FIX regression (reviewer 2026-07-06): the reserve guard is
+    # `7d-under-cap AND not-would-immediately-re-trip`, not 7d-only. A standard
+    # lane must NOT be narrowed onto a model-spent account that would re-trip its
+    # own ladder on arrival when a HEALTHY Fable-fresh target exists in the full
+    # pool. Here beta is model-spent (Fable=100) AND would re-trip (5h=60 ≥
+    # steps[0]=50) though its 7d (20) is under the 80 cap; gamma is Fable-fresh
+    # and healthy. A 7d-only guard would narrow onto beta and strand the lane on
+    # a re-tripping (DEGRADED) target; the fix picks gamma.
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        state = cus.load_state()
+        state["active"] = "alpha"
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 20.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+        state["accounts"]["beta"].update({"current_5h_pct": 60.0, "current_7d_pct": 20.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        state["accounts"]["gamma"].update({"current_5h_pct": 0.0, "current_7d_pct": 10.0,
+                                           "per_model_weekly_pct": {"Fable": 20.0}})
+
+        target = cus.pick_swap_target(state, cus._config_for_pool(_pool_config(), "standard"))
+
+        assert target is not None
+        assert target.name == "gamma", f"expected healthy Fable-fresh gamma, got {target.name}"
+        assert "DEGRADED" not in target.reason, target.reason
+    finally:
+        env.restore()
+
+
+def test_premium_slot_degrades_temporarily_when_no_model_safe_target():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 25.0,
+                                           "per_model_weekly_pct": {"Fable": 30.0}})
+        # beta: Fable-dead (premium gate rejects it) but aggregate-healthy — a
+        # CLEAN standard target (7d=30 < steps[0]=50, adapted from the pre-fix
+        # 63 so the standard retry yields a non-DEGRADED pick, per PIECE 4).
+        state["accounts"]["beta"].update({"current_5h_pct": 0.0, "current_7d_pct": 30.0,
+                                          "per_model_weekly_pct": {"Fable": 100.0}})
+        cus.save_state(state)
+        state = cus.load_state()
+        usage = {"alpha": _usage_pm(100.0, 25.0, fable=30.0),
+                 "beta": _usage_pm(0.0, 30.0, fable=100.0)}
+
+        moves = cus.decide_slot_swaps(state, _pool_config(), usage)
+        assert len(moves) == 1, moves
+        assert moves[0]["slot"] == slot
+        assert moves[0]["to"] == "beta"
+        assert moves[0]["pool"] == "standard"
+        assert "premium degraded to standard" in moves[0]["reason"]
+
+        cus._execute_slot_moves(moves, state, _pool_config(), no_execute=False)
+        # The move is for THIS cycle only — the slot's pool tag stays premium.
+        assert cus._slot_pool(cus.load_state(), slot, _pool_config()) == "premium"
+    finally:
+        env.restore()
 
 
 def test_premium_slot_swaps_off_model_exhausted_standard_holds():

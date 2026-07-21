@@ -4,6 +4,7 @@
 # dependencies = [
 #     "click>=8.0",
 #     "pyyaml>=6.0",
+#     "rich>=13.0",
 # ]
 # ///
 """claude-usage-swap (cus) — auto-rotate Claude Code OAuth accounts.
@@ -782,6 +783,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # that level) while the aggregate-7d cap keeps its own value — lets
         # "swap when Fable hits 90%" coexist with a lower aggregate ceiling.
         "cap_pct": None,
+        # Standard-pool lanes of a GATED install prefer accounts whose per-model
+        # week is already spent, so Fable-fresh accounts stay available for
+        # premium lanes. Deliberately NOT set here: it is injected (default True)
+        # by _config_for_pool ONLY into the standard-pool VIEW, which exists only
+        # when the base gate is enabled — so a non-gated install (gate off,
+        # default) never activates it, matching "inactive unless gate_enabled".
+        # Opt a gated install's standard lanes out with
+        # per_model_weekly.reserve_safe_for_premium: false.
     },
     "reactive": {
         "enabled": True,         # detect 429s via PostToolUseFailure hook
@@ -1378,6 +1387,21 @@ def _credential_refresh_token(creds: Any) -> str | None:
     oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
     rt = oauth.get("refreshToken") if isinstance(oauth, dict) else None
     return rt if isinstance(rt, str) and rt else None
+
+
+def mount_has_usable_credentials(mount: Path) -> bool:
+    """True iff the mount's live creds file parses and carries a refresh token.
+
+    "Usable" matches has_independent_login's bar: an access-token-only or
+    logout-shaped file is treated as absent — it can seed no session and must be
+    reinstalled from the account snapshot rather than reused as-is."""
+    path = mount_creds_path(mount)
+    if not path.exists():
+        return False
+    try:
+        return _credential_refresh_token(read_json(path)) is not None
+    except (json.JSONDecodeError, OSError):
+        return False
 
 
 def _refresh_fingerprint(refresh_token: str) -> str:
@@ -2240,17 +2264,22 @@ def mount_pids(mount: Path) -> list[int]:
     return pids
 
 
-def pane_mount_name(pane: str) -> str | None:
+def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
     """Which mount ('slot-N' / 'account-X') a tmux pane's claude process uses.
 
     None = bare/global (~/.claude/) or undeterminable. Walks the pane's
     process tree to the claude pid and reads its /proc environ — same ground
     truth as mount_pids, from the pane side (for `cus status` display).
+
+    `tmux_socket` disambiguates same-named panes (e.g. two `%3`s) across
+    multiple tmux servers: pane ids are only unique within one server, so a
+    None socket resolves against the default socket while a recorded socket
+    targets the exact server the session was launched under.
     """
     if not pane or pane == "no-tmux":
         return None
     try:
-        pid = _pane_pid(pane)
+        pid = _pane_pid(pane, tmux_socket)
         if not pid:
             return None
         cpid = _find_descendant_claude_pid(pid) or pid
@@ -3955,6 +3984,20 @@ def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
     return max(vals) if vals else 0.0
 
 
+def _tracked_model_weekly_from_acct(acct: dict, config: dict) -> float | None:
+    """Max tracked per-model weekly % on this account, or None if it carries no
+    reading. Unlike _max_model_weekly_from_acct this is INDEPENDENT of the
+    per-model gate (it never zeroes on a disabled gate): the standard-pool
+    reserve (reserve_safe_for_premium) needs to tell a genuinely Fable-fresh
+    account apart from one with no reading even when the gate is off."""
+    pm = acct.get("per_model_weekly_pct") or {}
+    if not pm:
+        return None
+    allow = {str(m).lower() for m in (config.get("per_model_weekly", {}).get("models") or [])}
+    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+    return max(vals) if vals else None
+
+
 def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
     per_model_weekly_pct from state.json. Used to fold per-model weekly caps
@@ -4615,6 +4658,9 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # falling back to hard_7d) — identical to the pre-split primary filter:
     # arrivals stop earlier than swap-away drains. See _model_weekly_target_cap_for_config.
     gate_enabled, _ = _per_model_weekly_gate(config)
+    # Hoisted (used by the standard-lane reserve elif AND the safe_7d filter
+    # below): the aggregate 7d hard cap.
+    hard_7d = _hard_7d_cap_for_config(config)
     model_cap = _model_weekly_target_cap_for_config(config)
     model_safe = [(n, a) for n, a in candidates
                   if _max_model_weekly_from_acct(a, config) < model_cap]
@@ -4626,8 +4672,20 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
         # callers (decide_swap's "no valid swap target" branch, decide_slot_swaps'
         # fan-out HOLD) emit the operator-facing daemon.log line.
         return None
-    if model_safe:
+    if gate_enabled:
         candidates = model_safe
+    elif config.get("per_model_weekly", {}).get("reserve_safe_for_premium"):
+        model_spent = [(n, a) for n, a in candidates
+                       if (pm := _tracked_model_weekly_from_acct(a, config)) is None or pm >= model_cap]
+        # Reserve is a PREFERENCE, not a wall: narrow standard lanes onto the
+        # model-exhausted set ONLY if it holds a target that survives BOTH downstream
+        # filters — under the aggregate 7d hard cap AND not immediately re-tripping its
+        # own ladder. Otherwise narrowing would strand the lane on a degraded
+        # model-spent account while a healthy Fable-fresh target exists in the full pool.
+        if any(a.get("current_7d_pct", 0) < hard_7d
+               and not _target_would_immediately_re_trip(a, config)
+               for _, a in model_spent):
+            candidates = model_spent
 
     # Universal filter (GH #17, all strategies): exclude candidates above
     # the user-stated AGGREGATE weekly ceiling. Previously only headroom/smart
@@ -4635,7 +4693,6 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # exhausted account. SOFT: falls back to "any candidate" if ALL are above cap
     # (system is degraded; swap somewhere rather than stay on a hot active). Runs
     # on the per-model-safe survivors from the HARD gate above.
-    hard_7d = _hard_7d_cap_for_config(config)
     safe_7d = [(n, a) for n, a in candidates if a.get("current_7d_pct", 0) < hard_7d]
     cap_fallback = not safe_7d
     if safe_7d:
@@ -7459,13 +7516,15 @@ def session_current_slot(session_id: str) -> str | None:
     429 attribution and lazy-warm filtering need (review findings 2026-07-02).
     """
     pane = None
+    tmux_socket = None
     for e in reversed(_parse_sessions_log()):
         if e.get("session_id") == session_id:
             pane = e.get("pane")
+            tmux_socket = e.get("tmux_socket")
             break
     if not pane:
         return None
-    mnt = pane_mount_name(pane)
+    mnt = pane_mount_name(pane, tmux_socket)
     return mnt if (mnt and mnt.startswith(SLOT_PREFIX)) else None
 
 
@@ -7478,7 +7537,7 @@ def live_sessions_on_slot(slot_name: str) -> list:
         sessions = find_live_sessions()
     except Exception:
         return []
-    return [s for s in sessions if pane_mount_name(s.pane) == slot_name]
+    return [s for s in sessions if pane_mount_name(s.pane, s.tmux_socket) == slot_name]
 
 
 def _locked_slots(config: dict) -> set[str]:
@@ -7524,6 +7583,7 @@ def _config_for_pool(config: dict, pool: str) -> dict:
         view = dict(config)
         pmw = dict(config.get("per_model_weekly", {}))
         pmw["gate_enabled"] = False
+        pmw["reserve_safe_for_premium"] = pmw.get("reserve_safe_for_premium", True)
         view["per_model_weekly"] = pmw
         return view
     return config
@@ -7647,6 +7707,44 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
         shim["_lane_load"] = _cur_lane_load()
         trace: dict = {}
         decision = decide_swap(shim, cfg_view, usage_by_account, trace)
+        effective_pool = pool
+        reason_prefix = ""
+        # Premium→standard DEGRADE (deliberate divergence from #163's HOLD): a
+        # premium lane whose per-model gate rejects every target as Fable-capped
+        # (no valid target) does NOT have to sit idle when the SAME account pool
+        # still has aggregate 7d headroom that serves standard-model work. Re-run
+        # the decision under standard-pool rules (gate off) and, if that yields a
+        # GENUINE (non-degraded) target, take it for THIS cycle only — the slot's
+        # pool tag is untouched, so it reverts to premium the moment a Fable-clean
+        # target frees. HOLD (upstream #163) remains the fallback when the
+        # standard retry ALSO finds nothing / only a degraded target.
+        #
+        # Trigger set = every gate that means "premium WANTS to move but has no
+        # acceptable target" — the ladder/hard-cap no-target holds AND the newer
+        # #139/#163 anti-degrade/anti-pingpong holds (`hard_7d_cap_degraded`,
+        # `hard_cap_pingpong`, `cap_degraded_target`). The one that materially
+        # needs the retry is `hard_cap_pingpong` under a PER-MODEL forcing cap:
+        # premium's best target is Fable-capped, but standard ignores the Fable
+        # gate and a clean aggregate target exists. The aggregate-cap holds also
+        # land here, but their standard retry is likewise 7d-capped, so the
+        # non-degraded guard below rejects it and the lane correctly HOLDs.
+        # Excluded on purpose: `min_improvement_gate` (a real target exists, just
+        # marginal — degrading would defeat that anti-churn hold) and the
+        # hysteresis/defer holds (transient, not a no-target condition).
+        if (decision is None and pool == "premium"
+                and trace.get("gate") in {"no_target", "hard_7d_cap_no_target",
+                                          "hard_7d_cap_degraded", "hard_cap_pingpong",
+                                          "cap_degraded_target"}):
+            std_trace: dict = {}
+            std_cfg = _config_for_pool(config, "standard")
+            std_decision = decide_swap(shim, std_cfg, usage_by_account, std_trace)
+            if std_decision is not None and "[DEGRADED:" not in std_decision.reason:
+                decision = std_decision
+                cfg_view = std_cfg
+                effective_pool = "standard"
+                reason_prefix = f"premium degraded to standard: {trace.get('reason')}; "
+                if traces is not None:
+                    traces[f"{acct_name}:standard"] = std_trace
         if traces is not None:
             traces[f"{acct_name}:{pool}"] = trace
         if decision is None:
@@ -7773,13 +7871,15 @@ def decide_slot_swaps(state: dict, config: dict, usage_by_account: dict[str, "Ac
                                f"for a premium lane; won't double-book '{target}' onto a second "
                                f"live mount — GH #104 / #139)")
                     continue
+            if reason_prefix:
+                reason = reason_prefix + reason
             taken.add(target)
             round_claims[target] = round_claims.get(target, 0) + 1
             moves.append({
                 "slot": slot_name, "from": acct_name, "to": target,
                 "gate": decision.gate, "tier": decision.tier,
                 "deferrable": decision.deferrable, "reason": reason,
-                "pool": pool,
+                "pool": effective_pool,
             })
     return moves
 
@@ -10244,13 +10344,35 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 "[DEGRADED:" in tgt.reason and "no targets below" in tgt.reason)
             if not starved:
                 continue
-            # Remedy hint. With the pool feature ON, the starvation means every
-            # headroom account is held AND has no free family — so provisioning
-            # another family (raising a pool's depth) is the login-free unlock,
-            # alongside add-account / free-a-lane / wait-for-reset.
-            pool_hint = (" Or provision another independent login for a headroom account "
-                         "(`cus login-mount <account>`) so this lane can borrow it."
-                         if independent_logins_enabled(config) else "")
+            # A premium lane that would DEGRADE to standard is NOT starved: the
+            # daemon (decide_slot_swaps) re-runs it under standard-pool rules and
+            # rotates it whenever a clean standard target exists. Mirror that here
+            # so Condition 2b never raises a false "cannot rotate" for a lane the
+            # daemon actually moves every cycle — it self-heals, no human action
+            # needed. (This also subsumes the earlier per-model-cap message: a
+            # premium lane blocked only by the Fable gate has a clean standard
+            # target, so it degrades rather than starves.)
+            if pool == "premium":
+                _std = pick_swap_target(shim, _config_for_pool(config, "standard"))
+                if _std is not None and "[DEGRADED:" not in _std.reason:
+                    continue
+            # Name the ACTUAL blocker so the remedy fits (2026-07-06). `drop` holds
+            # only accounts withheld because another live mount holds them AND no
+            # free pooled family exists — a genuine #104 double-book wall, which
+            # provisioning a family (or freeing a lane) unblocks. EMPTY ⇒ the
+            # blocker is 7d/aggregate saturation (every candidate over cap), which
+            # neither a family nor a freed lane can fix — so drop the double-book
+            # clause + login-mount hint there (dead-end advice).
+            reset_hint = "wait for another account's 5h/7d window to reset"
+            if drop:
+                cause = ("held by another live mount (GH #104 forbids double-booking — it "
+                         "clobbers the OAuth token) or is saturated")
+                pool_hint = (" Or provision another independent login for a headroom account "
+                             "(`cus login-mount <account>`) so this lane can borrow it."
+                             if independent_logins_enabled(config) else "")
+            else:
+                cause = "over its weekly (7d) cap or otherwise saturated"
+                pool_hint = ""
             # Tier severity: at/above saturation the lane is effectively frozen
             # and burning a live session → urgent; merely over the first ladder
             # step (still has headroom) → warning, an early nudge to add capacity.
@@ -10258,11 +10380,9 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 severity="urgent" if lane_pct >= sat_pct else "warning",
                 summary=f"lane {', '.join(sorted(slots))} on '{acct_name}' at {lane_pct:.0f}% "
                         f"(≥{lane_thr}%) with no swap target",
-                action=(f"'{acct_name}' is over its ladder step but every other account is either "
-                        f"held by another live mount (GH #104 forbids double-booking — it clobbers "
-                        f"the OAuth token) or is saturated, so this lane cannot rotate. Add another "
-                        f"account (`cus add <name>`), free a live lane, or wait for another account's "
-                        f"5h/7d window to reset." + pool_hint),
+                action=(f"'{acct_name}' is over its ladder step but every other account is {cause}, "
+                        f"so this lane cannot rotate. Add another account (`cus add <name>`), free a "
+                        f"live lane, or {reset_hint}." + pool_hint),
                 affected=acct_name,
             ))
 
@@ -10769,20 +10889,56 @@ class LiveSession:
     started_at: str
     last_stop_at: str | None     # latest Stop hook entry; None if never stopped
     transcript_path: Path | None  # ~/.claude/projects/<cwd>/<id>.jsonl
+    tmux_socket: str | None = None  # tmux server socket (${TMUX%%,*}); None = default/no-tmux
 
 
 def _parse_sessions_log() -> list[dict]:
-    """Read sessions.log as a list of dicts. Order: oldest first."""
+    """Read sessions.log as a list of dicts. Order: oldest first.
+
+    Two on-disk shapes coexist (CSV, cwd LAST so it may contain commas):
+      6-col (current):  <ts>,<session_id>,<account>,<pane>,<tmux_socket>,<cwd>
+      5-col (legacy):   <ts>,<session_id>,<account>,<pane>,<cwd>
+    Detection is by column count: split into at most 6 fields — 6 parts means
+    a socket is present (parts[4]), 5 means a legacy line (tmux_socket=None,
+    cwd=parts[4]). Either way cwd is the greedy final field, so an embedded
+    comma in cwd is preserved. "no-tmux"/"" sockets normalize to None.
+    """
     if not SESSIONS_LOG.exists():
         return []
     entries: list[dict] = []
     with SESSIONS_LOG.open() as f:
         for line in f:
-            parts = line.strip().split(",", 4)
-            if len(parts) < 5:
+            raw = line.rstrip("\r\n")  # tolerate CRLF (\r) if the log was ever CRLF-written
+            parts = raw.split(",", 5)
+            if len(parts) >= 6:
+                ts, session_id, account, pane, tmux_socket, cwd = parts
+                if tmux_socket in ("", "no-tmux"):
+                    tmux_socket = None
+            else:
+                parts = raw.split(",", 4)
+                if len(parts) < 5:
+                    continue
+                ts, session_id, account, pane, cwd = parts
+                tmux_socket = None
+            if not session_id:
                 continue
-            entries.append({"ts": parts[0], "session_id": parts[1], "account": parts[2], "pane": parts[3], "cwd": parts[4]})
+            entries.append({
+                "ts": ts,
+                "session_id": session_id,
+                "account": account,
+                "pane": pane,
+                "tmux_socket": tmux_socket,
+                "cwd": cwd,
+            })
     return entries
+
+
+def _same_tmux_pane(entry: dict, pane: str, tmux_socket: str | None) -> bool:
+    """True if a sessions.log entry refers to the same (server, pane) target.
+
+    Pane ids repeat across tmux servers, so a pane match alone is ambiguous;
+    the socket must also agree (both normalized so ""/absent == None)."""
+    return entry.get("pane") == pane and (entry.get("tmux_socket") or None) == (tmux_socket or None)
 
 
 def _latest_stops_per_session() -> dict[str, str]:
@@ -11016,6 +11172,7 @@ def find_live_sessions(account_filter: str | None = None) -> list[LiveSession]:
                 started_at=e["ts"],
                 last_stop_at=last_stop_at,
                 transcript_path=transcript,
+                tmux_socket=e.get("tmux_socket"),
             ))
     return live
 
@@ -11088,13 +11245,26 @@ def tmux_is_available() -> bool:
     return shutil.which("tmux") is not None
 
 
-def tmux_pane_exists(pane: str) -> bool:
+def _tmux_cmd(tmux_socket: str | None = None) -> list[str]:
+    """Base tmux argv, targeting a specific server socket when known.
+
+    Every tmux subprocess in the pane-resolution path routes through this so a
+    recorded `tmux_socket` (`${TMUX%%,*}` at SessionStart) hits the exact server
+    the pane lives on. None → bare `tmux` (default socket), preserving the
+    original single-server behavior. Fixes cross-server pane-id collisions
+    (two `%3`s on two servers → same PID → wrong mount/account attribution)."""
+    if tmux_socket:
+        return ["tmux", "-S", tmux_socket]
+    return ["tmux"]
+
+
+def tmux_pane_exists(pane: str, tmux_socket: str | None = None) -> bool:
     """Verify the given tmux pane id still exists."""
     if not pane or pane == "no-tmux" or not tmux_is_available():
         return False
     try:
         result = subprocess.run(
-            ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+            [*_tmux_cmd(tmux_socket), "list-panes", "-a", "-F", "#{pane_id}"],
             capture_output=True, text=True, timeout=5,
         )
         return pane in result.stdout.split()
@@ -11102,7 +11272,8 @@ def tmux_pane_exists(pane: str) -> bool:
         return False
 
 
-def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds: float = 0.3) -> bool:
+def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds: float = 0.3,
+                   tmux_socket: str | None = None) -> bool:
     """Send `text` (optionally followed by Enter) to a tmux pane.
 
     Pattern documented in tmux-Claude integration guides: use -l (literal)
@@ -11112,27 +11283,27 @@ def tmux_send_text(pane: str, text: str, then_enter: bool = True, delay_seconds:
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return False
     try:
-        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", text], check=True, timeout=5)
+        subprocess.run([*_tmux_cmd(tmux_socket), "send-keys", "-t", pane, "-l", text], check=True, timeout=5)
         if then_enter:
             time.sleep(delay_seconds)
-            subprocess.run(["tmux", "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
+            subprocess.run([*_tmux_cmd(tmux_socket), "send-keys", "-t", pane, "C-m"], check=True, timeout=5)
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
 
-def tmux_send_keys(pane: str, *keys: str) -> bool:
+def tmux_send_keys(pane: str, *keys: str, tmux_socket: str | None = None) -> bool:
     """Send raw key sequences (e.g. 'Escape', 'C-c') to a tmux pane."""
     if not tmux_is_available() or not pane or pane == "no-tmux":
         return False
     try:
-        subprocess.run(["tmux", "send-keys", "-t", pane, *keys], check=True, timeout=5)
+        subprocess.run([*_tmux_cmd(tmux_socket), "send-keys", "-t", pane, *keys], check=True, timeout=5)
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
 
-def _pane_pid(pane: str) -> int | None:
+def _pane_pid(pane: str, tmux_socket: str | None = None) -> int | None:
     """Return the shell PID running inside the given tmux pane, or None.
 
     Uses `tmux display-message #{pane_pid}`. That's the PID of the shell tmux
@@ -11142,7 +11313,7 @@ def _pane_pid(pane: str) -> int | None:
         return None
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+            [*_tmux_cmd(tmux_socket), "display-message", "-p", "-t", pane, "#{pane_pid}"],
             capture_output=True, text=True, timeout=5,
         )
         pid_str = result.stdout.strip()
@@ -11222,7 +11393,7 @@ def _read_claude_session_id_from_cmdline(pid: int) -> str | None:
     return None
 
 
-def pane_live_session_id(pane: str) -> str | None:
+def pane_live_session_id(pane: str, tmux_socket: str | None = None) -> str | None:
     """Authoritative current session-id for a tmux pane, read from the live
     claude process's cmdline (--resume arg). Returns None if claude was
     launched without --resume (fresh session) or any lookup step failed;
@@ -11235,7 +11406,7 @@ def pane_live_session_id(pane: str) -> str | None:
     sessions, the session-id isn't recoverable from the live process and
     we fall back to sessions.log.
     """
-    pid = _pane_pid(pane)
+    pid = _pane_pid(pane, tmux_socket)
     if pid is None:
         return None
     claude_pid = _find_descendant_claude_pid(pid)
@@ -11244,13 +11415,13 @@ def pane_live_session_id(pane: str) -> str | None:
     return _read_claude_session_id_from_cmdline(claude_pid)
 
 
-def tmux_pane_name(pane: str) -> str:
+def tmux_pane_name(pane: str, tmux_socket: str | None = None) -> str:
     """Return the tmux pane's command/process name, for whitelist matching."""
     if not tmux_is_available() or not pane:
         return ""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", pane, "#{pane_current_command}"],
+            [*_tmux_cmd(tmux_socket), "display-message", "-p", "-t", pane, "#{pane_current_command}"],
             capture_output=True, text=True, timeout=5,
         )
         return result.stdout.strip()
@@ -11258,7 +11429,7 @@ def tmux_pane_name(pane: str) -> str:
         return ""
 
 
-def pane_is_claude(pane: str) -> bool:
+def pane_is_claude(pane: str, tmux_socket: str | None = None) -> bool:
     """True if a tmux pane is currently running a claude session (GH #37).
 
     Claude Code runs as `claude` or (more commonly) as a `node` process hosting
@@ -11274,7 +11445,7 @@ def pane_is_claude(pane: str) -> bool:
     """
     if not pane or pane == "no-tmux":
         return False
-    return tmux_pane_name(pane) in ("claude", "node")
+    return tmux_pane_name(pane, tmux_socket) in ("claude", "node")
 
 
 # --------------------------------------------------------------------------
@@ -11308,7 +11479,7 @@ def session_matches_whitelist(session: LiveSession, config: dict) -> tuple[bool,
     patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
     if not patterns or not session.pane or session.pane == "no-tmux":
         return False, ""
-    pane_cmd = tmux_pane_name(session.pane)
+    pane_cmd = tmux_pane_name(session.pane, session.tmux_socket)
     for pat in patterns:
         try:
             if re.search(pat, pane_cmd):
@@ -11533,7 +11704,7 @@ def _resolve_relaunch_session_id(
 
     # Step 2: walk back through sessions.log for this pane.
     entries = _parse_sessions_log()
-    pane_entries = [e for e in entries if e.get("pane") == session.pane]
+    pane_entries = [e for e in entries if _same_tmux_pane(e, session.pane, session.tmux_socket)]
     pane_entries.reverse()  # latest first
     now = datetime.now(timezone.utc)
     for e in pane_entries:
@@ -11592,24 +11763,31 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     latest_stops = _latest_stops_per_session()
     now = datetime.now(timezone.utc)
 
-    # Group by pane; latest entry overwrites (entries are oldest-first).
+    # Group by tmux server + pane; latest entry overwrites (entries are
+    # oldest-first). Pane ids (%3, %12, …) are only unique WITHIN one tmux
+    # server, so keying on the bare pane would collapse same-named panes from
+    # two servers into one entry and attribute both to whichever /proc lookup
+    # the default socket happened to resolve. Keying on (tmux_socket, pane)
+    # keeps each server's pane distinct — socket normalized ""/absent == None,
+    # the same equivalence _same_tmux_pane applies.
     # GH #90/#95: entries_by_pane keeps the FULL per-pane entry list (same
     # oldest-first order) for the step-1.5 cmdline-staleness sweep below.
     # That sweep used to re-scan ALL of `entries` once per live pane —
-    # filtering on pane inside the loop and fromisoformat-parsing every
-    # line's timestamp each time — an O(total_entries x live_panes) pass
-    # over an append-only log (~14.6k lines on the incident box). Grouping
-    # here is one O(total_entries) pass; the sweep then touches only its
-    # own pane's entries. Identical subset, identical order, no semantic
-    # change — pure loop restructure.
-    by_pane: dict[str, dict] = {}
-    entries_by_pane: dict[str, list[dict]] = {}
+    # an O(total_entries x live_panes) pass over an append-only log
+    # (~14.6k lines on the incident box). Grouping here is one
+    # O(total_entries) pass; the sweep then touches only its own pane's
+    # entries. Keyed on the SAME normalized (socket, pane) tuple, so the
+    # subset and order match what a _same_tmux_pane filter would select —
+    # no semantic change, pure loop restructure.
+    by_pane: dict[tuple[str | None, str], dict] = {}
+    entries_by_pane: dict[tuple[str | None, str], list[dict]] = {}
     for e in entries:
         pane = e.get("pane", "")
         if not pane or pane == "no-tmux":
             continue
-        by_pane[pane] = e
-        entries_by_pane.setdefault(pane, []).append(e)
+        key = (e.get("tmux_socket") or None, pane)
+        by_pane[key] = e
+        entries_by_pane.setdefault(key, []).append(e)
 
     # GH #22: count how many panes share each cwd. The newest-mtime
     # fallback (step 3 below) is CWD-wide and can't disambiguate between
@@ -11630,12 +11808,12 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     transcripts = _transcript_index()
 
     out: list[LiveSession] = []
-    for pane, e in by_pane.items():
+    for (tmux_socket, pane), e in by_pane.items():
         if account_filter and e["account"] != account_filter:
             continue
-        if not tmux_pane_exists(pane):
+        if not tmux_pane_exists(pane, tmux_socket):
             continue
-        if not pane_is_claude(pane):
+        if not pane_is_claude(pane, tmux_socket):
             # Pane is back to shell (or running something else). No live claude.
             continue
 
@@ -11660,7 +11838,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
         # relaunched into the same chat. Fix: promote sessions.log above
         # newest-mtime so pane-specific data wins.
         cwd = e.get("cwd", "")
-        live_sid = pane_live_session_id(pane)
+        live_sid = pane_live_session_id(pane, tmux_socket)
 
         def _validate(cand_sid: str) -> Path | None:
             # cwd-first + O(1) index fallback (no full-tree glob) — GH #91.
@@ -11740,10 +11918,11 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             best_mtime = 0.0
         # GH #90/#95: iterate only THIS pane's entries (pre-grouped above in
         # the same pass that built by_pane) instead of re-scanning the whole
-        # log per pane. The old `if pe.get("pane") != pane: continue` filter
-        # is exactly what the grouping applied, so subset and order are
-        # unchanged — this is the O(n x panes) -> O(n) half of the fix.
-        for pe in entries_by_pane.get(pane, ()):
+        # log per pane. The grouping key is the same normalized
+        # (tmux_socket, pane) tuple _same_tmux_pane matches on, so subset
+        # and order are unchanged — this is the O(n x panes) -> O(n) half
+        # of the fix, kept tmux-socket-aware (#3).
+        for pe in entries_by_pane.get((tmux_socket, pane), ()):
             pe_ts_str = pe.get("ts")
             if not pe_ts_str:
                 continue
@@ -11878,6 +12057,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
             started_at=e["ts"],
             last_stop_at=last_stop_at,
             transcript_path=transcript,
+            tmux_socket=tmux_socket,
         ))
 
     # Cross-pane collision detector (GH #29). The fallback chain above is
@@ -11919,7 +12099,7 @@ def find_live_panes(account_filter: str | None = None, verbose: bool = False) ->
     return out
 
 
-def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
+def tmux_exit_claude(pane: str, draft_handling: str = "submit", tmux_socket: str | None = None) -> None:
     """Cleanly /exit claude in a tmux pane, handling input-box-has-focus cases.
 
     The 2026-05-19 incident showed that a bare `/exit` typed via tmux send-keys
@@ -11970,18 +12150,18 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
     # prompt. Escape dismisses any modal/picker/prompt without
     # submitting anything. Two Escapes to cover nested UI state
     # (autocomplete inside a prompt, etc.).
-    tmux_send_keys(pane, "Escape")
+    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
     time.sleep(0.15)
-    tmux_send_keys(pane, "Escape")
+    tmux_send_keys(pane, "Escape", tmux_socket=tmux_socket)
     time.sleep(0.15)
 
     if draft_handling == "clear":
         # Legacy brute-force-clear path. Discards user draft.
-        tmux_send_keys(pane, "C-u")
+        tmux_send_keys(pane, "C-u", tmux_socket=tmux_socket)
         time.sleep(0.15)
-        tmux_send_keys(pane, *(["BSpace"] * 400))
+        tmux_send_keys(pane, *(["BSpace"] * 400), tmux_socket=tmux_socket)
         time.sleep(0.3)
-        tmux_send_text(pane, "/exit")
+        tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
         return
 
     # Default: "submit" — preserve draft by sending it as a message first.
@@ -11989,14 +12169,15 @@ def tmux_exit_claude(pane: str, draft_handling: str = "submit") -> None:
     # the Enter below only sees the main chat input. If the input is empty,
     # Enter is a no-op in claude's TUI. If non-empty, the draft is sent
     # as a normal user turn (safely persisted in JSONL, visible on --resume).
-    tmux_send_keys(pane, "Enter")
+    tmux_send_keys(pane, "Enter", tmux_socket=tmux_socket)
     time.sleep(0.3)
     # Type /exit into the (now-empty) input box. tmux_send_text appends
     # Enter automatically.
-    tmux_send_text(pane, "/exit")
+    tmux_send_text(pane, "/exit", tmux_socket=tmux_socket)
 
 
-def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25) -> bool:
+def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 0.25,
+                   tmux_socket: str | None = None) -> bool:
     """Poll until the tmux pane's current command is no longer claude/node.
 
     Replaces the original hard-coded `time.sleep(2)` between /exit and the
@@ -12009,7 +12190,7 @@ def wait_for_shell(pane: str, timeout_seconds: int = 10, poll_interval: float = 
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        cmd = tmux_pane_name(pane)
+        cmd = tmux_pane_name(pane, tmux_socket)
         if cmd not in ("claude", "node", ""):
             return True
         time.sleep(poll_interval)
@@ -12289,7 +12470,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
     # swap downstream still proceeds (it benefits new sessions regardless).
     still_claude = []
     for s in swappable:
-        if pane_is_claude(s.pane):
+        if pane_is_claude(s.pane, s.tmux_socket):
             still_claude.append(s)
         else:
             click.echo(
@@ -12311,7 +12492,8 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    pane {s.pane}: idle (>{idle_seconds}s) — skipping pause-message (no need)")
             else:
                 click.echo(f"    pane {s.pane}: mid-turn — injecting pause-message")
-                tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+                tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."),
+                               tmux_socket=s.tmux_socket)
                 ok = wait_for_stop(s.session_id, hot.get("pause_response_timeout_seconds", 120))
                 if not ok:
                     # GH #19: escalate to tier 3 on pause-response timeout
@@ -12319,9 +12501,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                     # apparently didn't land (session stuck in tool call);
                     # force interrupt is the right next step.
                     click.echo(f"      pause_message timed out; escalating to tier 3 (force double-Escape)")
-                    tmux_send_keys(s.pane, "Escape")
+                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                     time.sleep(0.3)
-                    tmux_send_keys(s.pane, "Escape")
+                    tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                     time.sleep(0.5)
         elif tier == 3:
             if is_idle:
@@ -12331,9 +12513,9 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 click.echo(f"    pane {s.pane}: mid-turn — force interrupt (double Escape)")
                 # Single Escape may not interrupt — Claude's TUI sometimes
                 # needs two to dismiss running tool calls.
-                tmux_send_keys(s.pane, "Escape")
+                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                 time.sleep(0.3)
-                tmux_send_keys(s.pane, "Escape")
+                tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                 time.sleep(0.5)
                 shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                 if shell_note:
@@ -12366,15 +12548,16 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
                 if not ok:
                     # Escalate to tier 2: send pause_message and wait again.
                     click.echo(f"      tier 1 timed out; escalating to tier 2 (sending pause_message)")
-                    tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."))
+                    tmux_send_text(s.pane, hot.get("pause_message", "please pause; we're swapping accounts."),
+                               tmux_socket=s.tmux_socket)
                     pause_timeout = hot.get("pause_response_timeout_seconds", 120)
                     ok2 = wait_for_stop(s.session_id, pause_timeout)
                     if not ok2:
                         # Escalate to tier 3: double-Escape force interrupt.
                         click.echo(f"      tier 2 timed out; escalating to tier 3 (force double-Escape)")
-                        tmux_send_keys(s.pane, "Escape")
+                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                         time.sleep(0.3)
-                        tmux_send_keys(s.pane, "Escape")
+                        tmux_send_keys(s.pane, "Escape", tmux_socket=s.tmux_socket)
                         time.sleep(0.5)
                         shell_note = _read_recent_tool_use_for_session(s.session_id, lookback_seconds=300)
                         if shell_note:
@@ -12401,11 +12584,11 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         # pane — re-check it's still claude. If the user already exited during
         # the wait, typing "/exit" here would land in their shell and could
         # close the pane. Skip; the pane is already off the old account.
-        if not pane_is_claude(s.pane):
+        if not pane_is_claude(s.pane, s.tmux_socket):
             click.echo(f"    pane {s.pane}: no longer running claude — skipping /exit (GH #37; would type into shell)")
             continue
         click.echo(f"    pane {s.pane}: /exit (draft_handling={draft_handling})")
-        tmux_exit_claude(s.pane, draft_handling=draft_handling)
+        tmux_exit_claude(s.pane, draft_handling=draft_handling, tmux_socket=s.tmux_socket)
 
     # Poll each pane until shell prompt is back. Replaces the original
     # sleep(2) which raced — claude wasn't always done exiting when the
@@ -12417,7 +12600,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         if getattr(s, "_stuck_skip", False):
             # Already skipped /exit; don't wait for shell either.
             continue
-        if wait_for_shell(s.pane, timeout_seconds=shell_timeout):
+        if wait_for_shell(s.pane, timeout_seconds=shell_timeout, tmux_socket=s.tmux_socket):
             panes_ready.append(s)
         else:
             click.echo(f"    WARN: pane {s.pane} didn't return to shell in {shell_timeout}s; skipping relaunch")
@@ -12510,7 +12693,7 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         if i > 0 and stagger > 0:
             time.sleep(stagger)
         click.echo(f"    pane {s.pane}: relaunch → {cmd}")
-        tmux_send_text(s.pane, cmd)
+        tmux_send_text(s.pane, cmd, tmux_socket=s.tmux_socket)
 
 
 def _read_rate_limit_log_since(since_ts: str | None) -> list[dict]:
@@ -12961,8 +13144,57 @@ def whoami_cmd() -> None:
         click.echo(f"  flags:        {', '.join(flags)}")
 
 
+def _account_row(name: str, acct: dict, config: dict, first_step: float) -> dict:
+    """Shared per-account display derivation for `status` (plain + --pretty).
+
+    Pure data — no printing, no click.style — so both renderers consume the
+    SAME flags/estimator/next-swap/per-model semantics and cannot drift.
+
+    - flags: operator DISABLED (config, not polled state — surfaced so nobody
+      wonders why the picker skips the account) + the polled health flags, in
+      fixed order.
+    - est: estimator (C) — extrapolated CURRENT usage per window, included
+      only when it diverges >= 1.0pct from the last poll, so a fast-climbing
+      account is visible between polls. Insertion order 5h then 7d matches
+      the plain-output note order.
+    - next_swap_pct: None while on the shared first ladder step (the status
+      header already prints the ladder once as a legend); a value only for a
+      mid-ladder / non-default account, the only case worth a per-row callout.
+    - per_model: 7d-by-model, sorted highest-first so a model nearing its own
+      weekly cap is the first thing the eye lands on.
+    """
+    flags = []
+    if name in _disabled_accounts(config):
+        flags.append("DISABLED")
+    if acct.get("token_expired"):
+        flags.append("TOKEN_EXPIRED")
+    if acct.get("rate_limited"):
+        flags.append("RATE_LIMITED")
+    if acct.get("poll_error"):
+        flags.append("POLL_ERROR")
+    if acct.get("token_stale"):
+        flags.append("TOKEN_STALE")
+    est: dict = {}
+    for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
+        polled = acct.get(key, 0.0)
+        est_val = estimate_window_pct(acct, win, config)
+        if est_val - polled >= 1.0:
+            est[win] = (est_val, acct.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0)
+    nxt = acct.get("next_swap_at_pct", first_step)
+    return {
+        "flags": flags,
+        "status_col": ",".join(flags) if flags else "ok",
+        "est": est,
+        "next_swap_pct": nxt if nxt != first_step else None,
+        "per_model": sorted((acct.get("per_model_weekly_pct") or {}).items(),
+                            key=lambda kv: -kv[1]),
+        "last": acct.get("last_swap_ts") or "never",
+    }
+
+
 @cli.command()
-def status() -> None:
+@click.option("--pretty", is_flag=True, help="Rich, width-adaptive tables (color, usage bars).")
+def status(pretty: bool) -> None:
     """Show active account, per-account usage state, locks, and recent activity."""
     if not STATE_JSON.exists():
         click.echo("Not initialized. Run `cus init` first.")
@@ -12970,6 +13202,9 @@ def status() -> None:
 
     state = read_json(STATE_JSON)
     config = load_config()
+    if pretty:
+        _render_status_pretty(state, config)
+        return
     color_on = sys.stdout.isatty()
     mode = config.get("mode", "global")
     per_session = mode == "per_session"
@@ -12992,53 +13227,19 @@ def status() -> None:
     click.echo()
     click.echo(f"{'Account':<20} {'5h %':>8} {'7d %':>8} {'Status':<24} {'Last swap':<28}")
     click.echo("-" * 91)
-    disabled = _disabled_accounts(config)
     for name, a in sorted(state["accounts"].items()):
+        row = _account_row(name, a, config, first_step)
         marker = " *" if name == state["active"] else ""
-        last = a.get("last_swap_ts") or "never"
-        flags = []
-        # Operator out-of-rotation flag (config, not polled state) — surfaced
-        # here so nobody wonders why the picker never chooses this account.
-        if name in disabled:
-            flags.append("DISABLED")
-        if a.get("token_expired"):
-            flags.append("TOKEN_EXPIRED")
-        if a.get("rate_limited"):
-            flags.append("RATE_LIMITED")
-        if a.get("poll_error"):
-            flags.append("POLL_ERROR")
-        if a.get("token_stale"):
-            flags.append("TOKEN_STALE")
-        status_col = ",".join(flags) if flags else "ok"
-        # Estimator (C): annotate the extrapolated CURRENT usage when it diverges
-        # from the last poll, so a fast-climbing account is visible between polls
-        # (this is what the picker now uses to judge target fullness).
-        est_note = ""
-        for win, key in (("5h", "current_5h_pct"), ("7d", "current_7d_pct")):
-            polled = a.get(key, 0.0)
-            est = estimate_window_pct(a, win, config)
-            if est - polled >= 1.0:
-                rate = a.get(f"burn_rate_{win}_pct_per_min", 0.0) or 0.0
-                est_note += f"  [{win} est {est:.0f}% @ +{rate:.1f}%/min]"
-        # Show next_swap_at_pct ONLY when it's advanced off the shared first
-        # ladder step (the legend above already prints that) — i.e. this account
-        # is mid-ladder / carries a non-default value, which is the only case
-        # worth a per-row callout.
-        nxt_val = a.get("next_swap_at_pct", first_step)
-        nxt_note = f"  [next-swap: {nxt_val:.0f}%]" if nxt_val != first_step else ""
-        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {status_col:<24} {last:<28}{nxt_note}{est_note}")
-        # Per-model WEEKLY utilization (fable/sonnet tracking). Shown as a compact
-        # sub-line only for accounts that have any, sorted highest-first so a
-        # model nearing its own weekly cap is the first thing the eye lands on.
-        # 5h is intentionally absent — the API has no per-model 5h window.
-        pm = a.get("per_model_weekly_pct") or {}
-        if pm:
-            # Mark per-model numbers stale (dim + trailing '~') for any account
-            # we couldn't freshly observe — a token_stale account's cached
-            # `Fable=100%` printed bare read as an authoritative current value
-            # and drove a wrong swap (2026-07-05 incident). See _fmt_model_pct.
+        est_note = "".join(f"  [{win} est {e:.0f}% @ +{rate:.1f}%/min]"
+                           for win, (e, rate) in row["est"].items())
+        nxt_note = (f"  [next-swap: {row['next_swap_pct']:.0f}%]"
+                    if row["next_swap_pct"] is not None else "")
+        click.echo(f"{name+marker:<20} {_fmt_pct(a, 'current_5h_pct', color_on=color_on)} {_fmt_pct(a, 'current_7d_pct', color_on=color_on)} {row['status_col']:<24} {row['last']:<28}{nxt_note}{est_note}")
+        # Stale/unknown per-model treatment lives in _fmt_model_pct; which
+        # models to show and their order comes from _account_row.
+        if row["per_model"]:
             parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
-                              for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
+                              for m, p in row["per_model"])
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
     click.echo()
 
@@ -13148,7 +13349,7 @@ def status() -> None:
             # mode: a pane keeps its loaded creds until relaunch, so the recorded
             # SessionStart account is the better estimate.
             if per_session:
-                mnt = pane_mount_name(s.pane)
+                mnt = pane_mount_name(s.pane, s.tmux_socket)
                 if mnt and mnt.startswith(SLOT_PREFIX):
                     eff = state.get("slots", {}).get(mnt, {}).get("account") or s.account
                     where = f"slot={mnt:<8}"
@@ -13170,6 +13371,297 @@ def status() -> None:
         click.echo(f"Recent swaps ({min(5, len(history))} of {len(history)}):")
         for entry in history[-5:]:
             click.echo(f"  {entry['ts']}  {entry['from']} -> {entry['to']}  ({entry.get('trigger', 'unknown')})")
+
+
+def _render_status_pretty(state: dict, config: dict) -> None:
+    """`cus status --pretty` — rich one-shot render, sized to the terminal.
+
+    Spec: docs/plans/2026-07-07-status-pretty.md. Same data as plain status,
+    restructured for scanning: bracket-notes become cells, login pools fold
+    into a Pool column, Lanes+Live-sessions merge into one table.
+
+    rich imports stay INSIDE this function so the daemon / statusline hot
+    paths (and every non-pretty `cus` invocation) never pay for them.
+    """
+    from rich import box
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console(highlight=False)
+    width = console.width
+    show_bars = width >= 110      # spec breakpoints: bars only when roomy,
+    fold_models = width < 80      # by-model folds under the account when tight
+
+    mode = config.get("mode", "global")
+    cfg_steps = config.get("thresholds", {}).get("steps") or THRESHOLD_STEPS[:-1]
+    first_step = cfg_steps[0] if cfg_steps else 50
+    last_step = cfg_steps[-1] if cfg_steps else 90
+
+    if mode == "per_session":
+        head = f"per_session · bare-launch: {state['active']}"
+    elif mode == "hybrid":
+        head = f"hybrid · shared-mount: {state['active']}"
+    else:
+        head = f"global · active: {state['active']}"
+    ladder = " → ".join(f"{s}%" for s in cfg_steps)
+    console.print(Text.assemble((head, "bold"), ("  ·  ladder ", "dim"), (ladder, "dim")))
+    console.print()
+
+    def rel_ts(iso: str | None) -> str:
+        if not iso or iso == "never":
+            return "never"
+        secs = _time_since(iso)
+        return iso if secs is None else _fmt_duration(secs) + " ago"
+
+    def ladder_style(val: float) -> str:
+        # Colors mean "how close to a swap": the ladder's own thresholds.
+        if val >= last_step:
+            return "red"
+        if val >= first_step:
+            return "yellow"
+        return "green"
+
+    def usage_cell(acct: dict, key: str, row: dict) -> Text:
+        win = "5h" if key == "current_5h_pct" else "7d"
+        if _pct_is_unknown(acct, key):
+            # Intentionally NO estimator note here (plain mode prints one):
+            # an extrapolation beside an unobservable base reads as current
+            # data — the 2026-07-05 stale-reading trap. '?' stays bare.
+            return Text("?", style="dim")
+        val = acct.get(key, 0.0)
+        stale = _pct_is_stale_known(acct, key)
+        style = "dim" if stale else ladder_style(val)
+        t = Text()
+        if show_bars:
+            filled = min(8, max(0, round(val / 100 * 8)))
+            t.append("█" * filled + "░" * (8 - filled) + " ", style=style)
+        t.append(f"{val:.0f}%" + ("~" if stale else ""), style=style)
+        if win in row["est"]:
+            est_val, rate = row["est"][win]
+            t.append(f" ↗{est_val:.0f} +{rate:.1f}/m", style="dim")
+        return t
+
+    def per_model_text(acct: dict, row: dict) -> Text:
+        stale = _model_pct_is_stale(acct)
+        t = Text()
+        for i, (m, p) in enumerate(row["per_model"]):
+            if i:
+                t.append("  ")
+            t.append(f"{m} {p:.0f}%" + ("~" if stale else ""),
+                     style="dim" if stale else "")
+        return t
+
+    def status_cell(row: dict) -> Text:
+        t = Text()
+        if not row["flags"]:
+            t.append("ok", style="green")
+        else:
+            for i, f in enumerate(row["flags"]):
+                if i:
+                    t.append(",")
+                t.append(f, style="red dim" if f == "DISABLED" else "yellow")
+        if row["next_swap_pct"] is not None:
+            t.append(f" next@{row['next_swap_pct']:.0f}%", style="dim")
+        return t
+
+    pool_want = config.get("independent_logins", {}).get("pool_size", 3)
+
+    def pool_cell(name: str) -> Text:
+        fams = list_login_families(name)
+        if not fams:
+            return Text("")
+        free = [f for f in fams if f not in leased_families(name, state)]
+        short = len(fams) < pool_want
+        return Text(f"{len(free)}/{len(fams)} free" + (f" (<{pool_want})" if short else ""),
+                    style="yellow" if short else "")
+
+    tbl = Table(box=box.SIMPLE_HEAD, pad_edge=False)
+    tbl.add_column("Account", no_wrap=True)
+    tbl.add_column("5h")
+    tbl.add_column("7d")
+    if not fold_models:
+        tbl.add_column("7d by model")
+    tbl.add_column("Status")
+    tbl.add_column("Last swap")
+    tbl.add_column("Pool")
+    for name, a in sorted(state["accounts"].items()):
+        row = _account_row(name, a, config, first_step)
+        acct_cell = Text()
+        active = name == state["active"]
+        acct_cell.append("● " if active else "  ")
+        acct_cell.append(name, style="bold" if active else "")
+        pm = per_model_text(a, row)
+        if fold_models and row["per_model"]:
+            acct_cell.append("\n    ")
+            acct_cell.append_text(pm)
+        cells = [acct_cell,
+                 usage_cell(a, "current_5h_pct", row),
+                 usage_cell(a, "current_7d_pct", row)]
+        if not fold_models:
+            cells.append(pm)
+        cells += [status_cell(row), Text(rel_ts(row["last"])), pool_cell(name)]
+        tbl.add_row(*cells)
+    console.print(tbl)
+
+    il_on = config.get("independent_logins", {}).get("use_independent_logins", False)
+    if not il_on and any(list_login_families(n) for n in state["accounts"]):
+        console.print(Text("  (login-pool gate OFF — swaps still copy; "
+                           "set use_independent_logins: true)", style="yellow"))
+    console.print()
+
+    # --- Lanes & sessions (merged) ---------------------------------------
+    # Mirrors the plain Lanes + Live-sessions logic (see status()); the lane
+    # annotations are re-derived here from the same helpers rather than
+    # extracted, per the spec's refactor boundary (_account_row only).
+    per_session = mode == "per_session"
+    slots_state = state.get("slots", {}) or {}
+    slot_dirs = list_slot_dirs()
+    live = find_live_sessions()
+    machine_active = state.get("active", "?")
+    hot_swap_on = config.get("hot_swap", {}).get("enabled", False)
+    cwd_max = max(20, width - 60)
+
+    def trunc_cwd(cwd: str) -> str:
+        # Left-truncate: tails distinguish (home prefixes are shared).
+        return cwd if len(cwd) <= cwd_max else "…" + cwd[-(cwd_max - 1):]
+
+    buckets: dict = {}
+    for s in live:
+        if per_session:
+            mnt = pane_mount_name(s.pane, s.tmux_socket)
+            if mnt and mnt.startswith(SLOT_PREFIX):
+                key, eff = mnt, (slots_state.get(mnt, {}).get("account") or s.account)
+            elif mnt:  # account-dir launch (relogin flow)
+                key, eff = f"mount:{mnt}", mnt.removeprefix("account-")
+            else:
+                key, eff = "(bare)", machine_active
+        else:
+            key = "(global)"
+            eff = s.account if hot_swap_on else machine_active
+        buckets.setdefault(key, []).append((s, eff))
+
+    def session_lines(entries, show_acct: bool = False) -> Text:
+        t = Text()
+        for i, (s, eff) in enumerate(entries):
+            if i:
+                t.append("\n")
+            t.append(f"{(s.session_id or '?')[:8]} {s.pane} ")
+            if show_acct:
+                t.append(f"{eff} ")
+            if not per_session and eff != s.account:
+                t.append(f"(start:{s.account}) ", style="dim")
+            t.append(trunc_cwd(s.cwd), style="dim")
+        return t
+
+    locked = _locked_slots(config)
+    il_cfg = config.get("independent_logins", {})
+    il_flag = il_cfg.get("use_independent_logins", False)
+    il_visible = (il_flag or bool(list_provisioned_logins())
+                  or any(list_login_families(a) for a in state["accounts"]))
+    default_pool = config.get("per_session", {}).get("default_pool", "premium")
+
+    lane_rows = []
+    seen = set()
+    for d in slot_dirs:
+        seen.add(d.name)
+        entry = slots_state.get(d.name, {})
+        acct = entry.get("account")
+        pids = mount_pids(d)
+        state_txt = Text(f"live {len(pids)} pids", style="green") if pids else Text("idle", style="dim")
+        notes = []
+        if d.name in locked:
+            notes.append(("🔒locked", "yellow"))
+        pool = _slot_pool(state, d.name, config)
+        if pool != default_pool:
+            notes.append((pool, "cyan"))
+        if il_visible and acct:
+            lease = slot_leased_family(state, d.name)
+            if lease and lease[0] == acct:
+                notes.append((f"pool {lease[1]}", "green"))
+            elif list_login_families(acct):
+                notes.append(("pool avail", "green"))
+            elif has_independent_login(acct, d.name):
+                notes.append(("indep-login ✓", "green"))
+            elif il_flag:
+                notes.append(("indep-login MISSING", "yellow"))
+            else:
+                notes.append(("copy", "cyan"))
+        if d.name not in slots_state:
+            notes.append(("orphan — not in state", "yellow"))
+        notes_txt = Text(" · ").join(Text(n, style=st) for n, st in notes) if notes else Text("")
+        lane_rows.append((Text(d.name), Text(acct or "(empty)"), state_txt,
+                          notes_txt, session_lines(buckets.pop(d.name, []))))
+    for name in sorted(set(slots_state) - seen):
+        lane_rows.append((Text(name), Text(slots_state[name].get("account") or "(empty)"),
+                          Text("state entry, dir missing", style="yellow"), Text(""), Text("")))
+    for key in sorted(buckets):
+        entries = buckets[key]
+        if key == "(bare)":
+            lane_rows.append((Text("(bare)", style="yellow"), Text(machine_active),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("observe-only", style="yellow"),
+                              session_lines(entries)))
+        elif key.startswith(SLOT_PREFIX):
+            # Mount ground truth says slot-N, but the dir is gone from
+            # list_slot_dirs() (removed/renamed under a live pane). Keep the
+            # session grounded to its real slot — plain mode prints slot=<mnt>
+            # from the same mount — rather than mislabeling it "(global)".
+            lane_rows.append((Text(key), Text(entries[0][1]),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("slot dir missing", style="yellow"),
+                              session_lines(entries)))
+        elif key.startswith("mount:"):
+            lane_rows.append((Text(key.removeprefix("mount:")), Text(entries[0][1]),
+                              Text(f"{len(entries)} session(s)"),
+                              Text("account-dir mount", style="cyan"),
+                              session_lines(entries)))
+        else:  # (global) — background/hybrid modes
+            acct_label = "(per-pane)" if hot_swap_on else machine_active
+            lane_rows.append((Text("(global)"), Text(acct_label),
+                              Text(f"{len(entries)} session(s)"), Text(""),
+                              session_lines(entries, show_acct=hot_swap_on)))
+
+    if lane_rows:
+        lt = Table(box=box.SIMPLE_HEAD, pad_edge=False,
+                   title="Lanes & sessions", title_justify="left", title_style="bold")
+        lt.add_column("Lane", no_wrap=True)
+        lt.add_column("Account")
+        lt.add_column("State")
+        lt.add_column("Notes")
+        lt.add_column("Sessions")
+        for r in lane_rows:
+            lt.add_row(*r)
+        console.print(lt)
+        console.print()
+
+    # --- Locks -------------------------------------------------------------
+    pins = config.get("session_locks", {}).get("pinned", {}) or {}
+    patterns = config.get("session_locks", {}).get("never_restart_patterns", []) or []
+    locked_cfg = sorted(locked)
+    if pins or patterns or locked_cfg:
+        console.print(Text("Locks", style="bold"))
+        for k, v in pins.items():
+            console.print(f"  pinned: {k} → {v}")
+        for s_ in locked_cfg:
+            console.print(f"  locked slot: {s_}")
+        for p in patterns:
+            console.print(f"  never_restart: {p}")
+        console.print()
+
+    # --- Recent swaps --------------------------------------------------------
+    history = state.get("swap_history", [])
+    if history:
+        st = Table(box=box.SIMPLE_HEAD, pad_edge=False,
+                   title=f"Recent swaps ({min(5, len(history))} of {len(history)})",
+                   title_justify="left", title_style="bold")
+        st.add_column("When", no_wrap=True)
+        st.add_column("Swap")
+        st.add_column("Trigger")
+        for e in history[-5:]:
+            st.add_row(rel_ts(e["ts"]), f"{e['from']} → {e['to']}",
+                       Text(e.get("trigger", "unknown"), style="dim"))
+        console.print(st)
 
 
 # --------------------------------------------------------------------------
@@ -13432,7 +13924,11 @@ def sessions_cmd(as_json: bool) -> None:
     resolved_inputs: list[dict] = []
     panes_on_slot: set[str] = set()
     for s in live:
-        mount = pane_mount_name(s.pane)
+        # GH #137 + cross-server fix: resolve the mount on the pane's OWN tmux
+        # server (s.tmux_socket). Without the socket, two panes named %3 on two
+        # tmux servers would resolve against the default socket and mis-attribute
+        # to whichever server answered — the diagnostics view must be per-server.
+        mount = pane_mount_name(s.pane, s.tmux_socket)
         if mount and mount.startswith(SLOT_PREFIX):
             panes_on_slot.add(mount)
         acct, source = _resolve_mount_account(mount, state)
@@ -13543,7 +14039,7 @@ def check_orchestrate_cmd(target: str | None) -> None:
         click.echo("  (none — orchestrator would do simple cred swap with no relaunch)")
         return
     for s in live_panes:
-        pane_cmd = tmux_pane_name(s.pane)
+        pane_cmd = tmux_pane_name(s.pane, s.tmux_socket)
         idle = session_is_idle(s, hot.get("mid_turn_idle_seconds", 30))
         pinned, pin_reason = session_is_pinned(s, config)
         wl, wl_reason = session_matches_whitelist(s, config)
@@ -17084,8 +17580,23 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
 
     # Install the account into the slot — the same in-place swap primitive the
     # daemon uses (no-op when the slot already holds it). Reloads and persists
-    # state itself, under the swap lock.
-    if state.get("slots", {}).get(slot_name, {}).get("account") != account:
+    # state itself, under the swap lock. If an idle slot claims the right
+    # account but carries logout-shaped creds, blank its account first so the
+    # swap below actually REINSTALLS from the good snapshot instead of reusing
+    # a dead mount (execute_swap is a no-op when the slot already holds it).
+    slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
+    if slot_account == account and not mount_in_use(slot_dir) and not mount_has_usable_credentials(slot_dir):
+        click.echo(f"launch: {slot_name} held '{account}' but credentials are unusable; reinstalling")
+        with _swap_lock():
+            fresh = load_state()
+            entry = fresh.setdefault("slots", {}).setdefault(slot_name, {"account": None, "created_ts": now_iso()})
+            if entry.get("account") == account and not mount_has_usable_credentials(slot_dir):
+                entry["account"] = None
+                entry.pop("login_family", None)
+                save_state(fresh)
+        state = load_state()
+        slot_account = state.get("slots", {}).get(slot_name, {}).get("account")
+    if slot_account != account:
         execute_swap(account, trigger="launch", slot=slot_name)
 
     state = load_state()

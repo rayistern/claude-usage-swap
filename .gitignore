@@ -20,5 +20,6 @@ venv/
 .idea/
 .vscode/
 
-# --- Agent scaffolding (not for the public tree) ---
+# --- Local worktrees / agent scaffolding (not for the public tree) ---
+.worktrees/
 .a5c/

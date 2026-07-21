@@ -172,6 +172,35 @@ def test_launch_prepare_full_flow():
         env.restore()
 
 
+def test_launch_reinstalls_when_slot_holds_account_with_unusable_creds():
+    # A slot that already holds the requested account but carries logout-shaped
+    # creds (no refreshToken) must be REINSTALLED from the good snapshot on
+    # launch — not reused as-is (else the session starts logged out). Without
+    # the guard, slot.account == account short-circuits execute_swap and the
+    # dead creds would persist.
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        slot_name, slot_dir = cus.create_slot(state)
+        state = cus.load_state()
+        state["slots"][slot_name].update({"account": "alpha"})
+        state["slots"][slot_name].pop("reserved_until", None)
+        cus.save_state(state)
+        # logout-shaped: accessToken present, NO refreshToken.
+        (slot_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "at-dead", "expiresAt": 1}}))
+        assert not cus.mount_has_usable_credentials(slot_dir)
+
+        got_slot, got_dir, account = cus._launch_prepare("alpha", cus.load_state(), config)
+        assert account == "alpha"
+        assert got_slot == slot_name, "reused the same slot (matching account)"
+        creds = json.loads((got_dir / ".credentials.json").read_text())
+        assert creds["claudeAiOauth"]["refreshToken"] == "rt-alpha", "reinstalled from good snapshot"
+    finally:
+        env.restore()
+
+
 def test_launch_prepare_rejects_unknown_account():
     env = _Env()
     try:
