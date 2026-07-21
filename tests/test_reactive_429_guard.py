@@ -119,6 +119,7 @@ def test_A1_429_still_reacts_when_active_near_cap():
     d = _reactive("default", accts)
     assert d is not None and d.gate == "reactive_429" and d.target == "merkos", \
         f"429 at 70% should react and swap to merkos, got {d}"
+    assert d.reactive_entries and d.reactive_entries[0]["session_id"].startswith("deadbeef")
 
 
 def test_A1_and_B_compose_no_swap_onto_full_even_when_active_hot():
@@ -126,6 +127,44 @@ def test_A1_and_B_compose_no_swap_onto_full_even_when_active_hot():
     Fix B still refuses to land on a 100% target — hold instead."""
     accts = {"default": _a(85, 24), "merkos": _a(100, 22)}
     assert _reactive("default", accts) is None, "A1 passes but B blocks the 100% target"
+
+
+def test_global_reactive_ignores_event_from_prior_account_generation():
+    state = {"active": "new", "accounts": {
+        "new": _a(85, 20), "spare": _a(10, 10),
+    }}
+    event = {"ts": cus.now_iso(), "session_id": "sid", "match": "rate_limit",
+             "source": "stopfailure", "account": "old"}
+    assert cus.check_rate_limit_reactive(state, CFG, entries=[event]) is None
+    assert not event.get("_retry"), "stale generation is settled rather than replayed"
+
+
+def test_global_reactive_refuses_degraded_target_and_marks_retry():
+    state = {"active": "hot", "accounts": {
+        "hot": _a(95, 20), "also-hot": _a(85, 20),
+    }}
+    event = {"ts": cus.now_iso(), "session_id": "sid", "match": "rate_limit",
+             "source": "stopfailure", "account": "hot"}
+    assert cus.check_rate_limit_reactive(state, CFG, entries=[event]) is None
+    assert event.get("_retry") is True
+
+
+def test_global_reactive_hysteresis_persists_pending_event():
+    sid = "sid"
+    state = {"active": "hot", "accounts": {
+        "hot": _a(95, 20), "spare": _a(10, 10),
+    }}
+    state["accounts"]["hot"]["last_swap_ts"] = cus.now_iso()
+    original_read = cus._read_rate_limit_log_since
+    cus._read_rate_limit_log_since = lambda since: [{
+        "ts": cus.now_iso(), "session_id": sid, "match": "rate_limit",
+        "source": "stopfailure", "account": "hot",
+    }]
+    try:
+        assert cus.check_rate_limit_reactive(state, CFG) is None
+        assert state["pending_429_entries"][0]["account"] == "hot"
+    finally:
+        cus._read_rate_limit_log_since = original_read
 
 
 if __name__ == "__main__":

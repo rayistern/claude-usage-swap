@@ -22,10 +22,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        # Runtime deps (click, pyyaml) + pytest. Deliberately NOT installed
+        # Runtime deps (click, pyyaml, rich) + pytest. Deliberately NOT installed
         # from a requirements file — cus.py declares its runtime deps via PEP
         # 723 inline metadata; pytest is dev-only and never a runtime dep.
-        run: python -m pip install --upgrade pip click pyyaml pytest
+        run: python -m pip install --upgrade pip click pyyaml rich pytest
       - name: Syntax check
         run: python -c "import ast; ast.parse(open('cus.py').read())"
       - name: CLI imports cleanly

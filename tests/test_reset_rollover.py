@@ -132,7 +132,9 @@ def test_adaptive_sleep_shortens_to_just_after_reset():
     state = {"accounts": {"a": {
         "five_hour_resets_at": _iso(now + timedelta(seconds=240)), "current_5h_pct": 50,
     }}}
-    s = cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600)
+    s = cus._adaptive_sleep_seconds(state, {
+        "reset_inference": {"adaptive_repoll": True}, "poll_accel": {"enabled": False},
+    }, 600)
     assert 255 <= s <= 265   # 240 + 20 buffer
 
 
@@ -141,12 +143,16 @@ def test_adaptive_sleep_unchanged_when_reset_is_far():
     state = {"accounts": {"a": {
         "five_hour_resets_at": _iso(now + timedelta(hours=2)), "current_5h_pct": 50,
     }}}
-    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600) == 600
+    assert cus._adaptive_sleep_seconds(state, {
+        "reset_inference": {"adaptive_repoll": True}, "poll_accel": {"enabled": False},
+    }, 600) == 600
 
 
 def test_adaptive_sleep_unchanged_when_no_ticking_clock():
     state = {"accounts": {"a": {"current_5h_pct": 0}}}
-    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600) == 600
+    assert cus._adaptive_sleep_seconds(state, {
+        "reset_inference": {"adaptive_repoll": True}, "poll_accel": {"enabled": False},
+    }, 600) == 600
 
 
 def test_adaptive_sleep_floored():
@@ -155,7 +161,9 @@ def test_adaptive_sleep_floored():
         "five_hour_resets_at": _iso(now + timedelta(seconds=5)), "current_5h_pct": 50,
     }}}
     # 5 + 20 = 25, but floored at min_repoll_seconds (default 30)
-    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": True}}, 600) == 30
+    assert cus._adaptive_sleep_seconds(state, {
+        "reset_inference": {"adaptive_repoll": True}, "poll_accel": {"enabled": False},
+    }, 600) == 30
 
 
 def test_adaptive_sleep_disabled_returns_base():
@@ -163,7 +171,35 @@ def test_adaptive_sleep_disabled_returns_base():
     state = {"accounts": {"a": {
         "five_hour_resets_at": _iso(now + timedelta(seconds=60)), "current_5h_pct": 50,
     }}}
-    assert cus._adaptive_sleep_seconds(state, {"reset_inference": {"adaptive_repoll": False}}, 600) == 600
+    assert cus._adaptive_sleep_seconds(state, {
+        "reset_inference": {"adaptive_repoll": False}, "poll_accel": {"enabled": False},
+    }, 600) == 600
+
+
+def test_adaptive_sleep_honors_near_step_poll_accel():
+    state = {"active": "a", "accounts": {"a": {
+        "current_5h_pct": 62.0, "current_7d_pct": 10.0, "next_swap_at_pct": 65,
+    }}}
+    cfg = {
+        "poll_interval_seconds": 600,
+        "thresholds": {"steps": [65, 75, 90]},
+        "poll_accel": {"enabled": True, "within_pct_of_step": 5, "fast_interval_seconds": 45},
+        "reset_inference": {"adaptive_repoll": False},
+    }
+    assert cus._adaptive_sleep_seconds(state, cfg, 600) == 45
+
+
+def test_adaptive_sleep_keeps_base_when_account_far_from_step():
+    state = {"active": "a", "accounts": {"a": {
+        "current_5h_pct": 30.0, "current_7d_pct": 10.0, "next_swap_at_pct": 65,
+    }}}
+    cfg = {
+        "poll_interval_seconds": 600,
+        "thresholds": {"steps": [65, 75, 90]},
+        "poll_accel": {"enabled": True, "within_pct_of_step": 5, "fast_interval_seconds": 45},
+        "reset_inference": {"adaptive_repoll": False},
+    }
+    assert cus._adaptive_sleep_seconds(state, cfg, 600) == 600
 
 
 def _run_all() -> int:
