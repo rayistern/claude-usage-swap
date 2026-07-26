@@ -6,6 +6,7 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 ## Open
 
 <!-- AVC:TOC -->
+- [2026-07-10 — decision — Dead-snapshot heal-from-live-family: reseed a refresh-dead canonical snapshot from a valid pooled family instead of demanding a browser relogin (rayi2 incident)](#2026-07-10-decision-dead-snapshot-heal-from-live-family-reseed-a-refresh-dead-canonical-snapshot-from-a-valid-pooled-family-instead-of-demanding-a-browser-relogin-rayi2-incident)
 - [2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-125-merge-same-cause-as-123-124-entries)
 - [2026-07-03 — flag — Gym record loop also blocked for PR #124 merge (same cause as #123 entry)](#2026-07-03-flag-gym-record-loop-also-blocked-for-pr-124-merge-same-cause-as-123-entry)
 - [2026-07-03 — flag — Gym record loop for PR #123 merge blocked: repo not gym-initialized](#2026-07-03-flag-gym-record-loop-for-pr-123-merge-blocked-repo-not-gym-initialized)
@@ -27,6 +28,30 @@ See `docs/AUTONOMOUS_COLLABORATION.md` for the full methodology.
 - [2026-05-18 — flag — Gym MCP disconnected during planning — AVC-only methodology run](#2026-05-18-flag-gym-mcp-disconnected-during-planning-avc-only-methodology-run)
 
 <!-- AVC:ENTRIES -->
+
+## 2026-07-10 — decision — Dead-snapshot heal-from-live-family: reseed a refresh-dead canonical snapshot from a valid pooled family instead of demanding a browser relogin (rayi2 incident)
+
+- **Status:** open
+- **Type:** decision
+- **Tags:** #credentials #104 #109 #sos #self-heal #rayi2
+
+**Context.** `cus sos` flagged "[URGENT] 'rayi2' snapshot creds are dead and no valid login family remains — relogin required" for days while BOTH of rayi2's pooled families (family-1 on slot-9, family-2 on slot-5) were live, valid, and refreshed every cycle. Root cause: the #109 pool model never refreshes the canonical snapshot (leased-lane save-backs go to the family store by design), the snapshot's own refresh lineage diverged against the shared mount (both branches expired 07-08; distinct fingerprints confirm a #104-style divergence) and died, and no code path considered "reseed the snapshot from a live family". `has_free_login_family()` conflated "all families LEASED" with "no valid login exists".
+
+**What I decided (on branch `fix/snapshot-heal-from-live-family-20260710`, NOT deployed):**
+1. New `heal_snapshot_from_live_family` + daemon pass `_auto_heal_dead_snapshots` (runs in `_emit_sos_after` before `diagnose()`): reseed a `snapshot_refresh_dead` snapshot from the freshest VALID family store, guarded by identity anchor (`guard_canonical_identity_write`), structural validity (currently-valid access token + refresh token), GH #77 freshness, GH #79 backup.
+2. Aliasing invariant (#104), the load-bearing safety addition beyond the task's letter: after a heal the snapshot ALIASES a family's single-use refresh lineage, so (a) `_account_snapshot_dead` now returns dead-FOR-INSTALL (alias-first, zero network) so installs route through a proper family claim, and (b) `_unstale_account_snapshot` / `_refresh_account_token` skip snapshot-side refresh grants for aliased snapshots — a snapshot-side rotation would log the live lane out.
+3. The #104 collide guard at the install point now also covers the SHARED mount (`slot=None`), refusing to install a snapshot whose family is live on a lane.
+4. SOS condition 10.6 downgrades to a self-healing WARNING when a valid heal source exists; stays URGENT only when nothing can vouch (genuine relogin).
+
+**Why.** The account was never logged out — only the snapshot copy rotted. Auto-healing from an identity-verified live family removes a false relogin fire-drill while the alias guards prevent the heal from creating the divergence-logout it is recovering from. 548/548 tests pass incl. 14 new ones.
+
+### Walk-back path
+1. `git revert` the merge of PR branch `fix/snapshot-heal-from-live-family-20260710` (single-PR change; no data migration).
+2. If a healed snapshot must be un-healed: restore the pre-heal snapshot from its GH #79 rotated backup (`account-<X>/.credentials.json.bak.<ts>` — the heal always backs up first), then re-set `snapshot_refresh_dead: true` on the account in state.json.
+3. The alias detection is computed from token bytes (no state marker), so reverting the code fully restores prior probe/install behavior with no cleanup.
+
+---
+
 
 ## 2026-07-03 — flag — Gym record loop also blocked for PR #125 merge (same cause as #123/#124 entries)
 
