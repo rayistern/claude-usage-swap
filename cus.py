@@ -497,6 +497,38 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # `cus status` + `cus sos`. Detection is DISK-ONLY (shape/expiry, no
         # probes), so it is safe to default ON; set False to silence.
         "flag_idle_dead_slots": True,
+        # ---- DEEP prune (2026-08-07 family-pollution incident) ----
+        # `cus prune --deep` adds four store-level checks the base prune can't
+        # see, born from the live 2026-08-07 mess: account-03 was clobbered to
+        # rayi2's identity, families minted DURING the clobber window carry
+        # rayi2's creds while filed under 03, and rayi2's subscription was then
+        # cancelled — so a lane claiming 03/family-8 authenticated FINE (the
+        # refresh grant works, claim-verify #127 passes) and then hit
+        # "organization has disabled Claude subscription access". Auth-based
+        # verification cannot catch a store whose auth is alive but whose
+        # IDENTITY is wrong or whose SUBSCRIPTION is dead; these gates can.
+        # All four default ON because --deep itself is an explicit operator
+        # invocation (report-only without --execute) and the daemon sweep does
+        # NOT run them — flipping one off skips that check entirely.
+        "deep_identity_mismatch": True,     # store identity ≠ its filed account
+        "deep_duplicate_generation": True,  # store shares a live surface's refresh token
+        "deep_subscription": True,          # store's subscription is org-disabled (#191)
+        "deep_past_lifetime": True,         # store past assumed refresh-token TTL + probe-dead
+        # Daemon-sweep auto-evacuation (behind the daemon_sweep master gate,
+        # which defaults OFF — so this ships inert): when the #191 guard flags
+        # an account subscription_disabled, every LIVE lane on it is
+        # definitively dead (each request answers org-disabled), so the sweep
+        # moves those lanes onto a surviving account via the ordinary
+        # execute_swap slot-move primitive (inheriting every #104/#109 guard).
+        # Default ON *within the sweep* because it only ever fires on a
+        # definitively-dead account — there is no workload it can hurt.
+        "auto_evacuate": True,
+        # Warm-spare floor: warn (never act — a family mint needs an
+        # interactive browser /login, which no daemon can perform) when a
+        # usable, non-disabled account has fewer than this many FREE families
+        # whose creds pass the disk-only shape/expiry check. This is the
+        # "spare tire" count that lets an evacuation land instantly.
+        "warm_spare_families": 1,
     },
     # Subscription-ended (org-disabled) auto-detection + auto-exclusion
     # (2026-08-07, the rayi5/rayi6 cancellation incident). WHEN A CLAUDE
@@ -10089,6 +10121,612 @@ def _release_dead_leases(state: dict, config: dict, *, execute: bool) -> list[st
     return released
 
 
+# ---------------------------------------------------------------------------
+# DEEP prune (2026-08-07) — the family-pollution incident follow-up to GH #190
+# Mechanism 3. The base prune (`_prune_free_families`) answers exactly one
+# question per store: "does its refresh grant still mint tokens?". The live
+# 2026-08-07 mess proved that is not enough, three ways:
+#
+#   1. IDENTITY POLLUTION. account-03's canonical was clobbered to rayi2's
+#      identity (a duplicate-identity overwrite); families minted under 03
+#      during that window (03/family-6/7/8) hold REAL rayi2 logins — auth
+#      alive, subscription later cancelled. A lane claiming 03/family-8
+#      passes claim-verify (#127 checks only the grant) and then walls with
+#      "organization has disabled Claude subscription access". The store's
+#      STORED identity contradicts the account it is FILED UNDER — a purely
+#      disk-visible fact no grant probe can see.
+#   2. SUBSCRIPTION DEATH. #191 catches this at the POLL layer (canonical
+#      creds), but a family store carries its own token; a free family whose
+#      identity's subscription ended keeps passing auth checks forever.
+#   3. UNROTATED BOOTSTRAP COPIES. `login-mount --from-existing` copies the
+#      canonical's refresh token verbatim; until first rotation the copy and
+#      the canonical share ONE single-use token (the #104 seed) — and any
+#      probe of the copy dead-branches the canonical (the credential-death-
+#      cascade shape). These must be detected disk-only (fingerprint match),
+#      never probed.
+#
+# Everything here follows the house prune discipline: REPORT-ONLY unless
+# execute=True; retirement is a rename to `.dead-<date>` (reversible, never a
+# delete); leased families are NEVER probed or retired (leased_families is
+# recomputed immediately before every probe and asserted).
+# ---------------------------------------------------------------------------
+
+def _account_reference_identity(account: str) -> tuple[dict | None, str]:
+    """The identity an account's stores SHOULD carry — for the deep-prune
+    identity-mismatch check. Returns (identity | None, source-label).
+
+    Deliberately NOT `account_identity_anchor`: that anchor counts the login
+    FAMILIES as trusted witnesses (correct for the save-back clobber guard,
+    where the canonical is the suspect), but here the families are exactly
+    what we are auditing — a polluted family must not get a vote on the
+    reference it is judged against (live example: 03's rayi2-polluted
+    families made `account_identity_anchor("03")` AMBIGUOUS, which would
+    have blinded this check entirely). Witnesses used instead:
+
+      * meta.yaml (`_meta_anchor_identity`) — written at `cus init` /
+        relogin time, never by the save-back path;
+      * the canonical .claude.json (`account_canonical_identity`) — CAN be
+        clobbered (2026-07-06), which is why it is only a co-witness.
+
+    Both present and agreeing → merged (strongest). One present → that one.
+    CONTRADICTING → (None, "conflict: ...") — the account's own identity is
+    in dispute, so deep prune must not retire anything under it on identity
+    grounds (report the conflict; the operator resolves which side is right).
+    Neither → (None, "none") — nothing to enforce."""
+    meta = _meta_anchor_identity(account)
+    canon = account_canonical_identity(account)
+    if meta and canon:
+        if _identities_match(meta, canon) is False:
+            return None, f"conflict: meta.yaml {meta} vs canonical .claude.json {canon}"
+        # Merge so the reference carries every facet either witness knows;
+        # meta wins on shared keys (it is the harder-to-clobber witness).
+        return {**canon, **meta}, "meta+canonical"
+    if meta:
+        return meta, "meta"
+    if canon:
+        return canon, "canonical"
+    return None, "none"
+
+
+def _family_age_days(account: str, family_id: str) -> float | None:
+    """Days since a POOLED family was minted (per its provenance.json), or
+    None if unknown — the family-keyed sibling of `login_age_days` (which
+    stays keyed by legacy (account, slot) stores for its existing callers)."""
+    try:
+        prov = read_json(login_family_provenance_path(account, family_id))
+    except (json.JSONDecodeError, OSError):
+        return None
+    minted = prov.get("minted_ts") if isinstance(prov, dict) else None
+    if not minted:
+        return None
+    try:
+        minted_dt = datetime.fromisoformat(minted.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - minted_dt).total_seconds() / 86400.0
+
+
+def _live_surface_fingerprints(state: dict) -> dict[str, str]:
+    """Refresh-token fingerprint → human label for every surface whose token
+    generation a free store must never share (the duplicate-generation check)
+    and must certainly never PROBE (a grant rotates the single-use token and
+    dead-branches the other holder — the #104 clobber / credential-death-
+    cascade shape):
+
+      * every LIVE slot mount's current creds (listed first so their label
+        wins a collision — a live session is the scariest thing to clobber);
+      * the shared ~/.claude mount's creds (bare sessions);
+      * every account's CANONICAL snapshot (an idle canonical is kept fresh
+        by the un-stale sweep, so an unrotated `--from-existing` copy of it
+        WILL dead-branch within hours — flagging the copy now beats letting
+        a claim trust it later).
+
+    Idle slot mounts are deliberately EXCLUDED: an idle slot sharing its
+    (reclaimable) leased family's fingerprint is the normal post-lease state,
+    not a duplicate. Best-effort reads throughout — an unreadable surface
+    simply contributes nothing."""
+    out: dict[str, str] = {}
+
+    def _fp_of(path: Path) -> str | None:
+        try:
+            rt = _credential_refresh_token(read_json(path))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return _refresh_fingerprint(rt) if rt else None
+
+    for d in list_slot_dirs():
+        if not mount_in_use(d):
+            continue
+        fp = _fp_of(mount_creds_path(d))
+        if fp:
+            out.setdefault(fp, f"LIVE mount {d.name}")
+    fp = _fp_of(CREDS_JSON)
+    if fp:
+        out.setdefault(fp, "the shared ~/.claude mount")
+    for acct in sorted(state.get("accounts", {}) or {}):
+        fp = _fp_of(account_creds_path(acct))
+        if fp:
+            out.setdefault(fp, f"canonical account-{acct}")
+    return out
+
+
+def _retire_store_file(path: Path) -> str:
+    """Rename a store's creds file to `.dead-<YYYYMMDD>` and return the new
+    name — the shared non-destructive retire primitive. Unlike the bare
+    `path.rename(...)` pattern it never overwrites: POSIX rename silently
+    replaces an existing target, so a second same-day retirement of a
+    re-minted store would DESTROY the first retiree's bytes (violating the
+    annotate-don't-delete discipline); we suffix `-2`, `-3`, ... instead."""
+    stamp = f"{datetime.now(timezone.utc):%Y%m%d}"
+    candidate = path.with_name(f"{path.name}.dead-{stamp}")
+    n = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.dead-{stamp}-{n}")
+        n += 1
+    path.rename(candidate)
+    return candidate.name
+
+
+def _legacy_login_store_ids(account: str) -> list[str]:
+    """Legacy per-(account, slot) login store ids of `account` whose creds
+    file exists — the deep-prune iteration base for pre-pool stores
+    (logins/<account>/slot-N/). These are still claimable by the legacy
+    branch of `_slot_move_plan`/execute_swap (`has_independent_login`), so a
+    stale or duplicated one is a live hazard, not an archive. Sorted by slot
+    index for deterministic output."""
+    d = login_pool_dir(account)
+    if not d.exists():
+        return []
+    ids = [p.name for p in d.iterdir()
+           if p.is_dir() and p.name.startswith(SLOT_PREFIX)
+           and login_store_creds_path(account, p.name).exists()]
+
+    def _idx(slot_id: str) -> int:
+        try:
+            return int(slot_id.removeprefix(SLOT_PREFIX))
+        except ValueError:
+            return 1 << 30
+    return sorted(ids, key=_idx)
+
+
+def _deep_prune_stores(state: dict, config: dict, *, execute: bool, probe: bool,
+                       accounts: list[str] | None = None) -> list[dict]:
+    """The `cus prune --deep` store walk: identity-mismatch, duplicate-
+    generation, subscription-disabled and past-lifetime verdicts over every
+    login store (pooled families AND legacy slot-keyed stores) of every
+    account. Report-only unless execute=True; each check individually gated
+    by housekeeping.deep_* (all default ON — --deep is operator-invoked).
+
+    Ordering per store is a safety ladder, cheap/disk-only first, and a store
+    caught by an earlier rung is NEVER probed by a later one:
+
+      1. leased / live-held → hands off entirely (identity mismatch is still
+         REPORTED so the operator sees the polluted lease, with the honest
+         fix: evacuate the lane, `cus slot move <slot> <clean-acct>`);
+      2. identity-mismatch (disk-only) → retire. Wrong-identity creds under
+         this account can only ever mis-place a lane, regardless of whether
+         the token is alive;
+      3. duplicate-generation (disk-only fingerprint match vs live mounts /
+         shared mount / canonicals) → retire. Probing such a store would
+         rotate a token some OTHER surface holds live (#104), so detection
+         must precede — and thereby shield — every probing check below.
+         Stores modified <1h ago are report-only here: a just-bootstrapped
+         `--from-existing` copy legitimately matches its canonical until the
+         claim path rotates it, and retiring mid-provision would break the
+         operator's in-flight flow;
+      4. subscription-disabled: the #191 account flag retires flag-account
+         stores with ZERO network (the poll layer already proved the
+         subscription dead for this identity); otherwise, with probing
+         allowed and a currently-valid access token on disk, one cooldown-
+         cached profile GET (`_subscription_probe_verdict`) decides;
+      5. past-lifetime: provenance mint-age beyond the assumed refresh-token
+         TTL (`_expiry_state_from_age`) → the store is retired only when a
+         probe PROVES the grant dead ("beyond lifetime AND fails a probe");
+         probe-unavailable/unknown fails open to a report line, because
+         retiring on a network blip would throw away working stores.
+
+    Returns rows: {"kind": "deep", "account", "store", "legacy": bool,
+    "check", "detail", "leased": bool, "retired": str|None}."""
+    hk = config.get("housekeeping", {})
+    check_mismatch = hk.get("deep_identity_mismatch", True)
+    check_duplicate = hk.get("deep_duplicate_generation", True)
+    check_subscription = (hk.get("deep_subscription", True)
+                          and _subscription_guard_enabled(config))
+    check_lifetime = hk.get("deep_past_lifetime", True)
+    # Thread the (longer) housekeeping probe cooldown exactly as
+    # _prune_free_families does, so the two passes share one cadence + the
+    # _STORE_DEAD_PROBE cache and can never double-probe a store in one run.
+    probe_cfg = dict(config)
+    probe_cfg["launch_gate"] = {
+        **(config.get("launch_gate") or {}),
+        "probe_cooldown_minutes": hk.get("family_probe_cooldown_minutes", 60),
+    }
+    sub_dead = _subscription_dead_accounts(state, config)
+    live_fps = _live_surface_fingerprints(state)
+    out: list[dict] = []
+
+    def _row(acct: str, store: str, legacy: bool, check: str, detail: str,
+             *, leased: bool = False, retired: str | None = None,
+             would_retire: bool = False) -> dict:
+        # would_retire marks rows an --execute run WOULD retire (or did — set
+        # alongside retired) vs purely informational rows; the CLI prints the
+        # two classes differently so "would retire" is never claimed for a
+        # finding --execute would in fact keep.
+        return {"kind": "deep", "account": acct, "store": store, "legacy": legacy,
+                "check": check, "detail": detail, "leased": leased,
+                "retired": retired, "would_retire": would_retire or retired is not None}
+
+    def _retire(acct: str, store: str, legacy: bool, path: Path, check: str,
+                detail: str) -> str | None:
+        if not (execute and path.exists()):
+            return None
+        retired = _retire_store_file(path)
+        _cred_audit("housekeeping", f"retired-{check}-store",
+                    f"deep prune: {detail} — retired the store so no claim/install "
+                    f"path can trust it (reversible rename, 2026-08-07 deep prune)",
+                    account=acct,
+                    login_family=(None if legacy else f"{acct}/{store}"),
+                    extra=f"store={acct}/{store} retired_to={retired}")
+        return retired
+
+    for acct in sorted(accounts if accounts is not None else state.get("accounts", {})):
+        ref, ref_src = _account_reference_identity(acct)
+        stores: list[tuple[str, Path, dict, bool]] = [
+            (fam, login_family_creds_path(acct, fam), family_identity(acct, fam), False)
+            for fam in _all_family_store_ids(acct)
+        ] + [
+            (sid, login_store_creds_path(acct, sid), login_store_identity(acct, sid), True)
+            for sid in _legacy_login_store_ids(acct)
+        ]
+        if stores and ref is None and ref_src.startswith("conflict"):
+            # The account's own witnesses disagree about WHO it is — surface
+            # once per account; identity-mismatch retirement is suppressed
+            # below (ref is None) because judging stores against a disputed
+            # reference could retire the RIGHT side of the dispute.
+            out.append(_row(acct, "(account)", False, "reference-conflict",
+                            f"identity reference in dispute — {ref_src}; identity-mismatch "
+                            f"retirement suppressed for this account until resolved"))
+        for store_id, path, ident, legacy in stores:
+            mismatch = (check_mismatch and ref is not None and ident
+                        and _identities_match(ident, ref) is False)
+            # ---- rung 1: leased / live-held stores are untouchable ----------
+            if not legacy and store_id in leased_families(acct, state):
+                if mismatch:
+                    lease_slots = [s for s, e in (state.get("slots") or {}).items()
+                                   if isinstance(e, dict)
+                                   and e.get("login_family") == f"{acct}/{store_id}"]
+                    out.append(_row(acct, store_id, legacy, "identity-mismatch",
+                                    f"LEASED by {lease_slots or 'a live slot'} but stores "
+                                    f"{ident} while account reference ({ref_src}) is {ref} — "
+                                    f"the lane is running the WRONG account's creds; evacuate "
+                                    f"it (`cus slot move <slot> <clean-acct>`), then re-run "
+                                    f"deep prune to retire this store", leased=True))
+                continue
+            if legacy:
+                legacy_slot_dir = slot_path(store_id)
+                if legacy_slot_dir.exists() and mount_in_use(legacy_slot_dir):
+                    # The legacy store's namesake slot is live: the mount MAY
+                    # hold this store's generation (the pre-pool arrangement),
+                    # so probing OR retiring under it is a clobber risk.
+                    continue
+            try:
+                creds = read_json(path)
+            except (json.JSONDecodeError, OSError):
+                creds = None
+            rt = _credential_refresh_token(creds) if creds is not None else None
+            fp = _refresh_fingerprint(rt) if rt else None
+            # ---- rung 2: identity-mismatch (disk-only) ----------------------
+            if mismatch:
+                detail = (f"stores {ident} but is filed under '{acct}' whose reference "
+                          f"identity ({ref_src}) is {ref}")
+                retired = _retire(acct, store_id, legacy, path, "identity-mismatch", detail)
+                out.append(_row(acct, store_id, legacy, "identity-mismatch", detail,
+                                retired=retired, would_retire=True))
+                continue
+            # ---- rung 3: duplicate-generation (disk-only) -------------------
+            if check_duplicate and fp and fp in live_fps:
+                surface = live_fps[fp]
+                try:
+                    age_s = time.time() - path.stat().st_mtime
+                except OSError:
+                    age_s = None
+                detail = f"shares its refresh-token generation ({fp}) with {surface}"
+                if age_s is not None and age_s < 3600:
+                    out.append(_row(acct, store_id, legacy, "duplicate-generation",
+                                    detail + " — store written <1h ago (possibly an "
+                                    "in-flight --from-existing provision); report-only"))
+                else:
+                    retired = _retire(acct, store_id, legacy, path, "duplicate-generation",
+                                      detail + " — an unrotated copy is a #104 clobber seed")
+                    out.append(_row(acct, store_id, legacy, "duplicate-generation", detail,
+                                    retired=retired, would_retire=True))
+                continue
+            # ---- rung 4: subscription-disabled ------------------------------
+            # Retirement here REQUIRES a probe-confirmed "disabled" verdict on
+            # THIS store's own token — the #191 account flag alone is only a
+            # tip-off, never grounds to retire. Proven live 2026-08-07: the
+            # flag on account 03 was minted while 03's canonical/slots were
+            # drift-tangled with rayi2 (whose subscription IS dead), so the
+            # flag was mis-attributed — trusting it blindly would have retired
+            # 03/family-9, the account's one FRESH, alive rayistern family.
+            # The probe self-corrects both ways: it confirms genuinely dead
+            # stores under the flag, and it exposes a stale flag ("active").
+            if check_subscription:
+                flagged = acct in sub_dead
+                verdict: str | None = None
+                if probe:
+                    fresh = creds if isinstance(creds, dict) else None
+                    now_ms = int(time.time() * 1000)
+                    exp = _creds_expires_at(fresh) if fresh is not None else None
+                    if (flagged and rt
+                            and (fresh is None or _live_mount_creds_invalid(fresh)
+                                 or exp is None or int(exp) <= now_ms + 60_000)):
+                        # The flag warrants an answer but the on-disk access
+                        # token is expired: mint a fresh one via the shared
+                        # free-store grant machinery (safe — free store, the
+                        # #127 claim-verify discipline; rotation persisted).
+                        # Only flagged stores earn this rotation: probing every
+                        # healthy-looking store's subscription isn't worth
+                        # burning grants (the 2026-06-19 burnout lesson).
+                        assert legacy or store_id not in leased_families(acct, state), \
+                            f"deep prune must never probe leased family {acct}/{store_id}"
+                        grant_key = ("legacy:" if legacy else "fam:") + f"{acct}/{store_id}"
+                        if not _store_creds_dead(path, grant_key, probe_cfg, allow_probe=True):
+                            try:
+                                fresh = read_json(path)
+                            except (json.JSONDecodeError, OSError):
+                                fresh = None
+                        else:
+                            fresh = None  # plain-dead store — the base prune pass retires it
+                    exp = _creds_expires_at(fresh) if isinstance(fresh, dict) else None
+                    oauth = fresh.get("claudeAiOauth") if isinstance(fresh, dict) else None
+                    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+                    if (token and exp is not None
+                            and int(exp) > int(time.time() * 1000) + 60_000):
+                        # THE invariant (task-mandated): recompute the lease set
+                        # immediately before the network call so no store that
+                        # became leased since the loop top can ever be probed.
+                        assert legacy or store_id not in leased_families(acct, state), \
+                            f"deep prune must never probe leased family {acct}/{store_id}"
+                        verdict, _detail = _subscription_probe_verdict(
+                            f"store:{acct}/{store_id}", token, config)
+                if verdict == "disabled":
+                    detail = ("profile probe on this store's own token: subscription "
+                              "org-disabled (canceled + claude_free signature)"
+                              + (" — confirms the #191 account flag" if flagged else ""))
+                    retired = _retire(acct, store_id, legacy, path,
+                                      "subscription-disabled", detail)
+                    out.append(_row(acct, store_id, legacy, "subscription-disabled",
+                                    detail, retired=retired, would_retire=True))
+                    continue
+                if flagged:
+                    # Flag without confirmation → VISIBLE but informational;
+                    # fall through to the lifetime check rather than stopping.
+                    if verdict == "active":
+                        out.append(_row(acct, store_id, legacy, "subscription-disabled",
+                                        "#191 account flag appears STALE for this store — "
+                                        "profile probe says ACTIVE; kept (the flag self-heals "
+                                        "on the next successful usage poll)"))
+                    else:
+                        out.append(_row(acct, store_id, legacy, "subscription-disabled",
+                                        "account flagged subscription_disabled (#191) but "
+                                        "UNCONFIRMED for this store ("
+                                        + ("--no-probe" if not probe
+                                           else "no valid access token / probe inconclusive")
+                                        + ") — kept; retirement requires a probe-confirmed "
+                                          "verdict on the store's own token"))
+            # ---- rung 5: past-lifetime --------------------------------------
+            if check_lifetime:
+                age = (login_age_days(acct, store_id) if legacy
+                       else _family_age_days(acct, store_id))
+                exp_state, days_left = _expiry_state_from_age(age, config)
+                if exp_state != "expired":
+                    continue
+                over = f"{-days_left:.0f}d past the assumed TTL" if days_left is not None \
+                    else "past the assumed TTL"
+                if not probe:
+                    out.append(_row(acct, store_id, legacy, "past-lifetime",
+                                    f"minted {over} — unverified (--no-probe); retire "
+                                    f"requires a probe-proven-dead grant"))
+                    continue
+                # Same recompute-then-assert invariant as the profile probe.
+                assert legacy or store_id not in leased_families(acct, state), \
+                    f"deep prune must never probe leased family {acct}/{store_id}"
+                key = ("legacy:" if legacy else "fam:") + f"{acct}/{store_id}"
+                dead = _store_creds_dead(path, key, probe_cfg, allow_probe=True)
+                if dead:
+                    detail = f"minted {over} AND its refresh grant is dead"
+                    retired = _retire(acct, store_id, legacy, path, "past-lifetime", detail)
+                    out.append(_row(acct, store_id, legacy, "past-lifetime", detail,
+                                    retired=retired, would_retire=True))
+                    continue
+                # Not dead: either PROVEN alive or the probe failed open
+                # (network "unknown") — distinguish for the report, retire
+                # neither (a working store with stale provenance just needs
+                # its provenance believed less; a network blip must not cost
+                # a store). The _STORE_DEAD_PROBE cache can NOT tell the two
+                # apart (it stores (ts, False) for alive AND unknown), but the
+                # DISK can: an alive grant persists a fresh unexpired token
+                # into the store, while unknown leaves the expired bytes — so
+                # re-read and judge shape/expiry.
+                try:
+                    fresh = read_json(path)
+                except (json.JSONDecodeError, OSError):
+                    fresh = None
+                proven = (isinstance(fresh, dict) and not _live_mount_creds_invalid(fresh)
+                          and (_creds_expires_at(fresh) or 0) > int(time.time() * 1000) - 30_000)
+                out.append(_row(acct, store_id, legacy, "past-lifetime",
+                                f"minted {over} but token "
+                                + ("verified ALIVE — provenance age is stale, store kept"
+                                   if proven else
+                                   "unverifiable right now (probe failed open) — kept; "
+                                   "re-run to retry")))
+    return out
+
+
+def _slot_identity_drift(state: dict) -> list[dict]:
+    """Slot↔state drift rows for the deep-prune report — the same comparison
+    diagnose()'s Condition 7 makes (slot mount .claude.json identity vs the
+    assigned account's canonical identity), extracted so `cus prune --deep`
+    can print it as step 0. Drift matters to prune specifically because every
+    lease-safety decision here keys off state.json's slot→account/lease
+    records: retiring stores while those records lie about reality is doing
+    surgery from the wrong chart. Pure detection — no writes, no probes."""
+    out: list[dict] = []
+    for slot_name, entry in sorted((state.get("slots") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        acct = entry.get("account")
+        if not acct:
+            continue
+        cj = mount_claude_json_path(slot_path(slot_name))
+        if not cj.exists():
+            continue
+        try:
+            slot_ids = _identity_fields(read_json(cj))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _identities_match(slot_ids, _dir_identity(acct)) is False:
+            out.append({"slot": slot_name, "assigned": acct,
+                        "mount_identity": slot_ids})
+    return out
+
+
+def _evacuation_candidates(state: dict, config: dict) -> list[dict]:
+    """LIVE lanes stranded on subscription-disabled accounts, each with the
+    best surviving target `execute_swap` could move it to — the planning half
+    of auto-evacuation, shared by the `cus prune --deep` report (print the
+    exact `cus slot move` commands) and the daemon sweep (execute them).
+
+    A lane on a #191-flagged account is definitively dead (every request
+    answers org-disabled), so unlike ordinary rebalancing there is no
+    cache-warmth argument for leaving it (the "don't churn workable lanes"
+    rule doesn't apply — nothing on it is workable). Targets are accounts
+    that are not operator-disabled, not subscription-dead, and whose
+    `_slot_move_plan` previews a clean install ("snapshot" or "claim" — the
+    same clobber guards the real move enforces), preferred emptiest-first by
+    max(5h%, 7d%). Locked slots are skipped entirely (a lock is user intent;
+    even suggesting a move there invites a fight with the operator).
+
+    Returns [{"slot", "account", "target": str|None, "plan": str|None}] —
+    target None means every surviving account refused (pool exhausted /
+    nothing alive): the honest answer is a warning, not a forced clobber."""
+    dead = _subscription_dead_accounts(state, config)
+    if not dead:
+        return []
+    excluded = _disabled_accounts(config, state)
+    locked = _locked_slots(config)
+    accounts = state.get("accounts") or {}
+
+    def _load(name: str) -> float:
+        a = accounts.get(name) or {}
+        return max(float(a.get("current_5h_pct") or 0.0),
+                   float(a.get("current_7d_pct") or 0.0))
+
+    survivors = sorted((n for n in accounts
+                        if n not in dead and n not in excluded
+                        and not (accounts.get(n) or {}).get("snapshot_refresh_dead")),
+                       key=_load)
+    out: list[dict] = []
+    for slot_name, entry in sorted((state.get("slots") or {}).items()):
+        if not isinstance(entry, dict) or slot_name in locked:
+            continue
+        acct = entry.get("account")
+        if acct not in dead:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists() or not mount_in_use(d):
+            continue  # idle lanes need no rescue — the launch gate re-places them
+        target = plan = None
+        for cand in survivors:
+            preview = _slot_move_plan(state, config, slot_name, cand)
+            if preview["plan"] in ("snapshot", "claim"):
+                target, plan = cand, preview["plan"]
+                break
+        out.append({"slot": slot_name, "account": acct, "target": target, "plan": plan})
+    return out
+
+
+def _warm_spare_warnings(state: dict, config: dict) -> list[str]:
+    """WARN-ONLY spare-family floor check (the warming half of the 2026-08-07
+    housekeeping ask): for every usable account, count FREE families whose
+    creds pass the DISK-ONLY shape/expiry check and warn when the count is
+    below housekeeping.warm_spare_families. Warn-only by construction — a
+    new family requires an interactive browser `/login`, which no sweep can
+    perform; the value of the warning is that an evacuation (or any rescue
+    `cus slot move`) needs a pre-logged-in spare to land on INSTANTLY.
+    Zero probes, zero writes."""
+    hk = config.get("housekeeping", {})
+    need = int(hk.get("warm_spare_families", 1))
+    if need <= 0:
+        return []
+    excluded = _disabled_accounts(config, state)
+    msgs: list[str] = []
+    for acct in sorted(state.get("accounts", {}) or {}):
+        if acct in excluded:
+            continue  # unusable accounts don't need spares — they need renewal
+        fams = _all_family_store_ids(acct)
+        if not fams:
+            continue  # account not using the pool — nothing to keep warm
+        leased = leased_families(acct, state)
+        warm = sum(1 for f in fams
+                   if f not in leased
+                   and not _creds_shape_expiry_dead(login_family_creds_path(acct, f)))
+        if warm < need:
+            msgs.append(f"{acct}: {warm}/{need} warm spare famil"
+                        f"{'y' if need == 1 else 'ies'} — a rescue/evacuation onto this "
+                        f"account may have nothing to claim; browser login needed: "
+                        f"`cus login-mount {acct}`")
+    return msgs
+
+
+def _sweep_evacuate_subscription_dead(state: dict, config: dict, *,
+                                      no_execute: bool = False) -> list[str]:
+    """Daemon-side auto-evacuation (2026-08-07): move LIVE lanes off accounts
+    the #191 guard flagged subscription_disabled, onto the best surviving
+    account, via the ordinary `execute_swap(..., slot=...)` primitive — the
+    exact same code path as a manual `cus slot move`, so every #104/#109
+    clobber guard is inherited, not reimplemented.
+
+    Reachable ONLY from _sweep_housekeeping, i.e. behind BOTH the
+    housekeeping.daemon_sweep master gate (default OFF — ships inert) and
+    this function's own housekeeping.auto_evacuate gate (default ON, because
+    it only fires on a definitively-dead account: a lane there serves
+    nothing, so moving it cannot lose work — the opposite of the churn the
+    cache-warmth rule protects). Pane/session pins are not consulted (they
+    key on pane ids, not slots); the walk-back for a surprising move is the
+    printed `cus slot move <slot> <old-account>` — and the old account being
+    subscription-dead means wanting it back is the rare case."""
+    hk = config.get("housekeeping", {})
+    if not hk.get("auto_evacuate", True):
+        return []
+    msgs: list[str] = []
+    for cand in _evacuation_candidates(state, config):
+        slot_name, acct, target = cand["slot"], cand["account"], cand["target"]
+        if target is None:
+            msgs.append(f"[urgent] {slot_name} is LIVE on subscription-dead '{acct}' and no "
+                        f"surviving account can host it (pool exhausted / all dead) — "
+                        f"provision a family (`cus login-mount <alive-acct>`) or renew")
+            continue
+        if no_execute:
+            msgs.append(f"would evacuate {slot_name} off subscription-dead '{acct}' → "
+                        f"'{target}' ({cand['plan']}) (report-only — no_execute)")
+            continue
+        try:
+            execute_swap(target, trigger="housekeeping-evacuate", slot=slot_name)
+            msgs.append(f"evacuated {slot_name} off subscription-dead '{acct}' → '{target}' "
+                        f"({cand['plan']}); walk-back: `cus slot move {slot_name} {acct}`")
+            _cred_audit("housekeeping", "evacuated-subscription-dead-lane",
+                        f"live lane's account '{acct}' is subscription-disabled (#191) — "
+                        f"moved the lane to surviving '{target}' via execute_swap",
+                        slot=slot_name, account=target,
+                        extra=f"from={acct} plan={cand['plan']}")
+        except (RuntimeError, OSError) as e:
+            msgs.append(f"[urgent] evacuation of {slot_name} ('{acct}' → '{target}') failed: "
+                        f"{type(e).__name__}: {e} — lane remains on a dead account")
+    return msgs
+
+
 def _sweep_housekeeping(state: dict, config: dict, *, no_execute: bool = False) -> list[str]:
     """Daemon-side housekeeping sweep (Mechanism 3g) — the opt-in automation of
     `cus prune`, mirroring the _sweep_unstale_idle_accounts/_sweep_clock_keepalive
@@ -10103,7 +10741,17 @@ def _sweep_housekeeping(state: dict, config: dict, *, no_execute: bool = False) 
         --no-execute, which threads through as report-only),
       * reports the out-of-band-relogin detections (and only ACTS on them —
         auto-reseed — if housekeeping.auto_reseed, default False),
-      * audits idle slots and reports dead leases (releasing them on execute).
+      * audits idle slots and reports dead leases (releasing them on execute),
+      * warns when a usable account is below its warm-spare-family floor
+        (2026-08-07 — warn-only: a family mint needs a browser /login),
+      * evacuates LIVE lanes off subscription-dead accounts (2026-08-07,
+        housekeeping.auto_evacuate, default ON within the sweep — see
+        _sweep_evacuate_subscription_dead for why ON is safe here).
+
+    The DEEP store checks (identity-mismatch / duplicate-generation /
+    subscription / past-lifetime) are deliberately NOT part of the sweep:
+    they retire stores on identity judgments, which stays an operator-
+    reviewed action (`cus prune --deep`), not per-interval automation.
     """
     global _HOUSEKEEPING_LAST_RUN
     hk = config.get("housekeeping", {})
@@ -10141,6 +10789,8 @@ def _sweep_housekeeping(state: dict, config: dict, *, no_execute: bool = False) 
     for rel in _release_dead_leases(state, config, execute=execute):
         msgs.append(("released dead lease " if execute
                      else "dead lease (report-only — no_execute) ") + rel)
+    msgs.extend(_warm_spare_warnings(state, config))
+    msgs.extend(_sweep_evacuate_subscription_dead(state, config, no_execute=no_execute))
     return msgs
 
 
@@ -18316,7 +18966,14 @@ def doctor_cmd(fix_dirs: bool) -> None:
                    "rotates it live; the canonical is knowingly dead-branched until relogin.")
 @click.option("--no-probe", "no_probe", is_flag=True,
               help="Shape/expiry checks only — no token-rotating refresh-grant probes.")
-def prune_cmd(execute: bool, reseed: str | None, no_probe: bool) -> None:
+@click.option("--deep", "deep", is_flag=True,
+              help="Add the 2026-08-07 deep store checks: identity-mismatch (a family filed "
+                   "under account A holding account B's creds), duplicate-generation "
+                   "(unrotated --from-existing copies sharing a live surface's token), "
+                   "subscription-disabled stores (#191), and past-lifetime stores. Also "
+                   "reports slot↔state drift and evacuation candidates. Report-only "
+                   "without --execute, like everything else here.")
+def prune_cmd(execute: bool, reseed: str | None, no_probe: bool, deep: bool = False) -> None:
     """Credential-store housekeeping (GH #190 Mechanism 3).
 
     Report (default) or fix (--execute) the slow-rot failure modes the launch
@@ -18325,6 +18982,13 @@ def prune_cmd(execute: bool, reseed: str | None, no_probe: bool) -> None:
     signature (fresh canonical + stale dependents → points at `--reseed`),
     idle slots whose mount creds would fail their next launch, and slot
     leases whose family store is gone (released with --execute).
+
+    --deep (2026-08-07 family-pollution incident) adds the checks auth-based
+    verification can never make: a store whose IDENTITY contradicts the
+    account it is filed under, a store whose SUBSCRIPTION is org-disabled
+    while its auth still works, an unrotated bootstrap copy sharing a live
+    surface's single-use refresh token, and stores past the assumed
+    refresh-token lifetime whose grant proves dead.
 
     Probing is SAFE here by construction: only FREE families are ever probed
     — a free family's token is held by nobody, so rotating it is claim-
@@ -18344,6 +19008,32 @@ def prune_cmd(execute: bool, reseed: str | None, no_probe: bool) -> None:
             sys.exit(1)
         fam = _reseed_family_from_canonical(reseed, state, config)
         sys.exit(0 if fam else 1)
+
+    deep_rows: list[dict] = []
+    drift_rows: list[dict] = []
+    evac_rows: list[dict] = []
+    warm_msgs: list[str] = []
+    if deep:
+        # Step 0: slot↔state drift — printed FIRST because every lease-safety
+        # decision below keys off state.json's slot records; if they lie, fix
+        # state before retiring stores (`cus daemon --once --no-execute` runs
+        # the full reconcile pass; record reality, do NOT swap first).
+        drift_rows = _slot_identity_drift(state)
+        if drift_rows:
+            click.echo(click.style(
+                "Slot↔state drift (fix FIRST — deep prune judges leases by state.json):",
+                bold=True))
+            for r in drift_rows:
+                click.echo(click.style(
+                    f"  {r['slot']}: assigned '{r['assigned']}' but mount identity is "
+                    f"{r['mount_identity']} — reconcile via `cus daemon --once --no-execute`, "
+                    f"then fix state.json slots.{r['slot']}.account to match reality",
+                    fg="red"))
+            click.echo("")
+        # Deep store checks run BEFORE the free-family probe pass so that on
+        # --execute the polluted/duplicate stores are retired disk-only and
+        # can never be reached by a later token-rotating probe.
+        deep_rows = _deep_prune_stores(state, config, execute=execute, probe=not no_probe)
 
     rows = _prune_free_families(state, config, execute=execute, probe=not no_probe)
     fam_rows = [r for r in rows if r["kind"] == "family"]
@@ -18390,11 +19080,66 @@ def prune_cmd(execute: bool, reseed: str | None, no_probe: bool) -> None:
                 f"  {'released' if execute else 'would release (re-run with --execute)'}: {rel}",
                 fg="yellow"))
 
-    if not (oob or idle or released or any(r["dead"] for r in fam_rows)):
+    deep_actionable = 0
+    if deep:
+        click.echo("\nDeep store checks (identity / duplicate-generation / subscription / lifetime):")
+        if not deep_rows:
+            click.echo("  (no findings)")
+        for r in deep_rows:
+            label = f"{r['account']}/{r['store']}" + (" [legacy]" if r["legacy"] else "")
+            if r["leased"]:
+                # A polluted LEASED store is the loudest finding: the lane on
+                # top of it is running the wrong account's creds RIGHT NOW.
+                click.echo(click.style(
+                    f"  {label}: {r['check'].upper()} — {r['detail']}", fg="red"))
+                deep_actionable += 1
+            elif r["retired"]:
+                click.echo(click.style(
+                    f"  {label}: {r['check']} — retired to {r['retired']} ({r['detail']})",
+                    fg="yellow"))
+                deep_actionable += 1
+            elif r["would_retire"]:
+                click.echo(click.style(
+                    f"  {label}: {r['check']} — would retire (re-run with --execute): "
+                    f"{r['detail']}", fg="yellow"))
+                deep_actionable += 1
+            else:
+                # Informational rows (reference-conflict, past-lifetime-but-
+                # alive/unverified, <1h-fresh duplicates) — visible, no action.
+                click.echo(f"  {label}: {r['check']} — {r['detail']}")
+
+        warm_msgs = _warm_spare_warnings(state, config)
+        if warm_msgs:
+            click.echo("\nWarm-spare floor (pre-logged-in free families per usable account):")
+            for m in warm_msgs:
+                click.echo(click.style(f"  {m}", fg="yellow"))
+
+        evac_rows = _evacuation_candidates(state, config)
+        if evac_rows:
+            click.echo("\nLive lanes on subscription-dead accounts (evacuation candidates):")
+            for r in evac_rows:
+                if r["target"]:
+                    click.echo(click.style(
+                        f"  {r['slot']} ('{r['account']}' is subscription-dead) → run: "
+                        f"cus slot move {r['slot']} {r['target']}   # plan: {r['plan']}",
+                        fg="red"))
+                else:
+                    click.echo(click.style(
+                        f"  {r['slot']} ('{r['account']}' is subscription-dead) — NO surviving "
+                        f"account can host it; `cus login-mount <alive-acct>` first", fg="red"))
+
+    if not (oob or idle or released or any(r["dead"] for r in fam_rows)
+            or drift_rows or deep_actionable or evac_rows or warm_msgs):
         click.echo(click.style("\n✓ nothing to prune", fg="green"))
     elif not execute:
-        click.echo("\nreport-only — re-run with --execute to retire dead families / "
-                   "release dead leases.")
+        msg = ("\nreport-only — re-run with --execute to retire dead families / "
+               "release dead leases")
+        if deep:
+            msg += (" / retire deep-check findings. (Evacuations are never run by "
+                    "prune — use the printed `cus slot move` commands.)")
+        else:
+            msg += "."
+        click.echo(msg)
 
 
 @cli.command(name="sync-config")
