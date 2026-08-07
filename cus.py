@@ -410,6 +410,39 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "window_minutes": 30,    # ... within this rolling window → escalate
         },
     },
+    # Launch-time credential liveness gate (GH #190). The launch fast path used
+    # to trust a slot that ALREADY held the requested account: if
+    # state.slots[slot].account == account, no execute_swap ran and the session
+    # exec'd straight onto whatever bytes sat in the slot's .credentials.json.
+    # Those bytes can be well-SHAPED but DEAD (an expired access token whose
+    # refresh token fails the grant with invalid_grant — the same shape as the
+    # 2026-07-07 merkos dead-snapshot incident), so the new session opened
+    # straight into "Not logged in · Run /login". This gate liveness-checks the
+    # same-account fast path BEFORE the exec and, when the mount's creds are
+    # provably dead, retires the slot's (dead) family lease and reinstalls from
+    # a verified source via execute_swap — or refuses with a clear message
+    # rather than launching a logged-out session. Backward-compatible: healthy
+    # mounts take a zero-network shape/expiry fast path, and `enabled: False`
+    # restores the trust-the-slot pre-#190 behavior bit-for-bit.
+    "launch_gate": {
+        # Master gate. False ⇒ the same-account fast path trusts the slot's
+        # existing creds unconditionally (pre-#190 behavior).
+        "enabled": True,
+        # When a FREE slot's creds are suspect (well-shaped but access token
+        # already expired), allow the refresh-grant probe to decide dead vs
+        # alive. The grant ROTATES the token on success (single-use, #104), so
+        # the rotated pair is persisted back into the mount (and its leased
+        # family store) immediately. Probing is HARD-disabled for an in-use
+        # mount regardless of this flag — rotating a live session's token from
+        # outside would clobber the family. False ⇒ suspect-but-unprobeable
+        # creds fail open (launch proceeds as today).
+        "probe_suspect": True,
+        # Poll-burnout backoff for the probe (mirrors token_self_refresh's
+        # unstale_cooldown_minutes): at most one refresh-grant probe per store
+        # per this many minutes, so a launch loop can't hammer the OAuth
+        # endpoint (the 2026-06-19 burnout lesson).
+        "probe_cooldown_minutes": 10,
+    },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
     "thresholds": {
@@ -5692,7 +5725,7 @@ def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> t
 
 
 def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = None,
-                 bump_ladder: bool = True) -> dict:
+                 bump_ladder: bool = True, force_reinstall: bool = False) -> dict:
     """Atomically swap to `target_name`. Returns updated state dict.
 
     Shared between the CLI `cus switch` command and the daemon's auto-swap.
@@ -5718,14 +5751,24 @@ def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = N
     previously-interrupted swap runs first, under the same lock. Raises
     RuntimeError on lock timeout (the exception type every caller already
     catches).
+
+    `force_reinstall` (GH #190): a swap whose target equals the mount's current
+    account is normally a silent no-op (nothing to move). The liveness-heal
+    paths (launch gate, same-account `cus slot move`) need the OPPOSITE — a
+    full verified REINSTALL of the same account over dead mount creds, running
+    the entire guard stack (save-back with its #77 freshness guards, the
+    dead-snapshot family-seed, the #141 blank-install refusals). True bypasses
+    only the same-account early return; every guard downstream still applies.
+    Default False keeps every existing caller byte-identical.
     """
     with _swap_lock():
         _recover_pending_swap()
-        return _execute_swap_locked(target_name, trigger, slot=slot, bump_ladder=bump_ladder)
+        return _execute_swap_locked(target_name, trigger, slot=slot, bump_ladder=bump_ladder,
+                                    force_reinstall=force_reinstall)
 
 
 def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None,
-                         bump_ladder: bool = True) -> dict:
+                         bump_ladder: bool = True, force_reinstall: bool = False) -> dict:
     """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
     # State is loaded AFTER the lock is acquired: a concurrent swap that just
     # finished has already persisted its state.json, so `current` below is
@@ -5762,7 +5805,10 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         current = slot_entry.get("account")
         live_cj_path = mount_claude_json_path(mount_dir)
         live_creds_path = mount_creds_path(mount_dir)
-    if target_name == current:
+    if target_name == current and not force_reinstall:
+        # Same-account swap = nothing to move. force_reinstall (GH #190) is the
+        # deliberate exception: reinstall the same account over dead mount creds
+        # with the full guard stack (see execute_swap's docstring).
         return state
 
     target_dir = ACCOUNTS_DIR / f"account-{target_name}"
@@ -8677,6 +8723,13 @@ _UNSTALE_ATTEMPT_MS: dict[str, float] = {}
 #   token on success, so — like the un-stale sweep — it must run at most once per
 #   `unstale_cooldown_minutes` per account (poll-burnout backoff). Cleared below.
 _SNAPSHOT_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
+# _STORE_DEAD_PROBE: cooldown-key -> (wall-clock seconds of the last probe, is-dead
+#   bool) — the cooldown cache for `_store_creds_dead` (GH #190 launch gate), the
+#   generalization of _SNAPSHOT_DEAD_PROBE for arbitrary creds files (slot mounts
+#   today; keys look like "mount:slot-5"). Same rationale: the probe is a network
+#   round-trip that ROTATES the store's refresh token on success, so it must be
+#   rate-limited per store (launch_gate.probe_cooldown_minutes). Cleared below.
+_STORE_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
 
 
 def _reset_blank_tracking() -> None:
@@ -8687,6 +8740,7 @@ def _reset_blank_tracking() -> None:
     _LANE_HEAL_HISTORY.clear()
     _UNSTALE_ATTEMPT_MS.clear()
     _SNAPSHOT_DEAD_PROBE.clear()
+    _STORE_DEAD_PROBE.clear()
 
 
 def _account_snapshot_dead(account: str, config: dict | None = None, *, force: bool = False) -> bool:
@@ -8799,6 +8853,179 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
     # endpoint isn't hammered, but never let a transient refuse a swap.
     _SNAPSHOT_DEAD_PROBE[account] = (now, False)
     return False
+
+
+def _store_creds_dead(path: Path, cooldown_key: str, config: dict, *,
+                      allow_probe: bool = True, force: bool = False) -> bool:
+    """True iff the credentials file at `path` cannot currently authenticate —
+    the GH #190 generalization of `_account_snapshot_dead` for an ARBITRARY
+    creds store (a slot mount's .credentials.json today; the snapshot helper
+    stays account-keyed for its callers' cache semantics).
+
+    Verdict ladder (cheap → expensive, mirroring the snapshot template):
+      1. missing / unreadable            → dead (nothing to authenticate with).
+      2. well-shaped (not blank per `_live_mount_creds_invalid`) AND the access
+         token is unexpired (30s grace, same as poll_account_usage) → NOT dead,
+         zero network — the common healthy case stays free.
+      3. no refresh token (and no valid access token above) → dead.
+      4. suspect (well-shaped-but-expired, or blank-shaped with a refresh
+         token) and `allow_probe`: cooldown-cached `_oauth_refresh_grant`
+         probe, keyed by `cooldown_key` in `_STORE_DEAD_PROBE` (cooldown =
+         launch_gate.probe_cooldown_minutes; the probe ROTATES the token, so
+         it must be rate-limited — the 2026-06-19 burnout lesson):
+           - alive   → PERSIST the rotated pair into `path` (backup first;
+                       the grant is single-use, #104 — losing the rotation
+                       would kill the family) and return NOT dead.
+           - dead    → invalid_grant → dead.
+           - unknown → FAIL OPEN (not dead): a network blip must never turn a
+                       launchable slot into a refusal; the #141 blank-shape
+                       guards still backstop an actually blank install.
+      5. suspect and NOT `allow_probe` → fail open (not dead): without the
+         grant we cannot distinguish dead from merely-expired, and refusing on
+         a guess would block working launches.
+
+    `force` bypasses the cooldown cache (mirrors _account_snapshot_dead).
+    Never raises into the caller."""
+    try:
+        creds = read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return True  # missing/unreadable: nothing usable at this path
+    # Cheap path: well-shaped and unexpired ⇒ authenticates right now. The 30s
+    # grace mirrors _account_snapshot_dead so we don't trust a token about to
+    # expire mid-launch.
+    if not _live_mount_creds_invalid(creds):
+        exp = _creds_expires_at(creds)
+        now_ms = int(time.time() * 1000)
+        if exp is not None and int(exp) > now_ms - 30_000:
+            return False
+    rt = _credential_refresh_token(creds)
+    if not rt:
+        # No refresh token to mint from AND no currently-valid access token.
+        return True
+    if not allow_probe:
+        # Suspect but unprobeable (probe disabled by config, or the caller
+        # hard-disabled it for an in-use mount) → fail open.
+        return False
+    cooldown_min = config.get("launch_gate", {}).get("probe_cooldown_minutes", 10)
+    now = time.time()
+    if not force:
+        cached = _STORE_DEAD_PROBE.get(cooldown_key)
+        if cached is not None and (now - cached[0]) < cooldown_min * 60:
+            return cached[1]
+    verdict, tok = _oauth_refresh_grant(rt)
+    if verdict == "alive" and isinstance(tok, dict):
+        # Persist the rotation BEFORE returning (single-use grant, #104): the
+        # old refresh token is a dead branch the moment the grant succeeds, so
+        # the fresh pair must land on disk or the family is lost. Guarded so a
+        # malformed grant response can never crash the caller.
+        try:
+            access = tok.get("access_token")
+            if isinstance(access, str) and access:
+                new_oauth = dict(creds.get("claudeAiOauth") or {})
+                new_oauth["accessToken"] = access
+                new_oauth["refreshToken"] = tok.get("refresh_token") or rt
+                expires_in = tok.get("expires_in")
+                if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+                    new_oauth["expiresAt"] = int((time.time() + float(expires_in)) * 1000)
+                new_creds = dict(creds)
+                new_creds["claudeAiOauth"] = new_oauth
+                backup_credentials_file(path)
+                atomic_write_bytes(path, (json.dumps(new_creds, indent=2) + "\n").encode(), mode=0o600)
+                _cred_audit("store-dead-probe", "refreshed",
+                            "store access token was expired but its refresh grant is ALIVE — "
+                            "minted+persisted fresh tokens into the store (GH #190)",
+                            token_fp=_audit_token_fp(new_creds),
+                            extra=f"store={cooldown_key} new_expiry={_expiry_repr(new_creds)}")
+        except (OSError, TypeError, ValueError):
+            pass  # persist failed; the grant WAS alive, so still not dead
+        _STORE_DEAD_PROBE[cooldown_key] = (now, False)
+        return False
+    if verdict == "dead":
+        _STORE_DEAD_PROBE[cooldown_key] = (now, True)
+        _cred_audit("store-dead-probe", "detected",
+                    "store refresh grant returned invalid_grant — these creds are DEAD "
+                    "(launching on them would open a logged-out session, GH #190)",
+                    token_fp=_audit_token_fp(creds), extra=f"store={cooldown_key}")
+        return True
+    # "unknown" → fail open; cache the not-dead verdict so a flapping endpoint
+    # isn't hammered, but never let a transient refuse a launch.
+    _STORE_DEAD_PROBE[cooldown_key] = (now, False)
+    return False
+
+
+def _retire_slot_family_and_lease(slot_name: str, account: str, state: dict,
+                                  config: dict) -> str | None:
+    """Retire a slot's leased login family whose creds proved DEAD (GH #190):
+    rename the family's creds store to `.dead-<YYYYMMDD>` (the same retire
+    pattern `claim_verified_login_family` uses for dead pool stores, so
+    list_login_families stops offering it and SOS/doctor can count
+    retirements) and pop the slot's lease so the follow-up reinstall claims a
+    FRESH family instead of re-leasing the dead one. Returns the retired
+    family id, or None when the slot holds no lease for `account`.
+
+    Shared by the launch-time liveness gate and the same-account
+    `cus slot move` verify-and-reinstall — both discover a dead mount whose
+    family store is the (dead) source of truth and must be swept before
+    execute_swap picks an install source. `config` is accepted for signature
+    parity with its callers (gating/probing already happened by the time a
+    retire is warranted)."""
+    del config  # reserved: retire itself needs no config knobs today
+    lease = (state.get("slots", {}).get(slot_name) or {}).get("login_family")
+    if not lease or "/" not in str(lease):
+        return None
+    lease_account, fam = str(lease).split("/", 1)
+    if lease_account != account:
+        # A lease for a DIFFERENT account is drift, not ours to retire here —
+        # the reconcile pass owns slot↔state drift.
+        return None
+    path = login_family_creds_path(account, fam)
+    dead_name = None
+    if path.exists():
+        dead_name = f"{path.name}.dead-{datetime.now(timezone.utc):%Y%m%d}"
+        path.rename(path.with_name(dead_name))
+    state["slots"][slot_name].pop("login_family", None)
+    save_state(state)
+    _cred_audit("launch-gate", "retired-dead-family",
+                "slot's mount creds proved DEAD — retired its leased family store and "
+                "released the lease so the reinstall claims a fresh family (GH #190)",
+                slot=slot_name, account=account, login_family=lease,
+                extra=(f"retired_to={dead_name}" if dead_name else "store_already_gone=true"))
+    return fam
+
+
+def _slot_mount_creds_dead(slot_name: str, slot_dir: Path, account: str, state: dict,
+                           config: dict, *, allow_probe: bool) -> bool:
+    """`_store_creds_dead` specialized to a SLOT's mount creds (GH #190 launch
+    gate + same-account slot-move heal). Two slot-specific rules on top of the
+    generic helper:
+
+      * The probe is HARD-disabled for an in-use mount, regardless of
+        `allow_probe`: a probe rotates the refresh token, and rotating a LIVE
+        session's family out from under it is exactly the #104 clobber.
+      * If the probe came back alive and persisted a rotation into the mount,
+        the rotated pair is immediately saved back through
+        `saveback_mount_credentials` so the slot's LEASED family store (or the
+        account snapshot) carries the fresh generation too — otherwise the
+        freshest tokens would exist only on the mount, the pre-PR#126 poisoning
+        shape."""
+    creds_path = mount_creds_path(slot_dir)
+    try:
+        before = creds_path.read_bytes()
+    except OSError:
+        before = None
+    probe_ok = allow_probe and not mount_in_use(slot_dir)
+    dead = _store_creds_dead(creds_path, f"mount:{slot_name}", config, allow_probe=probe_ok)
+    if not dead and probe_ok:
+        try:
+            after = creds_path.read_bytes()
+        except OSError:
+            after = None
+        if after is not None and after != before:
+            # The probe rotated + persisted fresh tokens into the mount —
+            # propagate them to the canonical store (leased family / snapshot)
+            # under the standard guard stack.
+            saveback_mount_credentials(slot_dir, account, state)
+    return dead
 
 
 def _lane_lastvalid_path(mount_creds: Path) -> Path:
@@ -16930,6 +17157,21 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # their writes (same rule as the daemon's periodic save-back).
             for f in doctor_mount(lane_dir, fix=True):
                 click.echo(f"launch: doctor healed {lane}/{f['entry']} ({f['problem']})")
+            # GH #190 launch gate: SHAPE-check only — never probe a live lane's
+            # creds (the refresh grant rotates the token, which would clobber
+            # the running sessions' family, #104). A blank/invalid mount means
+            # the joining session would open logged out; refuse with the heal
+            # path instead of silently minting a dead session.
+            if config.get("launch_gate", {}).get("enabled", True):
+                try:
+                    _lane_creds = read_json(mount_creds_path(lane_dir))
+                except (json.JSONDecodeError, OSError):
+                    _lane_creds = None
+                if _lane_creds is None or _live_mount_creds_invalid(_lane_creds):
+                    raise click.ClickException(
+                        f"refusing to join lane {lane}: its mount credentials are blank/invalid — the "
+                        f"new session would open logged out (GH #190). Heal first: "
+                        f"`cus slot move {lane} {account}` or let the daemon's lane heal run, then retry.")
             state = load_state()
             entry = state.setdefault("slots", {}).setdefault(lane, {"account": account, "created_ts": now_iso()})
             entry["last_launch_ts"] = now_iso()
@@ -16943,6 +17185,19 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # bare (no CLAUDE_CONFIG_DIR override; launch_cmd skips the env var
             # for the shared dir) and the daemon manages it with the other bare
             # sessions. No slot bookkeeping: the shared mount isn't a slot.
+            # GH #190 launch gate: same shape-check-only refusal as the lane
+            # join above, against the shared ~/.claude creds (never probe — the
+            # shared mount always has live-or-imminent bare sessions on it).
+            if config.get("launch_gate", {}).get("enabled", True):
+                try:
+                    _shared_creds = read_json(mount_creds_path(CLAUDE_DIR))
+                except (json.JSONDecodeError, OSError):
+                    _shared_creds = None
+                if _shared_creds is None or _live_mount_creds_invalid(_shared_creds):
+                    raise click.ClickException(
+                        f"refusing to join the shared mount on '{account}': ~/.claude credentials are "
+                        f"blank/invalid — the new bare session would open logged out (GH #190). Heal "
+                        f"first (`cus switch {account}` / `cus relogin {account}`), then retry.")
             click.echo(f"launch: joining the shared mount already on '{account}' (lane sharing — bare session, swaps with the shared mount)")
             return "shared", CLAUDE_DIR, account
 
@@ -17027,6 +17282,30 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     # state itself, under the swap lock.
     if state.get("slots", {}).get(slot_name, {}).get("account") != account:
         execute_swap(account, trigger="launch", slot=slot_name)
+    elif (config.get("launch_gate", {}).get("enabled", True)
+          and _slot_mount_creds_dead(slot_name, slot_dir, account, state, config,
+                                     allow_probe=config.get("launch_gate", {}).get("probe_suspect", True))):
+        # ---- GH #190 launch gate: same-account fast path liveness check ----
+        # The slot ALREADY holds the requested account, so historically no swap
+        # ran and the session exec'd onto whatever bytes sat in the mount —
+        # including well-shaped-but-DEAD creds (expired access token whose
+        # refresh grant returns invalid_grant), which opened the new session
+        # straight into "Not logged in · Run /login". When the mount's creds
+        # prove dead: retire the slot's (dead) family lease so the reinstall
+        # claims a FRESH source, then run the real swap primitive with
+        # force_reinstall (same-account swaps are otherwise no-ops) so the full
+        # verified-install guard stack decides the source — snapshot, or the
+        # dead-snapshot family-seed, or a clean refusal. bump_ladder=False: a
+        # heal-in-place is not rotation churn, so the account's swap-threshold
+        # ladder must not advance.
+        _retire_slot_family_and_lease(slot_name, account, state, config)
+        try:
+            execute_swap(account, trigger="launch-liveness-reinstall", slot=slot_name,
+                         bump_ladder=False, force_reinstall=True)
+        except RuntimeError as e:
+            raise click.ClickException(
+                f"launch gate (GH #190): {slot_name}'s '{account}' credentials are dead and a "
+                f"verified reinstall was refused — {e}") from e
 
     state = load_state()
     entry = state.setdefault("slots", {}).setdefault(slot_name, {"account": account, "created_ts": now_iso()})

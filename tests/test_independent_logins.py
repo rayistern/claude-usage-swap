@@ -475,12 +475,19 @@ def test_duplicate_family_detected_and_warned_and_sos():
 # --------------------------------------------------------------------------
 
 def _make_live_lane(env: "_Env", slot: str, account: str) -> None:
-    """Scaffold a slot dir holding `account` and make it appear live (one pid)."""
+    """Scaffold a slot dir holding `account` and make it appear live (one pid).
+
+    Plants VALID mount creds too: a genuinely live lane always carries a live
+    .credentials.json, and the GH #190 launch gate now (correctly) refuses to
+    JOIN a lane whose mount creds are missing/blank — the joining session would
+    open logged out. Pre-#190 this fixture skipped the creds because the join
+    path never read them."""
     state = cus.load_state()
     state["slots"] = {slot: {"account": account}}
     cus.save_state(state)
     cus.scaffold_mount_dir(cus.slot_path(slot))
     live = cus.slot_path(slot)
+    (live / ".credentials.json").write_text(json.dumps(_creds(f"rt-lane-{account}")))
     cus.mount_pids = lambda m: [999] if str(m) == str(live) else []
     cus._OCCUPIED_SLOTS_CACHE.clear()
 
