@@ -443,6 +443,42 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # endpoint (the 2026-06-19 burnout lesson).
         "probe_cooldown_minutes": 10,
     },
+    # Credential-store housekeeping (GH #190 Mechanism 3): `cus prune` + an
+    # OPT-IN daemon sweep that probe/retire dead FREE login families, detect
+    # the out-of-band-relogin signature (fresh canonical + stale dependents),
+    # audit idle slots whose mount creds would fail their next launch, and
+    # release leases whose family store is gone. Everything risky defaults
+    # OFF: the daemon sweep and auto-reseed are opt-in, and `cus prune` is
+    # REPORT-ONLY without --execute. Only FREE families are ever probed — a
+    # leased family is a live mount's token generation and rotating it from
+    # outside is exactly the #104 clobber.
+    "housekeeping": {
+        # Master gate for the DAEMON-side sweep (_sweep_housekeeping). False
+        # (default) ⇒ the daemon never runs housekeeping on its own; the
+        # operator drives it via `cus prune`. Deliberately shipped OFF so the
+        # scaffold is inert until explicitly approved/enabled.
+        "daemon_sweep": False,
+        # When the daemon sweep is on, run at most once per this many hours
+        # (housekeeping is slow-moving hygiene, not per-cycle work — and each
+        # run may rotate free-family tokens, so cadence bounds churn).
+        "sweep_interval_hours": 6,
+        # Cooldown for the free-family refresh-grant probe (the housekeeping
+        # analog of launch_gate.probe_cooldown_minutes, but longer: families
+        # sit idle for days, so probing them hourly buys nothing and every
+        # probe rotates the token + writes a backup — the 2026-06-19 burnout
+        # lesson).
+        "family_probe_cooldown_minutes": 60,
+        # When the sweep detects the out-of-band-relogin signature, may it
+        # AUTOMATICALLY run the canonical→family generation transfer
+        # (_reseed_family_from_canonical)? False (default): detection only —
+        # the reseed deliberately dead-branches the canonical snapshot, which
+        # is an operator-approval-class action (`cus prune --reseed <acct>`).
+        "auto_reseed": False,
+        # Surface idle slots whose mount creds are dead/blank (audit 3d) in
+        # `cus status` + `cus sos`. Detection is DISK-ONLY (shape/expiry, no
+        # probes), so it is safe to default ON; set False to silence.
+        "flag_idle_dead_slots": True,
+    },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
     "thresholds": {
@@ -2630,6 +2666,18 @@ def create_slot(state: dict, config: dict | None = None) -> tuple[str, Path]:
     return name, d
 
 
+def _mount_creds_blank_on_disk(slot_dir: Path) -> bool:
+    """DISK-ONLY: is this slot's mount .credentials.json missing/unreadable or
+    blank-shaped (#141 signature)? Used by acquire_slot's prefer-account pass
+    (GH #190 Mechanism 3f) to deprioritize a same-account slot whose creds
+    would need a heal anyway — under the swap lock, so NEVER a network probe
+    (a refresh-grant there would both stall the lock and rotate tokens)."""
+    try:
+        return _live_mount_creds_invalid(read_json(mount_creds_path(slot_dir)))
+    except (json.JSONDecodeError, OSError):
+        return True
+
+
 def acquire_slot(state: dict, prefer_account: str | None = None,
                  config: dict | None = None) -> tuple[str, Path]:
     """Find a free slot for a launch (create one if none), reserving it.
@@ -2670,10 +2718,24 @@ def acquire_slot(state: dict, prefer_account: str | None = None,
             free.append(d)
         chosen: Path | None = None
         if prefer_account:
+            # GH #190 Mechanism 3f: DEPRIORITIZE (not disqualify) a preferred
+            # slot whose mount creds are missing/blank ON DISK — two passes:
+            # (1) same-account slot with plausible creds (launches with zero
+            # heal work), then (2) any same-account slot (the pre-#190 pick:
+            # still better than a cross-account slot, which would force a full
+            # swap — the launch gate/install path heals a blank mount anyway).
+            # Checks are DISK-ONLY: we hold the swap lock here, and a network
+            # probe would both stall the lock and rotate a token (#104).
             for d in free:
-                if slots_state[d.name].get("account") == prefer_account:
+                if (slots_state[d.name].get("account") == prefer_account
+                        and not _mount_creds_blank_on_disk(d)):
                     chosen = d
                     break
+            if chosen is None:
+                for d in free:
+                    if slots_state[d.name].get("account") == prefer_account:
+                        chosen = d
+                        break
         if chosen is None and free:
             chosen = free[0]
         if chosen is not None:
@@ -8730,17 +8792,25 @@ _SNAPSHOT_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
 #   round-trip that ROTATES the store's refresh token on success, so it must be
 #   rate-limited per store (launch_gate.probe_cooldown_minutes). Cleared below.
 _STORE_DEAD_PROBE: dict[str, tuple[float, bool]] = {}
+# _HOUSEKEEPING_LAST_RUN: wall-clock seconds of the last _sweep_housekeeping
+#   run (GH #190 Mechanism 3g). The daemon-side housekeeping sweep is slow-
+#   moving hygiene, not per-cycle work — this timestamp enforces
+#   housekeeping.sweep_interval_hours so an enabled sweep still runs at most
+#   once per interval per daemon process. Reset below (test hook).
+_HOUSEKEEPING_LAST_RUN: float | None = None
 
 
 def _reset_blank_tracking() -> None:
     """Clear all in-process blank-mount / un-stale tracking (test hook; also
     usable to force a fresh preempt/un-stale attempt or heal-count after a config
     change). Never needed in normal daemon operation — the dicts self-prune."""
+    global _HOUSEKEEPING_LAST_RUN
     _PREEMPT_ATTEMPT_MS.clear()
     _LANE_HEAL_HISTORY.clear()
     _UNSTALE_ATTEMPT_MS.clear()
     _SNAPSHOT_DEAD_PROBE.clear()
     _STORE_DEAD_PROBE.clear()
+    _HOUSEKEEPING_LAST_RUN = None
 
 
 def _account_snapshot_dead(account: str, config: dict | None = None, *, force: bool = False) -> bool:
@@ -9026,6 +9096,437 @@ def _slot_mount_creds_dead(slot_name: str, slot_dir: Path, account: str, state: 
             # under the standard guard stack.
             saveback_mount_credentials(slot_dir, account, state)
     return dead
+
+
+# ---------------------------------------------------------------------------
+# GH #190 Mechanism 3 — credential-store housekeeping (`cus prune` + opt-in
+# daemon sweep). All functions here are REPORT-ONLY unless their caller passes
+# execute=True, and only FREE families are ever probed: a leased family is a
+# live mount's token generation, and a refresh-grant probe rotates the token
+# (single-use, #104), so probing a leased family would clobber the live
+# session. Free families are safe to probe — nobody holds their token, and
+# rotating one is exactly what claim-verify (#127) already does on claim.
+# ---------------------------------------------------------------------------
+
+def _creds_shape_expiry_dead(path: Path) -> bool:
+    """DISK-ONLY dead-creds check (GH #190 Mechanism 3): would these creds fail
+    to authenticate AND have nothing to mint from? Missing/unreadable ⇒ dead.
+    Well-shaped and unexpired (30s grace, same as _store_creds_dead's cheap
+    path) ⇒ not dead. Anything else with a refresh token ⇒ NOT dead — only a
+    (token-rotating, network) grant could tell dead from merely-expired, and
+    this predicate deliberately never probes, so it fails open exactly like
+    _store_creds_dead's allow_probe=False branch. Blank/expired with no
+    refresh token ⇒ dead (nothing to authenticate with, nothing to mint)."""
+    try:
+        creds = read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return True
+    if not _live_mount_creds_invalid(creds):
+        exp = _creds_expires_at(creds)
+        if exp is not None and int(exp) > int(time.time() * 1000) - 30_000:
+            return False
+    return _credential_refresh_token(creds) is None
+
+
+def _all_family_store_ids(account: str) -> list[str]:
+    """Every family id of `account` whose creds STORE FILE exists — including
+    stores list_login_families hides (no refresh token, blank-shaped). The
+    housekeeping iteration base: a junk store invisible to the claim path is
+    exactly what prune exists to retire, so we cannot iterate the usable-only
+    view. Half-scaffolded dirs (no creds file yet — a login-mount mid-flight)
+    are skipped: there is nothing to probe or retire there."""
+    d = login_pool_dir(account)
+    if not d.exists():
+        return []
+    fams = [p.name for p in d.iterdir()
+            if p.is_dir() and p.name.startswith(LOGIN_FAMILY_PREFIX)
+            and login_family_creds_path(account, p.name).exists()]
+    return sorted(fams, key=_family_index)
+
+
+def _prune_free_families(state: dict, config: dict, *, execute: bool, probe: bool,
+                         accounts: list[str] | None = None) -> list[dict]:
+    """Probe every FREE login family and report (or, with execute=True, retire)
+    the dead ones — Mechanism 3a of the GH #190 housekeeping scaffold.
+
+    Per account: walk every family store on disk (including no-refresh-token
+    junk stores the claim path can't even see), SKIPPING leased families — a
+    leased family is a live mount's generation and must NEVER be probed (the
+    probe rotates the single-use token, #104). Each free store goes through
+    `_store_creds_dead` (probe=`probe`; an alive probe persists the rotation
+    into the store, which is claim-verify's own discipline — a free family's
+    token is held by nobody). Cooldown: housekeeping.family_probe_cooldown_minutes,
+    threaded via a shallow config overlay because _store_creds_dead reads its
+    cooldown from launch_gate.probe_cooldown_minutes (reuse the probe/persist/
+    cache machinery rather than duplicating it).
+
+    Dead store: retired to `.dead-<YYYYMMDD>` (the claim_verified_login_family
+    retire pattern) when execute=True, else reported only.
+
+    Returns a list of dict rows:
+      {"kind": "family", "account", "family", "dead": bool, "retired": str|None}
+      {"kind": "pool_depth", "account", "live_free": int, "pool_size": int}
+    The pool_depth row lets callers report free-pool depth vs
+    independent_logins.pool_size (with the `cus login-mount <acct>` pointer).
+    `accounts` (optional) restricts the pass (the reseed path prunes just its
+    own account first)."""
+    hk = config.get("housekeeping", {})
+    probe_cfg = dict(config)
+    probe_cfg["launch_gate"] = {
+        **(config.get("launch_gate") or {}),
+        "probe_cooldown_minutes": hk.get("family_probe_cooldown_minutes", 60),
+    }
+    pool_size = config.get("independent_logins", {}).get("pool_size", 3)
+    out: list[dict] = []
+    for acct in sorted(accounts if accounts is not None else state.get("accounts", {})):
+        fams = _all_family_store_ids(acct)
+        if not fams:
+            continue
+        leased = leased_families(acct, state)
+        live_free = 0
+        for fam in fams:
+            if fam in leased:
+                continue  # live mount's generation — never probed, never retired
+            # The invariant this whole mechanism rests on: by the time we reach
+            # a probe, the family MUST be free. leased_families is recomputed
+            # here (not the loop-top copy) so drift between the two reads can
+            # never leak a probe onto a freshly-leased family.
+            assert fam not in leased_families(acct, state), \
+                f"housekeeping must never probe leased family {acct}/{fam}"
+            path = login_family_creds_path(acct, fam)
+            dead = _store_creds_dead(path, f"fam:{acct}/{fam}", probe_cfg, allow_probe=probe)
+            if not dead:
+                live_free += 1
+                out.append({"kind": "family", "account": acct, "family": fam,
+                            "dead": False, "retired": None})
+                continue
+            retired = None
+            if execute and path.exists():
+                retired = f"{path.name}.dead-{datetime.now(timezone.utc):%Y%m%d}"
+                path.rename(path.with_name(retired))
+                _cred_audit("housekeeping", "retired-dead-family",
+                            "free login family's creds proved dead — retired the store so the "
+                            "claim path stops considering it (GH #190 prune)",
+                            account=acct, login_family=f"{acct}/{fam}",
+                            extra=f"retired_to={retired}")
+            out.append({"kind": "family", "account": acct, "family": fam,
+                        "dead": True, "retired": retired})
+        out.append({"kind": "pool_depth", "account": acct,
+                    "live_free": live_free, "pool_size": pool_size})
+    return out
+
+
+def _detect_oob_relogin(state: dict, config: dict) -> list[SOSCondition]:
+    """Detect the OUT-OF-BAND-relogin signature (Mechanism 3b): the canonical
+    snapshot is healthy (a fresh browser relogin landed there) while dependent
+    stores — login families, idle-slot mounts — are dead or far staler. A
+    relogin mints a brand-new token generation, so everything seeded from the
+    OLD generation is now a dead branch; the honest fix is the explicit
+    canonical→family generation transfer (`cus prune --reseed <acct>`).
+
+    PURE DETECTION — no probes, no writes; verdicts come from disk shape/expiry
+    plus any dead verdicts the prune pass already cached in _STORE_DEAD_PROBE.
+    Acting on the detection is gated elsewhere (housekeeping.auto_reseed,
+    default False).
+
+    "Dependent dead/stale" per account (leased families skipped — a live
+    mount's generation is by definition current):
+      * family store unreadable or blank-shaped (a failed refresh's leavings);
+      * family store probe-cached DEAD (from a prior prune probe this process);
+      * family store's expiresAt more than _OOB_STALE_GAP_HOURS older than the
+        canonical's — the "canonical refreshed recently, family never did"
+        gap a relogin (or long idle stretch) leaves behind;
+      * idle slot on this account whose mount creds fail the disk-only
+        shape/expiry check."""
+    out: list[SOSCondition] = []
+    gap_ms = _OOB_STALE_GAP_HOURS * 3_600_000
+    for acct_name in sorted(state.get("accounts", {})):
+        acct = state["accounts"].get(acct_name)
+        if not isinstance(acct, dict):
+            continue
+        if acct.get("snapshot_refresh_dead"):
+            continue  # canonical is NOT healthy — the opposite failure mode
+        snap = account_creds_path(acct_name)
+        try:
+            canon = read_json(snap)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _live_mount_creds_invalid(canon) or not _credential_refresh_token(canon):
+            continue  # canonical not demonstrably healthy — nothing to reseed from
+        canon_exp = _creds_expires_at(canon)
+        stale: list[str] = []
+        leased = leased_families(acct_name, state)
+        for fam in _all_family_store_ids(acct_name):
+            if fam in leased:
+                continue
+            path = login_family_creds_path(acct_name, fam)
+            cached = _STORE_DEAD_PROBE.get(f"fam:{acct_name}/{fam}")
+            if cached is not None and cached[1]:
+                stale.append(f"family {fam} (probe-proven dead)")
+                continue
+            try:
+                fam_creds = read_json(path)
+            except (json.JSONDecodeError, OSError):
+                stale.append(f"family {fam} (unreadable store)")
+                continue
+            if _live_mount_creds_invalid(fam_creds):
+                stale.append(f"family {fam} (blank-shaped store)")
+                continue
+            fam_exp = _creds_expires_at(fam_creds)
+            if canon_exp is not None and fam_exp is not None and (canon_exp - fam_exp) > gap_ms:
+                stale.append(f"family {fam} (far older than canonical)")
+        for slot_name, entry in sorted((state.get("slots") or {}).items()):
+            if not isinstance(entry, dict) or entry.get("account") != acct_name:
+                continue
+            d = slot_path(slot_name)
+            if not d.exists() or mount_in_use(d):
+                continue
+            if _creds_shape_expiry_dead(mount_creds_path(d)):
+                stale.append(f"idle {slot_name} mount (dead/blank creds)")
+        if stale:
+            out.append(SOSCondition(
+                severity="warning",
+                summary=(f"{len(stale)} stale login families/mounts under freshly-relogged "
+                         f"'{acct_name}'"),
+                action=f"run `cus prune --reseed {acct_name}`",
+                affected=acct_name,
+            ))
+    return out
+
+
+# How much older (by claudeAiOauth.expiresAt) a free family store must be than
+# the canonical snapshot before _detect_oob_relogin calls it "far older". 72h:
+# the un-stale sweep keeps an idle CANONICAL fresh every cycle, while a free
+# family only refreshes when claimed/probed — so a modest gap is normal; a
+# multi-day gap under a demonstrably-fresh canonical is the relogin signature.
+_OOB_STALE_GAP_HOURS = 72
+
+
+def _reseed_family_from_canonical(account: str, state: dict, config: dict) -> str | None:
+    """Honest SINGLE-USE canonical→family generation transfer (Mechanism 3c),
+    the recovery for an out-of-band relogin: the canonical snapshot holds the
+    only live generation, the families hold dead branches. Steps:
+
+      1. retire this account's dead FREE families (probing them — free ⇒ safe);
+      2. scaffold a NEW family (next index) and copy the canonical
+         .credentials.json (+ .claude.json identity) into it — the same copy
+         path `cus login-mount --from-existing` uses;
+      3. IMMEDIATELY refresh-grant the copied store and persist the rotation:
+         after the grant, the NEW FAMILY owns the live generation and the
+         canonical's copy is a dead branch — a deliberate, documented TRANSFER
+         (provenance.json records it). We rotate NOW rather than lazily so
+         there is never a window where two stores share one live refresh token
+         (the #104 shape);
+      4. the canonical snapshot is NOT touched: it will read
+         snapshot_refresh_dead until the operator relogins (this build has no
+         automatic heal-back mechanism — the #186 heal is not present here),
+         which is printed as an explicit consequence, not hidden;
+      5. a dead/unverifiable grant on the copy ⇒ the scaffold is removed and
+         the operator is told a relogin is required — never leave a half-built
+         family that the claim path might trust.
+
+    Returns the new family id, or None on failure."""
+    # (1) sweep this account's dead free families first so the new family's
+    # index and the pool's free count are computed against a clean pool.
+    _prune_free_families(state, config, execute=True, probe=True, accounts=[account])
+    snap = account_creds_path(account)
+    try:
+        canon = read_json(snap)
+    except (json.JSONDecodeError, OSError):
+        click.echo(f"reseed {account}: canonical snapshot ({snap}) is missing/unreadable — "
+                   f"relogin required (`cus relogin {account}`).")
+        return None
+    rt = _credential_refresh_token(canon)
+    if not rt:
+        click.echo(f"reseed {account}: canonical snapshot has no refresh token to transfer — "
+                   f"relogin required (`cus relogin {account}`).")
+        return None
+    # (2) scaffold + copy (the --from-existing copy path, but into the NEXT
+    # index — reseed may coexist with real families, unlike the bootstrap).
+    fam = next_family_id(account)
+    scaffold_login_family_dir(account, fam)
+    fam_creds = login_family_creds_path(account, fam)
+    atomic_copy(snap, fam_creds, mode=0o600)
+    snap_cj = ACCOUNTS_DIR / f"account-{account}" / ".claude.json"
+    if snap_cj.exists():
+        atomic_copy(snap_cj, login_family_dir(account, fam) / ".claude.json", mode=0o600)
+    # (3) transfer the generation: grant + persist into the FAMILY store only.
+    verdict, tok = _oauth_refresh_grant(rt)
+    if verdict != "alive" or not isinstance(tok, dict):
+        # Never leave a half-built family: an unrotated copy would share the
+        # canonical's (possibly dead) token — either useless or a #104 seed.
+        shutil.rmtree(login_family_dir(account, fam), ignore_errors=True)
+        if verdict == "dead":
+            click.echo(f"reseed {account}: canonical refresh token is DEAD (invalid_grant) — "
+                       f"nothing to transfer; relogin required (`cus relogin {account}`). "
+                       f"Removed the half-built {fam} scaffold.")
+        else:
+            click.echo(f"reseed {account}: could not verify the canonical refresh token "
+                       f"(network/endpoint) — refusing to transfer on a guess; removed the "
+                       f"{fam} scaffold. Retry later.")
+        return None
+    creds = read_json(fam_creds)
+    oauth = dict(creds.get("claudeAiOauth") or {})
+    oauth["accessToken"] = tok.get("access_token") or oauth.get("accessToken")
+    new_rt = tok.get("refresh_token") or rt
+    oauth["refreshToken"] = new_rt
+    if tok.get("expires_in"):
+        oauth["expiresAt"] = int((time.time() + float(tok["expires_in"])) * 1000)
+    creds = dict(creds)
+    creds["claudeAiOauth"] = oauth
+    atomic_write_bytes(fam_creds, json.dumps(creds, indent=2).encode(), mode=0o600)
+    email = account_canonical_identity(account).get("emailAddress")
+    prov = {
+        "account": account,
+        "family_id": fam,
+        "minted_ts": now_iso(),
+        "source_email": email or "unknown",
+        "refresh_fp": _refresh_fingerprint(new_rt),
+        "bootstrapped": True,
+        "note": (f"reseeded-from-canonical {datetime.now(timezone.utc):%Y-%m-%d} — generation "
+                 f"TRANSFER (GH #190); canonical holds a dead branch until relogin/heal"),
+    }
+    write_json(login_family_provenance_path(account, fam), prov)
+    _cred_audit("housekeeping", "reseeded-family",
+                "canonical→family generation TRANSFER: new family holds the rotated live "
+                "generation; canonical is knowingly dead-branched until relogin (GH #190)",
+                account=account, login_family=f"{account}/{fam}",
+                token_fp=_audit_token_fp(creds))
+    click.echo(f"reseed {account}: {fam} now holds the LIVE token generation "
+               f"(refresh grant verified + rotation persisted; provenance recorded).")
+    click.echo(f"  NOTE: account-{account}/.credentials.json now holds a DEAD branch by design — "
+               f"the canonical will show snapshot_refresh_dead until healed/next relogin "
+               f"(`cus relogin {account}` when convenient; no automatic heal-back on this build).")
+    return fam
+
+
+def _audit_idle_slots(state: dict, config: dict) -> list[dict]:
+    """Flag IDLE slots that will fail (or need a launch-gate heal) on their
+    next launch (Mechanism 3d): slot has an account + a dir on disk + no live
+    session, and either its mount creds fail the DISK-ONLY shape/expiry check
+    or its recorded lease points at a family store that no longer exists
+    (retired/removed). Pure detection, zero network, no writes — surfaced in
+    `cus prune`, `cus status`, and diagnose() (gated by
+    housekeeping.flag_idle_dead_slots). Returns
+    [{"slot", "account", "problem"}, ...] (a slot may contribute two rows)."""
+    out: list[dict] = []
+    for slot_name, entry in sorted((state.get("slots") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        acct = entry.get("account")
+        if not acct:
+            continue
+        d = slot_path(slot_name)
+        if not d.exists() or mount_in_use(d):
+            continue
+        if _creds_shape_expiry_dead(mount_creds_path(d)):
+            out.append({"slot": slot_name, "account": acct,
+                        "problem": ("mount creds missing/blank with nothing to mint from — "
+                                    "will fail on next launch (the GH #190 launch gate will "
+                                    "attempt a reinstall)")})
+        lease = slot_leased_family(state, slot_name)
+        if lease and lease[0] == acct and not login_family_creds_path(*lease).exists():
+            out.append({"slot": slot_name, "account": acct,
+                        "problem": (f"leased family {lease[0]}/{lease[1]} store is "
+                                    f"missing/retired — will fail on next launch "
+                                    f"(`cus prune --execute` releases the dead lease)")})
+    return out
+
+
+def _release_dead_leases(state: dict, config: dict, *, execute: bool) -> list[str]:
+    """Release IDLE slots' leases whose family store file is missing/retired
+    (Mechanism 3e): the lease references a generation that no longer exists on
+    disk, so the next claim/launch through it can only fail — popping it lets
+    the reinstall claim a FRESH family instead. Locked slots
+    (session_locks.locked_slots) are skipped entirely — a lock is user intent,
+    and even a lease pop is a state mutation on that slot. Live slots are
+    skipped (idle-only: a live mount's lease is its session's generation
+    record, even if the store file went missing — not ours to pop under it).
+
+    Report-only unless execute=True. Note: gc_slot needs no equivalent — it
+    pops the ENTIRE slot entry on reap, lease included, so this stays a
+    prune-only pass for slots that persist while their store died.
+    Returns ["slot: account/family", ...] for each (would-be) release."""
+    released: list[str] = []
+    locked = _locked_slots(config)
+    changed = False
+    for slot_name, entry in sorted((state.get("slots") or {}).items()):
+        if not isinstance(entry, dict) or slot_name in locked:
+            continue
+        lease = slot_leased_family(state, slot_name)
+        if lease is None:
+            continue
+        d = slot_path(slot_name)
+        if d.exists() and mount_in_use(d):
+            continue
+        if login_family_creds_path(*lease).exists():
+            continue
+        released.append(f"{slot_name}: {lease[0]}/{lease[1]}")
+        if execute:
+            entry.pop("login_family", None)
+            changed = True
+            _cred_audit("housekeeping", "released-dead-lease",
+                        "idle slot's leased family store is missing/retired — popped the lease "
+                        "so the next install claims a fresh family (GH #190 prune)",
+                        slot=slot_name, account=lease[0], login_family=f"{lease[0]}/{lease[1]}")
+    if changed:
+        save_state(state)
+    return released
+
+
+def _sweep_housekeeping(state: dict, config: dict, *, no_execute: bool = False) -> list[str]:
+    """Daemon-side housekeeping sweep (Mechanism 3g) — the opt-in automation of
+    `cus prune`, mirroring the _sweep_unstale_idle_accounts/_sweep_clock_keepalive
+    house pattern (called each cycle, gates + cooldowns inside, returns
+    operator-readable lines for the daemon to echo).
+
+    DEFAULT OFF (housekeeping.daemon_sweep: False) — with the default config
+    this function returns [] having performed ZERO probes and ZERO writes.
+    When enabled: runs at most once per housekeeping.sweep_interval_hours
+    (module-level _HOUSEKEEPING_LAST_RUN), then
+      * prunes free families (retiring dead ones — unless the daemon runs
+        --no-execute, which threads through as report-only),
+      * reports the out-of-band-relogin detections (and only ACTS on them —
+        auto-reseed — if housekeeping.auto_reseed, default False),
+      * audits idle slots and reports dead leases (releasing them on execute).
+    """
+    global _HOUSEKEEPING_LAST_RUN
+    hk = config.get("housekeeping", {})
+    if not hk.get("daemon_sweep", False):
+        return []
+    now = time.time()
+    interval_s = float(hk.get("sweep_interval_hours", 6)) * 3600
+    if _HOUSEKEEPING_LAST_RUN is not None and (now - _HOUSEKEEPING_LAST_RUN) < interval_s:
+        return []
+    _HOUSEKEEPING_LAST_RUN = now
+    execute = not no_execute
+    msgs: list[str] = []
+    for row in _prune_free_families(state, config, execute=execute, probe=True):
+        if row["kind"] == "family" and row["dead"]:
+            if row["retired"]:
+                msgs.append(f"retired dead free family {row['account']}/{row['family']} "
+                            f"→ {row['retired']}")
+            else:
+                msgs.append(f"dead free family {row['account']}/{row['family']} "
+                            f"(report-only — no_execute)")
+        elif row["kind"] == "pool_depth" and row["live_free"] < row["pool_size"]:
+            msgs.append(f"{row['account']}: {row['live_free']}/{row['pool_size']} live free "
+                        f"login families — top up with `cus login-mount {row['account']}`")
+    oob = _detect_oob_relogin(state, config)
+    for cond in oob:
+        msgs.append(f"[{cond.severity}] {cond.summary} — {cond.action}")
+    if hk.get("auto_reseed", False):
+        for cond in oob:
+            fam = _reseed_family_from_canonical(cond.affected, state, config)
+            if fam:
+                msgs.append(f"auto-reseeded {cond.affected}/{fam} from canonical "
+                            f"(generation transfer — canonical dead-branched until relogin)")
+    for row in _audit_idle_slots(state, config):
+        msgs.append(f"idle slot {row['slot']} ({row['account']}): {row['problem']}")
+    for rel in _release_dead_leases(state, config, execute=execute):
+        msgs.append(("released dead lease " if execute
+                     else "dead lease (report-only — no_execute) ") + rel)
+    return msgs
 
 
 def _lane_lastvalid_path(mount_creds: Path) -> Path:
@@ -10781,6 +11282,26 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         "Provision one per account you want borrowable: `cus login-mount <account>` "
                         "(run pool_size times, then `--finish` each). Accounts without a pool still work as "
                         "today — they just can't be a rescue target."),
+                affected="system",
+            ))
+
+    # Condition 12 (GH #190 Mechanism 3d): IDLE slots whose mount creds are
+    # dead/blank on disk (or whose lease points at a retired family store).
+    # These lanes look fine in `cus status` while idle but fail — or need a
+    # launch-gate heal — the moment someone launches on them. Warnings-only and
+    # purely additive (disk-only detection, zero probes), gated by
+    # housekeeping.flag_idle_dead_slots (default True). One aggregated line so
+    # a fleet of stale idle slots doesn't drown the real alarms above.
+    if config.get("housekeeping", {}).get("flag_idle_dead_slots", True):
+        idle_flagged = _audit_idle_slots(state, config)
+        if idle_flagged:
+            names = ", ".join(sorted({f"{f['slot']} ({f['account']})" for f in idle_flagged}))
+            out.append(SOSCondition(
+                severity="warning",
+                summary=f"idle slot(s) with dead/blank mount creds: {names}",
+                action=("These idle lanes will fail (or need an in-place heal from the GH #190 "
+                        "launch gate) on their next launch. See the full report: `cus prune`; "
+                        "retire/release the dead pieces with `cus prune --execute`."),
                 affected="system",
             ))
 
@@ -13236,6 +13757,13 @@ def status() -> None:
         il_flag = il_cfg.get("use_independent_logins", False)
         il_visible = (il_flag or bool(list_provisioned_logins())
                       or any(list_login_families(a) for a in state["accounts"]))
+        # GH #190 Mechanism 3d: per-slot dead-idle markers (disk-only audit —
+        # no probes — so it's cheap enough for every status render). Gated by
+        # housekeeping.flag_idle_dead_slots (default True).
+        idle_flags: dict[str, list[str]] = {}
+        if config.get("housekeeping", {}).get("flag_idle_dead_slots", True):
+            for _f in _audit_idle_slots(state, config):
+                idle_flags.setdefault(_f["slot"], []).append(_f["problem"])
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
@@ -13268,6 +13796,10 @@ def status() -> None:
                 else:
                     login_col = click.style("  [copy]", fg="cyan")
             click.echo(f"  {d.name:<10} account={entry.get('account') or '(empty)':<12} {live_col}{lock_col}{pool_col}{login_col}{orphan}")
+            for _problem in idle_flags.get(d.name, []):
+                # One marker line per flagged idle slot (GH #190 3d): this lane
+                # will fail / need a launch-gate heal on its next launch.
+                click.echo(click.style(f"      ⚠ idle-dead: {_problem}", fg="yellow"))
         for name in sorted(set(slots_state) - seen):
             click.echo(f"  {name:<10} " + click.style("[state entry, dir missing]", fg="yellow"))
         click.echo()
@@ -14563,6 +15095,14 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         for _pinged in _sweep_clock_keepalive(state, config):
             click.echo(f"  clock-keepalive: pinged dormant account {_pinged} to start a fresh "
                        f"5h window (keeping its clock ticking for rolling capacity)")
+        # GH #190 Mechanism 3g: opt-in credential-store housekeeping (prune dead
+        # free families, OOB-relogin detection, idle-slot audit, dead-lease
+        # release). DEFAULT OFF (housekeeping.daemon_sweep: False) — with the
+        # default config this is a pure no-op (zero probes, zero writes). When
+        # on, it self-limits to once per housekeeping.sweep_interval_hours, and
+        # the daemon's --no-execute threads through as report-only.
+        for _hk in _sweep_housekeeping(state, config, no_execute=no_execute):
+            click.echo(f"  housekeeping: {_hk}")
         # GH #59: countdown fallback — for any account whose 5h reset elapsed
         # without a fresh poll this cycle, trust the countdown and infer the
         # window reset (5h→0) BEFORE the ladder-reset + decision below, so both
@@ -17042,6 +17582,96 @@ def doctor_cmd(fix_dirs: bool) -> None:
     elif not fix_dirs:
         click.echo(f"\n{total} finding(s). Re-run with --fix-dirs to heal.")
         sys.exit(1)
+
+
+@cli.command(name="prune")
+@click.option("--execute", is_flag=True,
+              help="Perform retirements/lease releases (default: REPORT-ONLY).")
+@click.option("--reseed", "reseed", default=None, metavar="ACCOUNT",
+              help="Canonical→family generation TRANSFER for one account (explicit, never "
+                   "implied): scaffolds a new login family from the canonical snapshot and "
+                   "rotates it live; the canonical is knowingly dead-branched until relogin.")
+@click.option("--no-probe", "no_probe", is_flag=True,
+              help="Shape/expiry checks only — no token-rotating refresh-grant probes.")
+def prune_cmd(execute: bool, reseed: str | None, no_probe: bool) -> None:
+    """Credential-store housekeeping (GH #190 Mechanism 3).
+
+    Report (default) or fix (--execute) the slow-rot failure modes the launch
+    gate only catches at launch time: dead FREE login families (probed and,
+    with --execute, retired to `.dead-<date>`), the out-of-band-relogin
+    signature (fresh canonical + stale dependents → points at `--reseed`),
+    idle slots whose mount creds would fail their next launch, and slot
+    leases whose family store is gone (released with --execute).
+
+    Probing is SAFE here by construction: only FREE families are ever probed
+    — a free family's token is held by nobody, so rotating it is claim-
+    verify's (#127) own discipline. Leased families (a live mount's
+    generation) are never touched. --no-probe restricts even that to
+    disk-only shape/expiry checks.
+    """
+    if not STATE_JSON.exists():
+        click.echo("Not initialized. Run `cus init` first.")
+        sys.exit(1)
+    state = load_state()
+    config = load_config()
+
+    if reseed:
+        if reseed not in state.get("accounts", {}):
+            click.echo(f"Unknown account '{reseed}'. Run `cus list`.")
+            sys.exit(1)
+        fam = _reseed_family_from_canonical(reseed, state, config)
+        sys.exit(0 if fam else 1)
+
+    rows = _prune_free_families(state, config, execute=execute, probe=not no_probe)
+    fam_rows = [r for r in rows if r["kind"] == "family"]
+    depth_rows = [r for r in rows if r["kind"] == "pool_depth"]
+    click.echo("Free login families"
+               + (" (shape/expiry only — --no-probe)" if no_probe else " (probed)") + ":")
+    if not fam_rows:
+        click.echo("  (none on disk)")
+    for r in fam_rows:
+        if not r["dead"]:
+            click.echo(f"  {r['account']}/{r['family']}: alive")
+        elif r["retired"]:
+            click.echo(click.style(
+                f"  {r['account']}/{r['family']}: DEAD — retired to {r['retired']}", fg="yellow"))
+        else:
+            click.echo(click.style(
+                f"  {r['account']}/{r['family']}: DEAD — would retire (re-run with --execute)",
+                fg="yellow"))
+    for r in depth_rows:
+        if r["live_free"] < r["pool_size"]:
+            click.echo(click.style(
+                f"  {r['account']}: {r['live_free']}/{r['pool_size']} live free families — "
+                f"top up with `cus login-mount {r['account']}`", fg="yellow"))
+
+    oob = _detect_oob_relogin(state, config)
+    if oob:
+        click.echo("\nOut-of-band relogin signature (fresh canonical, stale dependents):")
+        for cond in oob:
+            click.echo(click.style(f"  [{cond.severity}] {cond.summary} — {cond.action}",
+                                   fg="yellow"))
+
+    idle = _audit_idle_slots(state, config)
+    if idle:
+        click.echo("\nIdle slots that will fail on next launch:")
+        for row in idle:
+            click.echo(click.style(f"  {row['slot']} ({row['account']}): {row['problem']}",
+                                   fg="yellow"))
+
+    released = _release_dead_leases(state, config, execute=execute)
+    if released:
+        click.echo("\nDead leases (family store missing/retired):")
+        for rel in released:
+            click.echo(click.style(
+                f"  {'released' if execute else 'would release (re-run with --execute)'}: {rel}",
+                fg="yellow"))
+
+    if not (oob or idle or released or any(r["dead"] for r in fam_rows)):
+        click.echo(click.style("\n✓ nothing to prune", fg="green"))
+    elif not execute:
+        click.echo("\nreport-only — re-run with --execute to retire dead families / "
+                   "release dead leases.")
 
 
 @cli.command(name="sync-config")
