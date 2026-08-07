@@ -16765,7 +16765,13 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     the swap primitive itself is awkward to drive through in every branch.
 
     Verdicts:
-      - "noop"     target is already the slot's account (nothing to move).
+      - "noop"     target is already the slot's account AND its mount creds
+                   look healthy (shape/expiry check only) — nothing to move.
+      - "verify"   target is already the slot's account but its mount creds
+                   are blank/expired (GH #190): the real move liveness-probes
+                   and, if dead, retires the family lease and reinstalls from
+                   a verified source. Preview-only classification — a plan
+                   path NEVER makes the (token-rotating) grant probe.
       - "snapshot" target is NOT live on any OTHER mount, so a plain snapshot
                    copy installs cleanly — no login family needed (today's copy
                    path; the gate-off default).
@@ -16806,7 +16812,27 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
     held_elsewhere = _account_held_by_other_live_mount(state, target, slot_name, config)
     gate = independent_logins_enabled(config)
     if target == current:
-        plan, detail = "noop", f"{slot_name} is already on '{target}'"
+        # Same-account (GH #190): classify by SHAPE/EXPIRY only — NEVER probe
+        # in a plan path (the refresh grant ROTATES the token; a --dry-run must
+        # be side-effect-free). Healthy ⇒ genuine noop. Suspect ⇒ "verify": the
+        # REAL move liveness-probes and, if dead, retires the family and
+        # reinstalls from a verified source. "verify" deliberately does NOT
+        # trip the command's plan=="refuse" pre-flight — it is a heal preview,
+        # not a refusal.
+        try:
+            _same_creds = read_json(mount_creds_path(slot_path(slot_name)))
+        except (json.JSONDecodeError, OSError):
+            _same_creds = None
+        _same_exp = _creds_expires_at(_same_creds) if _same_creds is not None else None
+        if (_same_creds is not None and not _live_mount_creds_invalid(_same_creds)
+                and _same_exp is not None and int(_same_exp) > int(time.time() * 1000) - 30_000):
+            plan, detail = "noop", (
+                f"{slot_name} is already on '{target}' and creds look healthy — nothing to do")
+        else:
+            plan, detail = "verify", (
+                f"{slot_name} is already on '{target}' but creds are blank/expired — the real move "
+                f"would liveness-probe and, if dead, retire the family and reinstall from a "
+                f"verified source (GH #190)")
     elif not held_elsewhere:
         plan, detail = "snapshot", (
             f"'{target}' is not live on any other mount — a plain snapshot install, no login family needed")
@@ -16901,10 +16927,32 @@ def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> N
 
     current = (state.get("slots", {}).get(name, {}) or {}).get("account")
 
-    # Already on the target — nothing to do (say so, don't error).
+    # Already on the target — VERIFY-and-reinstall instead of a blind no-op
+    # (GH #190). `cus slot move <slot> <its-own-account>` is the operator's
+    # explicit "make this slot's creds right" gesture, so a same-account move
+    # now liveness-checks the mount: healthy ⇒ the old "nothing to do" fast
+    # return (kept FIRST, before the lock guard — a healthy no-op should never
+    # trip a lock refusal); provably DEAD ⇒ retire the slot's dead family
+    # lease and fall through to the normal move path, whose execute_swap runs
+    # a full verified reinstall (force_reinstall — same-account swaps are
+    # otherwise silent no-ops). --dry-run must NOT probe (the refresh grant
+    # ROTATES the token — a preview may not mutate credentials), so it falls
+    # through to the side-effect-free plan preview, which classifies by
+    # shape/expiry only. Deliberately NOT gated on launch_gate.enabled: this
+    # is an explicit operator command, not an automatic gate.
+    same_account_heal = False
     if account == current:
-        click.echo(f"{name} is already on '{account}', nothing to do.")
-        return
+        if not dry_run and not _slot_mount_creds_dead(name, slot_path(name), account, state, config,
+                                                      allow_probe=True):
+            click.echo(f"{name} is already on '{account}' and its creds are healthy, nothing to do.")
+            return
+        if not dry_run:
+            click.echo(click.style(
+                f"{name} is already on '{account}' but its creds are DEAD — verify-and-reinstall "
+                f"(GH #190): retiring the dead family and installing fresh", fg="yellow"))
+            _retire_slot_family_and_lease(name, account, state, config)
+            state = load_state()
+            same_account_heal = True
 
     # Lock guard: a locked slot is frozen for the daemon AND for this command
     # (locks are user intent — "this slot stays put"). --force overrides once.
@@ -16939,7 +16987,13 @@ def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> N
         sys.exit(1)
 
     try:
-        execute_swap(account, trigger="manual-slot-move", slot=name)
+        # same_account_heal (GH #190): force_reinstall bypasses only the
+        # same-account no-op early return; every install guard still applies.
+        # bump_ladder=False for a heal — reinstalling in place is not rotation
+        # churn, so the account's swap-threshold ladder must not advance.
+        execute_swap(account, trigger="manual-slot-move", slot=name,
+                     force_reinstall=same_account_heal,
+                     bump_ladder=not same_account_heal)
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         # execute_swap's OWN GH #104 pool-exhaustion refusal lands here as a
         # RuntimeError ("pool exhausted for '<acct>': ...") — surface its
