@@ -2323,6 +2323,15 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     regime that used to refuse), return the lowest-estimated-usage live
     account and let _launch_prepare route it to the join path. Returns None
     only when every account is expired/erroring (or lane_sharing is off).
+
+    Per-model (Fable) weekly gate for PLACEMENT (2026-07-14, the 03/sxe
+    incident): every tier below now excludes any account whose LAST-KNOWN
+    per-model weekly is at/over the target cap — INCLUDING a stale reading —
+    and only degrades to the least-bad (lowest last-known Fable) when NO
+    Fable-clean account exists anywhere. See the block comment at the gate
+    computation below for the full incident/why. Inert when the gate is off
+    (standard pool / unmodified installs): the capped set is empty and every
+    tier reduces to its pre-2026-07-14 form.
     """
     # Spread preference: any account a slot entry names, plus the shared active.
     spread_occupied = {e.get("account") for e in state.get("slots", {}).values() if e.get("account")}
@@ -2349,15 +2358,67 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     # filters, so they need the exclusion explicitly (2026-07-03).
     disabled = _disabled_accounts(config)
 
+    # ---- Placement-side per-model (Fable) weekly gate (2026-07-14) ----
+    # Incident (the 03/sxe mis-placements, 2026-07-14): new sessions launched
+    # while nearly every account sat at Fable 88–100% kept landing on account
+    # `03`, whose Fable weekly was MAXED at 100% (past cap_pct 97 / target_cap
+    # 95), and each immediately hit "You've reached your Fable 5 limit" (slots
+    # 2, 8, 13, 14 in one day). Two gaps conspired:
+    #
+    #   1. The SWAP path was gated but PLACEMENT wasn't. pick_swap_target grew
+    #      a HARD per-model target filter on 2026-07-05 (see its Fable-gate
+    #      block), but this picker's RAW fallback tiers below bypass
+    #      pick_swap_target entirely — so when the shimmed picker correctly
+    #      HELD (every non-occupied candidate Fable-capped), the raw
+    #      "lowest estimated usage" fallback re-admitted the capped account
+    #      and placed the new session on it anyway. `03` was simply the one
+    #      account no slot occupied, so the spread preference funneled every
+    #      launch straight onto it, 5h/occupancy-optimal and Fable-dead.
+    #   2. A STALE reading BYPASSED the gate even on the shimmed path.
+    #      _max_model_weekly_from_acct's stale-guard (2026-07-05) reads a
+    #      token_stale/unobservable account's per-model as 0.0 — right for
+    #      swap-target selection (never refuse a target on a number we
+    #      couldn't reconfirm; the lane holds and retries next cycle), but
+    #      WRONG for placement: a new session routed onto an account whose
+    #      last-known Fable is ≥ cap lands on a maxed account if the stale
+    #      number was in fact still true, and there is no "current account"
+    #      to hold on. Placement therefore treats stale-high as EXCLUDED
+    #      (trust_stale=True reads the last-known number regardless of
+    #      staleness); _launch_prepare's verify loop force-polls the final
+    #      pick anyway, so a genuinely-recovered account re-enters rotation
+    #      as soon as any poll reconfirms it below cap.
+    #
+    # Degradation matches the picker's existing DEGRADED pattern: when NO
+    # Fable-clean account exists anywhere (genuine fleet-wide saturation),
+    # the least-bad tier at the bottom picks the LOWEST last-known Fable
+    # rather than refusing to place (or, pre-fix, silently picking the maxed
+    # one), and annotates the reason so `cus decisions` shows the degradation.
+    # Gate off ⇒ fable_capped is empty ⇒ every tier is byte-identical to its
+    # pre-fix form (the _max_model_weekly_from_acct(...)==0.0 property holds).
+    gate_enabled, _ = _per_model_weekly_gate(config)
+    model_cap = _model_weekly_target_cap_for_config(config)
+    fable_capped: set = set()
+    if gate_enabled:
+        fable_capped = {n for n, a in state.get("accounts", {}).items()
+                        if _max_model_weekly_from_acct(a, config, trust_stale=True) >= model_cap}
+
     # First: spread across all mounts. Fallback: allow reusing idle-slot
-    # accounts, but still never a live-mount account.
-    target = _try(spread_occupied) or _try(live_occupied)
+    # accounts, but still never a live-mount account. Fable-capped accounts
+    # (last-known, stale included — see the gate block above) are excluded
+    # from BOTH shims so neither the picker's scoring nor its own stale-guard
+    # can route a new session onto one; the least-bad tier at the bottom is
+    # the only re-admission path, and it annotates.
+    target = _try(spread_occupied | fable_capped) or _try(live_occupied | fable_capped)
     if target is None:
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
                  if not a.get("token_expired") and not a.get("poll_error")
                  and n not in live_occupied and n not in disabled]
-        if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+        # Placement Fable gate (2026-07-14): this raw fallback bypasses
+        # pick_swap_target, so it must apply the model-cap exclusion itself
+        # (same reasoning as the explicit `disabled` exclusion above).
+        clean = [(n, a) for n, a in cands if n not in fable_capped]
+        if clean:
+            n, _ = min(clean, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="launch fallback: lowest estimated usage")
     # Lane-share final fallback (GH #109 lanes, 2026-07-03): every healthy
     # account is on a live mount. Joining a live mount is safe (shared dir,
@@ -2368,9 +2429,39 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
         cands = [(n, a) for n, a in state.get("accounts", {}).items()
                  if not a.get("token_expired") and not a.get("poll_error")
                  and n in live_occupied and n not in disabled]
-        if cands:
-            n, _ = min(cands, key=lambda p: _account_estimated_effective_pct(p[1], config))
+        clean = [(n, a) for n, a in cands if n not in fable_capped]
+        if clean:
+            n, _ = min(clean, key=lambda p: _account_estimated_effective_pct(p[1], config))
             target = SwapTarget(name=n, reason="lane-share fallback: all healthy accounts on live mounts; joining lowest-usage lane")
+    # Least-bad DEGRADED tier (2026-07-14): every healthy, reachable account is
+    # Fable-capped on its last-known reading — genuine fleet-wide saturation
+    # (the live 03/sxe fleet shape: Fab 88–100 everywhere). Refusing to place
+    # would leave `cus launch auto` dead, so land on the LOWEST last-known
+    # Fable (secondary: prefer a free mount over a lane-join, then lowest
+    # estimated aggregate) and say so — the honest outcome vs silently picking
+    # the maxed one. Only reachable when the gate is on AND some account was
+    # excluded above, so gate-off installs never enter it.
+    if target is None and fable_capped:
+        # ("least_bad", not "pool" — that word means premium/standard here.)
+        least_bad: list[tuple[str, dict, bool]] = [
+            (n, a, False) for n, a in state.get("accounts", {}).items()
+            if not a.get("token_expired") and not a.get("poll_error")
+            and n not in live_occupied and n not in disabled]
+        if config.get("per_session", {}).get("lane_sharing", False):
+            least_bad += [(n, a, True) for n, a in state.get("accounts", {}).items()
+                          if not a.get("token_expired") and not a.get("poll_error")
+                          and n in live_occupied and n not in disabled]
+        if least_bad:
+            n, a, _live = min(least_bad, key=lambda p: (
+                _max_model_weekly_from_acct(p[1], config, trust_stale=True),
+                p[2],  # tie: a free mount beats joining a live lane
+                _account_estimated_effective_pct(p[1], config)))
+            target = SwapTarget(
+                name=n,
+                reason=(f"launch fallback: lowest last-known per-model weekly "
+                        f"({_max_model_weekly_from_acct(a, config, trust_stale=True):.0f}%) "
+                        f"[DEGRADED: no account below per-model weekly cap {model_cap:.0f}% — "
+                        f"fleet-wide Fable saturation]"))
     return target
 
 
@@ -3955,7 +4046,8 @@ def _max_model_weekly_from_usage(usage: AccountUsage, config: dict) -> float:
     return max(vals) if vals else 0.0
 
 
-def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
+def _max_model_weekly_from_acct(acct: dict, config: dict,
+                                trust_stale: bool = False) -> float:
     """Dict-level twin of _max_model_weekly_from_usage — reads the persisted
     per_model_weekly_pct from state.json. Used to fold per-model weekly caps
     into swap-target selection (_account_effective_pct).
@@ -3981,6 +4073,20 @@ def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
     for a token_stale account (its AccountUsage this cycle is empty), so a stale
     per-model can never force a live lane OFF an account. This guard only closes
     the CACHED-dict path used by target selection / the pingpong guard.
+
+    Annotation 2026-07-14 (`trust_stale`, the 03/sxe placement incident): the
+    stale-guard's "unknown reads 0.0" direction is correct for SWAP-target
+    selection (never refuse a target on a number we couldn't reconfirm — a lane
+    holding elsewhere still works), but it is EXACTLY BACKWARDS for PLACEMENT
+    (`pick_launch_account`): routing a brand-new session onto an account whose
+    LAST-KNOWN Fable is at/over cap — stale or not — lands it on a maxed
+    account and it 429s on its first Fable request (that's strictly worse than
+    any alternative placement, and there is no "current account to hold on").
+    Placement callers pass `trust_stale=True` to read the last-known per-model
+    number REGARDLESS of staleness flags, treating stale-high as excluded-until-
+    reconfirmed. Default False keeps every pre-existing (swap-side) call site
+    byte-identical, and the gate-off short-circuit above still returns 0.0
+    either way, so unmodified installs see no change.
     """
     enabled, allow = _per_model_weekly_gate(config)
     pm = acct.get("per_model_weekly_pct") or {}
@@ -3988,7 +4094,8 @@ def _max_model_weekly_from_acct(acct: dict, config: dict) -> float:
         return 0.0
     # Per-model shares the 7d window's staleness: if we can't trust current_7d
     # for this account, we can't trust its per-model weekly numbers either.
-    if _pct_is_unknown(acct, "current_7d_pct"):
+    # (Placement callers opt OUT via trust_stale — see the 2026-07-14 annotation.)
+    if not trust_stale and _pct_is_unknown(acct, "current_7d_pct"):
         return 0.0
     vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
     return max(vals) if vals else 0.0
@@ -8801,6 +8908,207 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
     return False
 
 
+def heal_snapshot_from_live_family(account: str, state: dict, config: dict | None = None,
+                                   *, no_execute: bool = False) -> bool:
+    """REPAIR a refresh-DEAD canonical snapshot by copying creds from a
+    verified-valid login family — even one currently LEASED to a live lane.
+    The #186 repair (2026-07-14, rayi2 incident). Returns True iff the account
+    is healed (or was found already-healed) and `snapshot_refresh_dead` cleared.
+
+    THE DIVERGENCE THIS FIXES (#104/#109): Anthropic's OAuth refresh tokens are
+    SINGLE-USE — every successful refresh grant kills the presented token and
+    issues a new one. An account's canonical snapshot
+    (`account-<name>/.credentials.json`) and its pooled login families
+    (`logins/<name>/family-N/.credentials.json`) are therefore independent
+    token FAMILIES that rotate apart the moment anything refreshes one of
+    them. When the canonical's own branch is rotated away / revoked, its
+    refresh grant returns invalid_grant and the un-stale sweep /
+    `_account_snapshot_dead` flag it `snapshot_refresh_dead` — even while one
+    or more LIVE lanes keep working fine on their leased families.
+
+    WHY PR #177 (`op=snapshot-dead-family-fallback`, merged 29ffac4) WASN'T
+    ENOUGH: that fix only works AROUND the dead snapshot at the swap
+    install-point — when placing a NEW lane it seeds from a FREE (unclaimed)
+    family instead of installing the dead canonical. It never repairs the
+    canonical itself, and it needs a family no live lane has leased. So when
+    ALL of an account's families are in-use (rayi2, 2026-07-14: family-1/2/3
+    all leased by live lanes), the canonical stays dead and the persistent
+    URGENT SOS ("snapshot creds are dead and no valid login family remains —
+    relogin required") fires forever, even though the account is healthy. A
+    human fixed rayi2 by hand-copying a live family's creds over the canonical
+    — this function is that exact repair, automated (user directive: reseed
+    from the live family, NOT a relogin).
+
+    HOW A LEASED FAMILY CAN BE A SAFE SOURCE: the daemon's periodic save-back
+    (`saveback_mount_credentials`) routes each lane's live creds back into its
+    LEASED family store, so an in-use family's store mirrors a token pair that
+    is authenticating RIGHT NOW. A future-dated `expiresAt` on the store is
+    the "verified-valid" bar here — the same cheap valid-access-token test
+    `_account_snapshot_dead` uses to declare a snapshot not-dead.
+
+    WHY WE NEVER FIRE A REFRESH-GRANT PROBE ON A LEASED FAMILY: the grant is
+    single-use. If the store still holds the lane's CURRENT refresh token, a
+    "verification" grant would consume it and log the live lane out at its
+    next refresh — the exact credential-death cascade of the 2026-07-10
+    incident (three canonical tokens killed by aggressive probing during
+    Fable saturation). Freshness-by-expiresAt verifies without rotating.
+
+    KNOWN LIMITATION (flagged for the operator, not solved here): after the
+    heal, the canonical and the source family SHARE one refresh token until
+    the lane next rotates it — then the canonical's copy is stale again
+    (its access token still works until expiry, and a later heal pass just
+    re-syncs from the save-back-fresh store). Corollary: token-rotating
+    probes on a just-healed canonical (`_account_snapshot_dead`,
+    `_unstale_account_snapshot`) could consume the shared token; the cleared
+    flags plus the fresh access token keep those probes on their cheap
+    non-rotating paths in the common case.
+
+    Conservative by contract: only acts when the account is genuinely flagged
+    `snapshot_refresh_dead`; never blanks the canonical (the old file is
+    backed up via `backup_credentials_file` first, restorable with
+    `cus restore-creds`); never deletes or rewrites a family store; never
+    raises into the caller."""
+    cfg = config if config is not None else load_config()
+    # Hot-read opt-out, mirroring verify_family_on_claim's inline-default style.
+    if not cfg.get("independent_logins", {}).get("heal_snapshot_from_family", True):
+        return False
+    acct = state.get("accounts", {}).get(account) if isinstance(state, dict) else None
+    if not isinstance(acct, dict) or not acct.get("snapshot_refresh_dead"):
+        return False  # nothing flagged dead — not this repair's case
+    snap = account_creds_path(account)
+    now_ms = int(time.time() * 1000)
+
+    # Already-healed cheap path: the canonical carries a currently-valid access
+    # token (a prior heal / relogin landed but the flag-clear never persisted —
+    # e.g. the sweep ran on a state copy that was never saved). Just clear the
+    # stale flag; re-copying would only churn backups. Same 30s expiry grace as
+    # `_account_snapshot_dead`'s cheap path so the two predicates agree.
+    try:
+        cur = read_json(snap) if snap.exists() else None
+    except (json.JSONDecodeError, OSError):
+        cur = None
+    if isinstance(cur, dict):
+        cur_oauth = cur.get("claudeAiOauth")
+        cur_access = cur_oauth.get("accessToken") if isinstance(cur_oauth, dict) else None
+        cur_exp = _creds_expires_at(cur)
+        if (isinstance(cur_access, str) and cur_access.strip()
+                and cur_exp is not None and int(cur_exp) > now_ms - 30_000):
+            acct.pop("snapshot_refresh_dead", None)
+            acct["token_expired"] = False
+            _SNAPSHOT_DEAD_PROBE.pop(account, None)
+            _cred_audit("snapshot-heal-from-live-family", "cleared-flag",
+                        "canonical snapshot already carries a currently-valid access token — "
+                        "cleared the stale snapshot_refresh_dead flag (no copy needed)",
+                        account=account, token_fp=_audit_token_fp(cur))
+            return True
+
+    # Candidate selection: every USABLE family (parseable creds + refresh token —
+    # list_login_families' bar), leased OR free, whose access token is valid NOW
+    # (future expiresAt = save-back-fresh, see docstring). Prefer the LATEST
+    # expiresAt: the most recently refreshed store is the least likely to have
+    # been rotated past by its lane since the last save-back.
+    best: tuple[int, str, dict] | None = None  # (expiresAt, family_id, creds)
+    for fam in list_login_families(account):
+        fam_path = login_family_creds_path(account, fam)
+        try:
+            fam_creds = read_json(fam_path)
+        except (json.JSONDecodeError, OSError):
+            continue  # unreadable store; next family
+        if _credential_refresh_token(fam_creds) is None:
+            continue  # nothing to inherit a refresh branch from
+        fam_oauth = fam_creds.get("claudeAiOauth")
+        fam_access = fam_oauth.get("accessToken") if isinstance(fam_oauth, dict) else None
+        fam_exp = _creds_expires_at(fam_creds)
+        if not (isinstance(fam_access, str) and fam_access.strip()):
+            continue
+        if fam_exp is None or int(fam_exp) <= now_ms:
+            # Expired store: could be a lane that rotated past it, could be dead.
+            # Only a refresh grant could tell — and firing one on a possibly-leased
+            # family risks the live lane's token (see docstring). Skip.
+            continue
+        if best is None or int(fam_exp) > best[0]:
+            best = (int(fam_exp), fam, fam_creds)
+
+    if best is None:
+        _cred_audit("snapshot-heal-from-live-family", "refused-no-source",
+                    "canonical snapshot is DEAD and no login family store carries a "
+                    "currently-valid access token to heal from — genuine relogin needed",
+                    account=account)
+        return False
+    best_exp, src_fam, src_creds = best
+
+    if no_execute:
+        click.echo(f"  (--no-execute) would heal '{account}' canonical snapshot from live "
+                   f"login family {account}/{src_fam} (#186)")
+        return False  # dry-run: leave the flag + SOS reflecting on-disk reality
+
+    try:
+        # Same choke-point discipline as every other canonical write: timestamped
+        # backup first (restorable via `cus restore-creds`), then an ATOMIC
+        # whole-file copy — the family store file has the exact .credentials.json
+        # shape, so a byte-copy preserves any sibling fields untouched.
+        backup_credentials_file(snap)
+        atomic_copy(login_family_creds_path(account, src_fam), snap, mode=0o600)
+    except OSError as e:
+        _cred_audit("snapshot-heal-from-live-family", "failed",
+                    f"backup/copy into canonical snapshot failed: {e}",
+                    account=account, login_family=f"{account}/{src_fam}")
+        return False
+
+    # Clear the death flags in state (caller persists) + the probe cooldown cache,
+    # so `_account_snapshot_dead` re-evaluates the now-fresh snapshot instead of
+    # serving its cached is-dead verdict for the rest of the cooldown window.
+    acct.pop("snapshot_refresh_dead", None)
+    acct.pop("token_stale", None)
+    acct["token_expired"] = False
+    _SNAPSHOT_DEAD_PROBE.pop(account, None)
+    _cred_audit("snapshot-heal-from-live-family", "healed",
+                "canonical snapshot refresh token was DEAD (invalid_grant) — repaired by "
+                "copying a save-back-fresh live login family's creds over it (#186, rayi2 "
+                "2026-07-14); old snapshot backed up",
+                account=account, login_family=f"{account}/{src_fam}",
+                token_fp=_audit_token_fp(src_creds),
+                extra=f"new_expiry={_expiry_repr(src_creds)}")
+    click.echo(f"snapshot-heal: '{account}' canonical snapshot was DEAD — healed from live "
+               f"login family {account}/{src_fam} (backup kept; relogin no longer needed)")
+    return True
+
+
+def _sweep_heal_dead_snapshots(state: dict, config: dict, *, no_execute: bool = False) -> list[str]:
+    """Each SOS-emit pass, auto-repair every account stuck in the "dead snapshot,
+    no free family" state BEFORE diagnose() alarms on it (#186, 2026-07-14).
+
+    Scope matches diagnose() Condition 10.6 exactly: `snapshot_refresh_dead` AND
+    no FREE login family. An account WITH a free family is deliberately left
+    alone — the #177 install-point fallback still seeds new lanes from that free
+    family, no SOS fires, and skipping it keeps this sweep's writes to the one
+    genuinely stuck case. On any heal the state is saved immediately (mirroring
+    the reactive path's mid-cycle save) so the flag-clear survives even the
+    _emit_sos_after call sites that pass a freshly-loaded state copy the caller
+    never persists. Per-account failures only log — never crash the SOS funnel.
+    Returns the healed account names."""
+    healed: list[str] = []
+    for name, acct in list(state.get("accounts", {}).items()):
+        if not isinstance(acct, dict) or not acct.get("snapshot_refresh_dead"):
+            continue
+        if has_free_login_family(name, state):
+            continue  # #177 fallback still covers it; no SOS would fire
+        try:
+            if heal_snapshot_from_live_family(name, state, config, no_execute=no_execute):
+                healed.append(name)
+        except Exception as e:  # noqa: BLE001 — a heal bug must not kill SOS emission
+            click.echo(f"  snapshot-heal: unexpected error healing '{name}': {e}")
+    if healed and not no_execute:
+        try:
+            save_state(state)
+        except OSError as e:
+            # The heal itself is durable on disk (the copied snapshot); a failed
+            # state save only delays the flag-clear until the next successful
+            # inactive-account poll clears it via the normal Branch-4 path.
+            click.echo(f"  snapshot-heal: state save failed ({e}) — flag clears on next poll")
+    return healed
+
+
 def _lane_lastvalid_path(mount_creds: Path) -> Path:
     """Path of a lane mount's last-known-valid SHADOW copy (Fix 3, 2026-07-07).
 
@@ -10443,6 +10751,16 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # the operator reloginss before the account silently drops out of rotation. An
     # account that is dead-snapshot but HAS a free family is deliberately NOT alarmed
     # here — the install-point seeds new lanes from the family, so it's still usable.
+    #
+    # Annotation 2026-07-14 (#186, rayi2 incident): the daemon now attempts
+    # `heal_snapshot_from_live_family` (via `_sweep_heal_dead_snapshots` in
+    # _emit_sos_after, BEFORE this diagnose runs) — repairing the canonical from a
+    # save-back-fresh LEASED family, the case #177's free-family-only fallback
+    # couldn't touch. So by the time this condition fires, the auto-heal already
+    # failed (no family store holds a currently-valid token) and a browser relogin
+    # genuinely is the only fix left. diagnose() itself stays side-effect-free
+    # (it is also called from the statusline and `cus sos`, where concurrent
+    # heals would race), so the heal lives in the daemon funnel, not here.
     for acct_name, acct in state.get("accounts", {}).items():
         if not isinstance(acct, dict):
             continue
@@ -14218,6 +14536,18 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         # diagnose(), so a healable lane never surfaces as an URGENT SOS. No-op in
         # global mode / when no lane is blanked.
         _auto_heal_live_lanes(state, config, no_execute=no_execute)
+        # #186 (2026-07-14 rayi2 incident): heal a refresh-DEAD canonical snapshot
+        # from a verified-valid LIVE login family BEFORE diagnose() — the same
+        # heal-then-diagnose funnel discipline as the mount/lane heals above, so a
+        # healable dead snapshot never reaches the operator as the persistent
+        # URGENT "snapshot creds are dead and no valid login family remains —
+        # relogin required" (diagnose Condition 10.6). Only an account with NO
+        # save-back-fresh family store falls through to that SOS (a genuine
+        # relogin case). See heal_snapshot_from_live_family for the #104/#109
+        # divergence story and why #177's free-family fallback couldn't fix this.
+        for _healed in _sweep_heal_dead_snapshots(state, config, no_execute=no_execute):
+            click.echo(f"  snapshot-heal: repaired '{_healed}' canonical snapshot from a live "
+                       f"login family (#186) — snapshot_refresh_dead cleared, SOS averted")
         conditions = diagnose(state, config)
         # PRE-EMPTIVE creds-health early-warning (2026-07-06): AFTER the reactive
         # auto-heals above (so a just-healed mount reads valid, not near-blank) and
