@@ -199,6 +199,25 @@ USAGE_API_BETA = os.environ.get("CUS_USAGE_BETA", "oauth-2025-04-20")
 USAGE_API_TIMEOUT_SECONDS = 10
 USAGE_API_RESPONSE_LIMIT_BYTES = 256 * 1024
 
+# Anthropic OAuth PROFILE endpoint — the subscription_guard's disambiguation
+# probe (2026-08-07, rayi5/rayi6 subscription-cancellation incident). WHY it
+# exists: when an account's Claude subscription ENDS (operator cancels; the org
+# is left "claude_free"), the USAGE endpoint above starts returning a GENERIC
+# HTTP 429 `rate_limit_error` — byte-identical to a real transient rate limit —
+# so cus classified dead-subscription accounts as merely `rate_limited` and
+# kept launching lanes onto them, each opening straight into "Your organization
+# has disabled Claude subscription access for Claude Code". The PROFILE
+# endpoint is the one place the truth is machine-readable: it keeps returning
+# HTTP 200 for such accounts (auth still valid — the #190 refresh-grant
+# liveness probe passes too, which is why that gate can't catch this) with
+# `organization.subscription_status: "canceled"`, `organization_type:
+# "claude_free"` and `account.has_claude_max/has_claude_pro: false`. Verified
+# live 2026-08-07 against rayi5 (canceled) vs rayi1 (active). Costs no usage
+# quota (it's an account-metadata read, not a model request) and is only hit
+# from the 429 poll branch, cooldown-bounded. Env-overridable like its
+# siblings, and so tests can point it at a stub.
+PROFILE_API_URL = os.environ.get("CUS_PROFILE_ENDPOINT", "https://api.anthropic.com/api/oauth/profile")
+
 # Anthropic messages endpoint — the clock_keepalive ping (2026-07-07) POSTs the
 # smallest possible model request here to START/keep an account's 5h usage
 # window ticking (see DEFAULT_CONFIG["clock_keepalive"] for the full WHY). We
@@ -478,6 +497,50 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # `cus status` + `cus sos`. Detection is DISK-ONLY (shape/expiry, no
         # probes), so it is safe to default ON; set False to silence.
         "flag_idle_dead_slots": True,
+    },
+    # Subscription-ended (org-disabled) auto-detection + auto-exclusion
+    # (2026-08-07, the rayi5/rayi6 cancellation incident). WHEN A CLAUDE
+    # SUBSCRIPTION ENDS the usage endpoint starts answering with a GENERIC 429
+    # (`rate_limit_error` — see PROFILE_API_URL's block comment for the live
+    # evidence), so cus read dead-subscription accounts as merely
+    # `rate_limited` — a SOFT condition that left them in the launch rotation
+    # (`pick_launch_account`'s raw fallbacks don't filter rate_limited at all)
+    # and new lanes kept landing on them, each immediately walled with "Your
+    # organization has disabled Claude subscription access for Claude Code".
+    # The operator had to notice and hand-run `cus disable` per account.
+    #
+    # With this guard ON, every 429 poll is disambiguated via one cooldown-
+    # bounded GET of the OAuth PROFILE endpoint (still 200 for these accounts;
+    # `subscription_status: "canceled"` + `organization_type: "claude_free"`
+    # is the definitive signature). A positive match flags the account
+    # `subscription_disabled` in state.json and auto-excludes it from ALL
+    # placement — swap targets, launch picks and their raw fallbacks — with
+    # the same hard, no-fallback semantics as an operator `cus disable`
+    # (see _disabled_accounts). The flag self-heals: any later SUCCESSFUL
+    # usage poll (subscription renewed) clears it, as does a probe that comes
+    # back "active". Nothing is deleted from config — exclusion is a state
+    # flag, reversible by renewal or `subscription_guard.enabled: false`.
+    #
+    # DEFAULT ON — justified three ways: (1) a subscription-disabled account is
+    # DEFINITIVELY unusable for Claude Code (every lane placed on it opens
+    # logged-out — there is no workload that succeeds); (2) detection requires
+    # the profile endpoint's explicit canceled+free signature and fails OPEN
+    # ("unknown"/network/schema-drift → classified plain rate_limited, exactly
+    # the old behavior); (3) it is backward-compatible in effect — the only
+    # behavior change is that accounts which would GUARANTEE a dead launch
+    # stop being picked. Deep-merge means absent keys = these defaults.
+    "subscription_guard": {
+        # Master gate. False ⇒ no profile probes, no auto-exclusion, and any
+        # lingering `subscription_disabled` state flags are IGNORED by the
+        # pickers/SOS (read-time gating, so flipping the config off restores
+        # pre-guard behavior without a state cleanup).
+        "enabled": True,
+        # At most one profile probe per account per this many minutes (module-
+        # level cache, mirrors launch_gate.probe_cooldown_minutes). The probe
+        # only fires on 429 polls, which are already exponential-backoff
+        # throttled, so this is belt-and-suspenders against hammering the
+        # profile endpoint during a fleet-wide real rate-limit storm.
+        "probe_cooldown_minutes": 30,
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -1184,6 +1247,13 @@ class AccountUsage:
       - poll_error: some other transport/parse failure.
       - token_expired: 401 response WITH a non-expired stored access token
         — means refresh-token-level failure, needs interactive re-login.
+      - subscription_disabled (2026-08-07, orthogonal to the above — it rides
+        ALONG WITH rate_limited, not instead of it): the 429 was disambiguated
+        by the OAuth profile probe as "this org's Claude subscription ENDED"
+        (subscription_status canceled + claude_free org). Auth still works
+        (profile 200s, refresh grants pass), usage is what's gone — so this is
+        NOT token_expired, and unlike rate_limited it never self-resolves by
+        waiting. See DEFAULT_CONFIG["subscription_guard"].
     """
     five_hour: UsageWindow | None = None
     seven_day: UsageWindow | None = None
@@ -1197,6 +1267,10 @@ class AccountUsage:
     per_model_weekly: dict = field(default_factory=dict)  # {display_name: UsageWindow}
     token_expired: bool = False
     token_stale: bool = False
+    # Set (alongside raw["rate_limited"]) when the subscription_guard's profile
+    # probe positively identified the 429 as a subscription-ended org. Default
+    # False keeps every existing constructor call-site backward-compatible.
+    subscription_disabled: bool = False
     polled_at: str = field(default_factory=now_iso)
     raw: dict = field(default_factory=dict)
 
@@ -2425,7 +2499,11 @@ def pick_launch_account(state: dict, config: dict) -> "SwapTarget | None":
     # Operator-disabled accounts are out of rotation for launches too — and
     # these two raw fallbacks below BYPASS pick_swap_target's universal
     # filters, so they need the exclusion explicitly (2026-07-03).
-    disabled = _disabled_accounts(config)
+    # `state` is passed so subscription-ended accounts (auto-flagged by the
+    # 2026-08-07 guard) are excluded from the raw fallbacks too — before the
+    # guard, a dead-subscription account read as merely rate_limited, which
+    # these fallbacks don't filter, so new lanes kept landing on it.
+    disabled = _disabled_accounts(config, state)
 
     # ---- Placement-side per-model (Fable) weekly gate (2026-07-14) ----
     # Incident (the 03/sxe mis-placements, 2026-07-14): new sessions launched
@@ -3947,6 +4025,125 @@ def _sweep_clock_keepalive(state: dict, config: dict) -> list[str]:
     return pinged
 
 
+# --------------------------------------------------------------------------
+# Subscription-ended (org-disabled) detection — see DEFAULT_CONFIG["subscription_guard"]
+# --------------------------------------------------------------------------
+
+# Per-account cooldown cache for the profile probe: {account: (monotonic_ts,
+# verdict, detail)}. Module-level (process-lifetime) like the launch gate's
+# probe cooldown — the daemon is long-lived, and a CLI one-shot at worst
+# re-probes once, which is exactly one cheap metadata GET.
+_SUBSCRIPTION_PROBE_CACHE: dict[str, tuple[float, str, dict]] = {}
+
+
+def _reset_subscription_probe_cache() -> None:
+    """Test hook (mirrors _reset_blank_tracking) — clears the probe cooldown."""
+    _SUBSCRIPTION_PROBE_CACHE.clear()
+
+
+def _subscription_guard_enabled(config: dict) -> bool:
+    """Master gate for subscription-ended auto-detection AND auto-exclusion.
+
+    Read at BOTH the detection point (poll) and every read point (pickers,
+    SOS, displays) so flipping it off restores pre-guard behavior even while
+    stale `subscription_disabled` flags linger in state.json."""
+    return bool(config.get("subscription_guard", {}).get("enabled", True))
+
+
+def _profile_says_subscription_disabled(profile: dict) -> tuple[bool, dict]:
+    """Pure classifier over an OAuth-profile response body: is this account's
+    Claude subscription ENDED (org-disabled for Claude Code)?
+
+    Returns (disabled, detail) where detail carries the fields worth logging.
+
+    DELIBERATELY CONSERVATIVE — requires the full observed dead signature
+    (rayi5, captured live 2026-08-07):
+      account.has_claude_max == false AND account.has_claude_pro == false
+      AND organization.organization_type == "claude_free"
+    and additionally treats any org with a seat_tier (team/enterprise seat —
+    not a personal subscription org) as ACTIVE. Anything ambiguous — missing
+    keys, schema drift, an org type we've never seen — classifies as NOT
+    disabled, so a profile-API reshape can only ever fail OPEN (account stays
+    plain rate_limited, the pre-guard behavior), never wrongly exclude a
+    healthy account.
+    """
+    acct = profile.get("account") if isinstance(profile.get("account"), dict) else {}
+    org = profile.get("organization") if isinstance(profile.get("organization"), dict) else {}
+    detail = {
+        "subscription_status": org.get("subscription_status"),
+        "organization_type": org.get("organization_type"),
+        "billing_type": org.get("billing_type"),
+        "has_claude_max": acct.get("has_claude_max"),
+        "has_claude_pro": acct.get("has_claude_pro"),
+    }
+    if acct.get("has_claude_max") or acct.get("has_claude_pro"):
+        return False, detail          # an active personal subscription exists
+    if org.get("seat_tier"):
+        return False, detail          # team/enterprise seat — out of scope
+    # Explicit-negative requirement: the keys must be PRESENT and say "free".
+    # `.get(...) is False` (not `not .get(...)`) so an absent key ≠ a negative.
+    if (acct.get("has_claude_max") is False
+            and acct.get("has_claude_pro") is False
+            and org.get("organization_type") == "claude_free"):
+        return True, detail
+    return False, detail
+
+
+def _probe_subscription_profile(token: str) -> tuple[str, dict]:
+    """One GET of the OAuth profile endpoint with `token`.
+
+    Returns (verdict, detail): "disabled" | "active" | "unknown". "unknown" on
+    ANY failure (network, non-200, parse, oversized) — the caller must treat
+    unknown as fail-open (keep the plain rate_limited classification).
+    """
+    req = urllib.request.Request(
+        PROFILE_API_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": USAGE_API_BETA,
+            "Accept": "application/json",
+            "User-Agent": "claude-usage-swap/0.1 (+https://github.com/rayistern/claude-usage-swap)",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=USAGE_API_TIMEOUT_SECONDS) as resp:
+            body = resp.read(USAGE_API_RESPONSE_LIMIT_BYTES + 1)
+            if len(body) > USAGE_API_RESPONSE_LIMIT_BYTES:
+                return "unknown", {}
+            data = json.loads(body.decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        # urllib.error.HTTPError subclasses URLError, so non-200s land here too.
+        return "unknown", {}
+    if not isinstance(data, dict):
+        return "unknown", {}
+    disabled, detail = _profile_says_subscription_disabled(data)
+    return ("disabled" if disabled else "active"), detail
+
+
+def _subscription_probe_verdict(account_name: str, token: str,
+                                config: dict | None = None) -> tuple[str, dict]:
+    """Config-gated + cooldown-cached wrapper around the profile probe.
+
+    Returns (verdict, detail) with verdict "disabled" | "active" | "unknown"
+    | "off" (guard disabled). All verdicts (including "unknown") are cached
+    for subscription_guard.probe_cooldown_minutes so a 429 storm across many
+    polls costs at most one profile GET per account per window.
+    """
+    config = config if config is not None else load_config()
+    if not _subscription_guard_enabled(config):
+        return "off", {}
+    cooldown_s = float(config.get("subscription_guard", {})
+                       .get("probe_cooldown_minutes", 30)) * 60.0
+    now = time.monotonic()
+    cached = _SUBSCRIPTION_PROBE_CACHE.get(account_name)
+    if cached is not None and (now - cached[0]) < cooldown_s:
+        return cached[1], cached[2]
+    verdict, detail = _probe_subscription_profile(token)
+    _SUBSCRIPTION_PROBE_CACHE[account_name] = (now, verdict, detail)
+    return verdict, detail
+
+
 def poll_account_usage(account_name: str) -> AccountUsage:
     """Query the Anthropic OAuth usage endpoint for one account.
 
@@ -4045,6 +4242,20 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             # 100% / 100% even when the real values were known to be lower
             # from the prior successful poll. See GH issue tracking this.
             u.raw = {"error": f"HTTP 429 (rate_limited): {body_preview}", "rate_limited": True}
+            # ---- subscription_guard disambiguation (2026-08-07) ----
+            # A subscription-ENDED org answers this endpoint with the exact
+            # same generic 429 as a real rate limit (verified live: rayi5).
+            # One cooldown-bounded profile probe tells them apart; a positive
+            # "disabled" upgrade makes update_state_with_usage auto-exclude
+            # the account from rotation. "active"/"unknown"/"off" leave this
+            # branch byte-identical to its pre-guard behavior (fail open).
+            verdict, sub_detail = _subscription_probe_verdict(account_name, token)
+            u.raw["subscription_probe"] = verdict
+            if verdict == "disabled":
+                u.subscription_disabled = True
+                u.raw["subscription"] = sub_detail
+            elif verdict == "active":
+                u.raw["subscription"] = sub_detail
         else:
             u.raw = {"error": f"HTTP {e.code}: {body_preview}"}
         return u
@@ -4599,7 +4810,21 @@ def _target_would_immediately_re_trip(acct: dict, config: dict) -> bool:
     return _account_estimated_effective_pct(acct, config) >= cfg_steps[0]
 
 
-def _disabled_accounts(config: dict) -> set:
+def _subscription_dead_accounts(state: dict, config: dict) -> set:
+    """Accounts auto-flagged `subscription_disabled` in state.json by the poll
+    layer's profile probe (2026-08-07 — see DEFAULT_CONFIG["subscription_guard"]).
+
+    Read-time config gating: returns EMPTY when the guard is off, so a stale
+    state flag can never exclude anything once the operator disables the
+    feature — flipping the config restores pre-guard behavior with no state
+    cleanup required."""
+    if not _subscription_guard_enabled(config):
+        return set()
+    return {n for n, a in (state.get("accounts") or {}).items()
+            if isinstance(a, dict) and a.get("subscription_disabled")}
+
+
+def _disabled_accounts(config: dict, state: dict | None = None) -> set:
     """Accounts the operator marked `disabled: true` in config.yaml's accounts
     list — a hard out-of-rotation switch (2026-07-03, user request: `default`
     depleted its Fable weekly while the polled per-model number still read 87%,
@@ -4609,9 +4834,20 @@ def _disabled_accounts(config: dict) -> set:
     operator mandate outranks "swap somewhere rather than sit on a hot
     active"). Polling continues (so the operator can see when its windows
     reset) and a lane already ON the account keeps running — the flag only
-    stops NEW placements. Re-enable by deleting the key or setting false."""
-    return {a.get("name") for a in config.get("accounts", [])
-            if isinstance(a, dict) and a.get("disabled")}
+    stops NEW placements. Re-enable by deleting the key or setting false.
+
+    2026-08-07: when `state` is supplied, the set ALSO includes accounts the
+    subscription_guard auto-flagged `subscription_disabled` (org's Claude
+    subscription ended — every lane placed there opens logged-out). Same hard
+    no-fallback exclusion, triggered automatically instead of by hand; the
+    per-call opt-in keeps state-less callers (and the SOS alarm-suppression
+    block, which must NOT silence a subscription-dead account's own alarm)
+    byte-identical to their old behavior."""
+    out = {a.get("name") for a in config.get("accounts", [])
+           if isinstance(a, dict) and a.get("disabled")}
+    if state is not None:
+        out |= _subscription_dead_accounts(state, config)
+    return out
 
 
 def _spread_lanes_enabled(config: dict) -> bool:
@@ -4679,7 +4915,12 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # at all. token_expired and poll_error always exclude, as does an
     # operator `disabled: true` (out-of-rotation mandate — no fallback tier
     # below ever re-admits these, unlike the cap/headroom soft filters).
-    disabled = _disabled_accounts(config)
+    # `state` passed (2026-08-07): auto-flagged subscription-ended accounts
+    # get the same hard, no-fallback exclusion — before this they carried only
+    # rate_limited, a SOFT filter that allow_rate_limited_targets (or an
+    # otherwise-empty pool) could re-admit, swapping a lane onto an account
+    # whose every session opens logged-out.
+    disabled = _disabled_accounts(config, state)
     candidates: list[tuple[str, dict]] = [
         (name, acct) for name, acct in accounts.items()
         if name != current
@@ -8384,14 +8625,23 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
     """Mutate state.json's per-account current_*_pct from a poll cycle.
 
-    Each per-account update follows one of five exclusive branches:
+    Each per-account update follows one of six exclusive branches:
       0. token_stale (stored access token aged out — refresh token still
          valid) — flag and preserve prior percentages, NO SOS escalation
       1. token_expired (HTTP 401 despite non-expired stored token) — real
          auth failure, flag and preserve prior percentages
-      2. rate_limited (HTTP 429) — flag and preserve prior percentages
+      1.5. subscription_disabled (2026-08-07: 429 disambiguated by the
+         profile probe as "org's Claude subscription ENDED") — flag for
+         auto-exclusion (see _disabled_accounts), keep rate_limited set
+         (the account IS 429ing), preserve prior percentages, and emit ONE
+         CRED-AUDIT line on the off→on transition
+      2. rate_limited (HTTP 429) — flag and preserve prior percentages;
+         a probe verdict of "active" here also CLEARS a lingering
+         subscription_disabled flag (subscription renewed, still throttled)
       3. poll_error (other failures) — flag and preserve prior percentages
-      4. success — clear all flags, store new percentages + reset times
+      4. success — clear all flags (subscription_disabled included — a
+         successful usage poll is proof the subscription works again),
+         store new percentages + reset times
 
     The branches are exclusive on a per-cycle basis. GH #13 added the
     token_stale branch to distinguish "we can't poll this inactive account
@@ -8426,6 +8676,42 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             # Token expiry isn't a polling-throttle event; don't backoff.
             continue
 
+        # Branch 1.5 (2026-08-07): subscription ENDED (org-disabled). The 429
+        # was positively identified by the profile probe as a canceled
+        # subscription on a claude_free org — the account authenticates fine
+        # but every Claude Code session on it walls with "Your organization
+        # has disabled Claude subscription access". Flag it (the pickers read
+        # this via _disabled_accounts and hard-exclude it, same semantics as
+        # an operator `cus disable`), keep rate_limited set too (it IS 429ing
+        # — backoff + existing soft filters stay honest), and log the off→on
+        # transition ONCE so the daemon log names the account + remediation
+        # without re-shouting every poll cycle.
+        if u.subscription_disabled:
+            newly_flagged = not acct.get("subscription_disabled")
+            acct["subscription_disabled"] = True
+            if newly_flagged:
+                acct["subscription_disabled_at"] = u.polled_at
+            sub = u.raw.get("subscription") or {}
+            acct["subscription_detail"] = {k: sub.get(k) for k in
+                                           ("subscription_status", "organization_type")}
+            acct["rate_limited"] = True
+            acct["token_expired"] = False
+            acct.pop("token_stale", None)
+            acct.pop("poll_error", None)
+            acct["last_poll_ts"] = u.polled_at
+            update_backoff(acct, success=False, config=config)
+            if newly_flagged:
+                _cred_audit(
+                    "subscription-disabled", "auto-excluded",
+                    "profile probe: subscription ended "
+                    f"(status={sub.get('subscription_status')}, "
+                    f"org={sub.get('organization_type')}) — account removed from "
+                    "launch/swap rotation; re-enable the subscription in the "
+                    "Anthropic console (or renew), then a successful poll (or "
+                    "`cus force-poll`) auto-clears this",
+                    account=name)
+            continue
+
         # Branch 2: rate-limited (429). Preserve last known current_*_pct +
         # apply exponential backoff so we stop hammering the endpoint.
         if u.raw.get("rate_limited"):
@@ -8433,6 +8719,18 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["token_expired"] = False
             acct.pop("poll_error", None)
             acct["last_poll_ts"] = u.polled_at
+            # Renewed-but-throttled recovery: a probe verdict of "active" is
+            # definitive proof the subscription is back even though usage
+            # still 429s (real throttle). Clear a lingering flag so the
+            # account re-enters rotation as soon as the throttle lifts.
+            if u.raw.get("subscription_probe") == "active" and acct.get("subscription_disabled"):
+                acct.pop("subscription_disabled", None)
+                acct.pop("subscription_disabled_at", None)
+                acct.pop("subscription_detail", None)
+                _cred_audit("subscription-disabled", "cleared",
+                            "profile probe reports an ACTIVE subscription again "
+                            "(still rate-limited) — account back in rotation",
+                            account=name)
             update_backoff(acct, success=False, config=config)
             continue
 
@@ -8451,6 +8749,15 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
         acct.pop("rate_limited", None)
         acct.pop("token_stale", None)
         acct["token_expired"] = False
+        # A SUCCESSFUL usage poll is definitive proof the subscription works
+        # (a subscription-ended org can't read usage at all — it 429s), so a
+        # renewal self-heals here with no operator action (2026-08-07 guard).
+        if acct.pop("subscription_disabled", None):
+            acct.pop("subscription_disabled_at", None)
+            acct.pop("subscription_detail", None)
+            _cred_audit("subscription-disabled", "cleared",
+                        "usage poll succeeded — subscription active again; "
+                        "account back in rotation", account=name)
         # A SUCCESSFUL poll of an INACTIVE account read its SNAPSHOT's access token
         # (poll_account_usage → _read_access_token reads storage for inactive accts),
         # so the snapshot authenticates and is NOT refresh-dead — clear a stale flag
@@ -10876,7 +11183,10 @@ def _diagnose_premium_headroom(
     #    becomes a usable target and it alone (with over-cap/blocked candidates) can
     #    still produce the URGENT line.
     premium_config = _config_for_pool(config, "premium")
-    disabled = _disabled_accounts(config)   # operator-parked: never a target, not lost capacity
+    # `state` passed (2026-08-07): a subscription-ended account must not count
+    # as a valid premium swap target in the scarcity math (its own SOS line
+    # names it separately, so skipping it here doesn't hide the capacity loss).
+    disabled = _disabled_accounts(config, state)   # operator-parked/sub-dead: never a target, not lost capacity
     valid_targets: list[str] = []       # fresh, below every cap → clean swap
     stale_refreshable: list[str] = []   # idle token_stale, below caps → refresh-on-swap
     lost: list[str] = []                # reachable-but-unusable = visible lost capacity
@@ -11124,19 +11434,54 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 affected=name,
             ))
 
+    # Condition 1b (2026-08-07): subscription ENDED (org-disabled) — the
+    # account was auto-excluded from rotation by the subscription_guard (its
+    # usage endpoint 429s generically; the profile probe identified a canceled
+    # subscription on a claude_free org). WARNING, not urgent: unlike a dead
+    # token nothing needs saving right now — the auto-exclusion already
+    # protects new launches/swaps, and lanes already on the account keep
+    # their local context (they just can't reach Claude). The line exists so
+    # the operator knows WHY the account vanished from rotation and what
+    # un-vanishes it. Read-time gated: guard off ⇒ no line (matches the
+    # pickers ignoring the flag).
+    if _subscription_guard_enabled(config):
+        for name, acct in accounts.items():
+            if not acct.get("subscription_disabled"):
+                continue
+            detail = acct.get("subscription_detail") or {}
+            status = detail.get("subscription_status") or "canceled"
+            out.append(SOSCondition(
+                severity="warning",
+                summary=f"{name}: Claude subscription ENDED (org-disabled, status={status}) — auto-excluded from rotation",
+                action=(f"'{name}' has no active Claude subscription, so every session on it walls with "
+                        f"\"organization has disabled Claude subscription access\". cus auto-excluded it "
+                        f"from launch/swap targets (no action needed to protect the fleet). To restore: "
+                        f"re-enable/renew the subscription in the Anthropic console, then "
+                        f"`cus force-poll {name}` — a successful poll auto-clears the flag. "
+                        f"To acknowledge + silence while it stays dead: `cus disable {name} --reason 'subscription ended'`."),
+                affected=name,
+            ))
+
     # Condition 2 + 3: targets available?
     # Honor allow_rate_limited_targets (issue #5): if set, rate_limited
     # accounts are still "valid" candidates from the picker's perspective,
     # so SOS shouldn't claim "no other account available" when the
     # orchestrator would have happily swapped to one.
     allow_rl = config.get("smart_strategy", {}).get("allow_rate_limited_targets", False)
-    def is_valid(a: dict) -> bool:
+    _sub_dead = _subscription_dead_accounts(state, config)
+    def is_valid(a: dict, name: str | None = None) -> bool:
+        # Subscription-ended (2026-08-07): hard-invalid even under
+        # allow_rate_limited_targets — the picker hard-excludes it, so
+        # counting it as an available target here would report capacity
+        # the orchestrator can never actually use.
+        if name is not None and name in _sub_dead:
+            return False
         if a.get("token_expired") or a.get("poll_error"):
             return False
         if a.get("rate_limited") and not allow_rl:
             return False
         return True
-    valid = [n for n, a in accounts.items() if is_valid(a)]
+    valid = [n for n, a in accounts.items() if is_valid(a, n)]
     active = state.get("active")
     if active and active in accounts:
         active_acct = accounts[active]
@@ -11197,8 +11542,8 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
         thr_cfg = config.get("thresholds", {})
         for acct_name, slots in sorted(occupied.items()):
             acct = accounts.get(acct_name, {})
-            if not is_valid(acct):
-                continue  # blocked accounts are already covered by Conditions 1/3
+            if not is_valid(acct, acct_name):
+                continue  # blocked accounts are already covered by Conditions 1/1b/3
             lane_thr = acct.get("next_swap_at_pct", 50)
             cand = []
             if thr_cfg.get("five_hour", True):
@@ -14018,7 +14363,14 @@ def status() -> None:
             flags.append("DISABLED")
         if a.get("token_expired"):
             flags.append("TOKEN_EXPIRED")
-        if a.get("rate_limited"):
+        # Subscription-ended (2026-08-07): shown INSTEAD of RATE_LIMITED — the
+        # account always carries both flags (the 429 is the SYMPTOM of the
+        # ended subscription), and printing the generic one next to the
+        # specific one would send the operator chasing a throttle that will
+        # never lift.
+        if a.get("subscription_disabled"):
+            flags.append("SUB_ENDED")
+        elif a.get("rate_limited"):
             flags.append("RATE_LIMITED")
         if a.get("poll_error"):
             flags.append("POLL_ERROR")
@@ -14234,6 +14586,11 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # binding fact, not whatever number happens to be cached.
     if acct.get("token_expired"):
         return ("blocked", "token expired (no live creds — relogin needed)")
+    # Subscription-ended outranks the generic 429 label (the account carries
+    # BOTH flags — the usage endpoint 429s precisely BECAUSE the subscription
+    # ended), and unlike a real rate limit no amount of waiting fixes it.
+    if acct.get("subscription_disabled"):
+        return ("blocked", "subscription ENDED (org-disabled — renew or `cus enable` after renewal)")
     if acct.get("poll_error"):
         return ("blocked", "poll error (usage unknown)")
     if acct.get("rate_limited"):
@@ -14508,6 +14865,13 @@ def sessions_cmd(as_json: bool) -> None:
             # the tag stops the operator wondering why a "disabled" account is in use.
             if r["account"] and r["account"] in disabled_set:
                 acct = f"{acct} {click.style('[disabled]', fg='yellow')}"
+            # Subscription-ended tag (2026-08-07): a lane still mounted on a
+            # sub-dead account is exactly the pane the operator needs to
+            # `cus slot move` off — make it jump out in red.
+            if (r["account"]
+                    and (state.get("accounts", {}).get(r["account"], {}) or {}).get("subscription_disabled")
+                    and _subscription_guard_enabled(config)):
+                acct = f"{acct} {click.style('[sub-ended]', fg='red', bold=True)}"
             # Line 1: identity + where mounted.
             drift_tag = ""
             if r["drift"]:
@@ -14735,6 +15099,17 @@ def switch(target: str, dry_run: bool, trigger: str, force: bool) -> None:
     if target == current:
         click.echo(f"{target} is already active. Nothing to do.")
         return
+
+    # Subscription-ended target refusal (2026-08-07, mirrors `cus slot move`):
+    # the shared mount on a subscription-dead account means every bare session
+    # opens logged-out. --force overrides (e.g. just-renewed, not yet re-polled).
+    if target in _subscription_dead_accounts(state, load_config()) and not force:
+        click.echo(click.style(
+            f"refusing: '{target}' has NO active Claude subscription (auto-detected — every "
+            f"session on it opens logged-out). Renew in the Anthropic console then "
+            f"`cus force-poll {target}` to clear, or pick another target. --force overrides.",
+            fg="red"))
+        sys.exit(1)
 
     # Duplicate-mount guard (GH #104): putting the shared mount on an account a
     # LIVE slot already holds makes two live mounts share one account — their
@@ -16501,7 +16876,13 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         flags = []
         if a.get("token_expired"):
             flags.append("EXP")
-        if a.get("rate_limited"):
+        # SUB-END replaces the soft "(429)" for a subscription-ended account
+        # (2026-08-07): the generic tag was exactly how dead-subscription
+        # accounts hid in plain sight on the statusline while lanes kept
+        # launching onto them. The 429 is implied (it's the symptom).
+        if a.get("subscription_disabled"):
+            flags.append("SUB-END")
+        elif a.get("rate_limited"):
             flags.append("429")
         if a.get("token_stale"):
             flags.append("STALE")
@@ -17787,6 +18168,18 @@ def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> N
     if account not in state.get("accounts", {}):
         click.echo(f"Unknown account '{account}'. Known: {sorted(state.get('accounts', {}).keys())}")
         sys.exit(1)
+    # Subscription-ended target refusal (2026-08-07): `cus slot move` is the
+    # canonical "rescue a stuck pane onto a clean account" move — landing it
+    # on a subscription-dead account would trade a stuck pane for a logged-out
+    # one. Same --force override as the lock guard below (e.g. the operator
+    # just renewed and hasn't re-polled yet).
+    if account in _subscription_dead_accounts(state, config) and not force:
+        click.echo(click.style(
+            f"refusing: '{account}' has NO active Claude subscription (auto-detected — every "
+            f"session on it opens logged-out). Renew in the Anthropic console then "
+            f"`cus force-poll {account}` to clear, or pick another target. --force overrides.",
+            fg="red"))
+        sys.exit(1)
     # Validate slot: a state entry OR an on-disk dir is enough to move it (an
     # unregistered-but-present dir is a real, movable mount; `cus slot list`
     # flags the registration gap separately).
@@ -18149,6 +18542,25 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         click.echo(f"launch: picked '{account}' ({target.reason})")
     elif account not in state.get("accounts", {}):
         raise click.ClickException(f"unknown account '{account}'. Known: {sorted(state.get('accounts', {}))}")
+
+    # ---- subscription_guard launch refusal (2026-08-07) ----
+    # Complements the #190 liveness gate, which CANNOT catch this case: a
+    # subscription-ended account's OAuth still authenticates (profile 200s,
+    # refresh grants pass), so its creds probe ALIVE — yet every session on it
+    # opens straight into "organization has disabled Claude subscription
+    # access". The auto-pick path never gets here (pick_launch_account
+    # excludes flagged accounts via _disabled_accounts), so this guards the
+    # EXPLICIT `cus launch <account>` path — refuse with the remediation
+    # rather than exec a session that is guaranteed walled. --force overrides
+    # once (mirrors the lock + double-book guards), e.g. to test a renewal
+    # before the next poll clears the flag.
+    if account in _subscription_dead_accounts(state, config) and not force:
+        raise click.ClickException(
+            f"'{account}' has NO active Claude subscription (auto-detected: its org is "
+            f"subscription-disabled for Claude Code) — a session on it opens logged-out. "
+            f"Renew/re-enable the subscription in the Anthropic console, then `cus force-poll "
+            f"{account}` to clear the flag; or pick another account (`cus launch auto`). "
+            f"--force overrides.")
 
     # Lane sharing (GH #109 lanes): if the chosen account is already live on a
     # slot lane, JOIN that lane (share its config dir) rather than refusing
