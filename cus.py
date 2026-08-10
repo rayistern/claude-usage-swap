@@ -6666,6 +6666,39 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 f"Provision another: `cus login-mount {target_name}`.")
     if install_src is None:
         install_src, used_independent = swap_install_source(target_name, slot, target_creds, config)
+    # ---- 2026-08-10 dead-legacy-store guard (slot-14 -> 03 blank-on-install) ----
+    # A LEGACY per-(slot,account) independent login store (used_independent=True with
+    # NO freshly-claimed pooled family) can be an unrotated `--from-existing` COPY
+    # whose shared OAuth family a DIFFERENT live mount later rotated away — leaving
+    # this store's refresh token a consumed dead branch (invalid_grant). Installing
+    # it blanks the mount on Claude Code's first self-refresh → "Not logged in" (the
+    # 2026-08-10 slot-14 incident: an Aug-07 `--from-existing` copy of 03's login,
+    # rotated dead by slot-6 on Aug-08, re-installed as-is by a daemon swap Aug-10).
+    # Every OTHER install surface already probes — claim_verified_login_family (#127)
+    # for pooled families, and the dead-SNAPSHOT guard just below for the plain-copy
+    # path — the legacy-store branch was the one hole. Reuse the GH #190
+    # `_store_creds_dead` ladder: cheap when the store is healthy (well-shaped +
+    # unexpired ⇒ zero network), a cooldown-cached refresh-grant probe when suspect
+    # (alive ⇒ rotation persisted into the store in place, so we install FRESH
+    # tokens; dead ⇒ refuse; network-unknown ⇒ fail open — the #141 blank-shape
+    # guards still backstop). Refusing never logs anyone out; installing a dead store
+    # does — same degrade-to-safe posture as the snapshot guard. A freshly-CLAIMED
+    # pooled family (claimed_family set) is already #127-verified, so it is
+    # deliberately excluded from re-probing (a needless rotation).
+    if (claimed_family is None and used_independent and slot is not None
+            and _store_creds_dead(install_src, f"legacy:{target_name}:{slot}", config)):
+        _cred_audit("legacy-store-dead-guard", "refused-dead-legacy",
+                    "legacy per-slot login store's refresh grant is DEAD (invalid_grant — "
+                    "likely an unrotated --from-existing copy whose family rotated elsewhere); "
+                    "refusing to install creds that would blank the mount (2026-08-10 slot-14)",
+                    slot=slot, mount=slot, account=target_name)
+        raise RuntimeError(
+            f"refusing to install '{target_name}' onto lane {slot}: its legacy per-slot login "
+            f"store is DEAD (the OAuth refresh grant returns invalid_grant — typically an "
+            f"unrotated `--from-existing` copy whose token family was rotated away by another "
+            f"live mount). Installing it would blank the mount and log the session out (the "
+            f"2026-08-10 slot-14->03 incident). Provision a fresh family: `cus login-mount "
+            f"{target_name}`. Lane left on its prior account (no creds written).")
     # ---- 2026-07-07 dead-snapshot family-seed (merkos incident) ----
     # At this point, if neither the claimed-pool-family block above nor
     # swap_install_source picked a distinct login family, install_src is the account
@@ -11231,15 +11264,37 @@ def _account_snapshot_age_days(account: str) -> float | None:
     probe — refresh tokens are single-use (GH #104)."""
     meta = account_meta(account)
     stamp = meta.get("refreshed_ts") or meta.get("imported_ts")
-    if not stamp or not isinstance(stamp, str):
-        return None
+    meta_age = None
+    if stamp and isinstance(stamp, str):
+        try:
+            dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            meta_age = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+        except ValueError:
+            meta_age = None
+    # H1 fix (2026-08-10): `refreshed_ts` is written ONLY by `cus init --force` /
+    # `cus add` — a browser relogin or a rotation save-back never bumps it. So on a
+    # freshly-relogged account the stamp still reads the ORIGINAL init date, and
+    # every account inherits ONE shared init timestamp — making them all warn
+    # "~35 days old / past TTL" no matter when the user actually logged in (the
+    # 2026-08-10 false alarm that mis-drove the "03/default canonical expired"
+    # diagnosis; the user had in fact logged every account in the prior week). The
+    # CURRENT refresh token cannot predate the canonical creds file's last write
+    # (every write lands the newest generation; stale writes are already blocked by
+    # the #77 freshness guard), so use the file mtime as a second, relogin-aware age
+    # source and trust whichever evidence is NEWER. Only counts a well-shaped
+    # (non-blank) file; still NEVER a network probe — refresh tokens are single-use
+    # (#104). Warnings only ever get QUIETER on provably-fresh tokens.
+    file_age = None
     try:
-        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+        creds_path = account_creds_path(account)
+        if creds_path.exists() and not _live_mount_creds_invalid(read_json(creds_path)):
+            file_age = (time.time() - creds_path.stat().st_mtime) / 86400.0
+    except (json.JSONDecodeError, OSError):
+        file_age = None
+    ages = [a for a in (meta_age, file_age) if a is not None]
+    return min(ages) if ages else None
 
 
 def _mount_refresh_age_days(account: str, slot: str | None, state: dict, config: dict) -> float | None:
