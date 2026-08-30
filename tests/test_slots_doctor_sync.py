@@ -174,19 +174,84 @@ def test_doctor_merges_real_dir_into_shared():
         env.restore()
 
 
+def test_doctor_merges_colliding_dir_recursively():
+    """GH #192: a NAME collision between directories must merge recursively,
+    not no-op. This is the slot-4 incident shape: projects/ held a per-project
+    encoded-cwd dir that also existed in the shared tree, the shallow merge
+    skipped it, the slot stayed a real dir, and `claude --resume` couldn't see
+    the shared transcripts. (Supersedes the pre-2026-08-30 expectation that
+    ANY colliding dir is left for operator judgment — that behavior WAS bug 2.)
+    """
+    env = _Env()
+    try:
+        alpha = env.accounts_dir / "account-alpha"
+        # Shared tree already has the project dir with one transcript...
+        shared_proj = env.claude_dir / "projects" / "-home-user-repo"
+        shared_proj.mkdir()
+        (shared_proj / "sess-shared.jsonl").write_text("shared")
+        # ...and the mount's REAL projects/ has the SAME-named project dir
+        # holding a different (unique) transcript → dir-vs-dir collision.
+        real = alpha / "projects"
+        (real / "-home-user-repo").mkdir(parents=True)
+        (real / "-home-user-repo" / "sess-stray.jsonl").write_text("stray")
+
+        findings = cus.doctor_mount(alpha, fix=True)
+        assert (alpha / "projects").is_symlink(), "recursive merge heals the collision"
+        assert (shared_proj / "sess-stray.jsonl").read_text() == "stray", "stray transcript reunited with shared tree"
+        assert (shared_proj / "sess-shared.jsonl").read_text() == "shared", "shared content untouched"
+        f = next(f for f in findings if f["entry"] == "projects")
+        assert f["healed"] is True, "finding marked as a genuine heal"
+    finally:
+        env.restore()
+
+
 def test_doctor_leaves_colliding_real_dir():
+    """A GENUINE content conflict (same path, divergent file bytes) is still
+    left for operator judgment — but the finding must say so (healed=False),
+    never masquerade as a heal (GH #192 bug 2).
+
+    Annotation 2026-08-30 (GH #192): pre-fix this test used an empty
+    dir-vs-dir collision, which the recursive merge now heals by design (see
+    test_doctor_merges_colliding_dir_recursively). Divergent file content is
+    the collision class that legitimately remains unhealable.
+    """
     env = _Env()
     try:
         alpha = env.accounts_dir / "account-alpha"
         (env.claude_dir / "session-env" / "uuid-9").mkdir()
+        (env.claude_dir / "session-env" / "uuid-9" / "env.json").write_text('{"v": "shared"}')
         real = alpha / "session-env"
-        real.mkdir()
-        (real / "uuid-9").mkdir()  # collides with shared
+        (real / "uuid-9").mkdir(parents=True)
+        (real / "uuid-9" / "env.json").write_text('{"v": "stray"}')  # divergent bytes
 
-        cus.doctor_mount(alpha, fix=True)
+        findings = cus.doctor_mount(alpha, fix=True)
         assert not (alpha / "session-env").is_symlink(), "colliding dir left for operator judgment"
+        assert (real / "uuid-9" / "env.json").read_text() == '{"v": "stray"}', "divergent content preserved"
+        assert (env.claude_dir / "session-env" / "uuid-9" / "env.json").read_text() == '{"v": "shared"}', "shared content untouched"
+        f = next(f for f in findings if f["entry"] == "session-env")
+        assert f["healed"] is False, "failed heal must NOT report as healed (GH #192)"
         findings = cus.doctor_mount(alpha, fix=False)
         assert any("session-env" == f["entry"] for f in findings), "still reported on re-run"
+    finally:
+        env.restore()
+
+
+def test_doctor_dedupes_identical_colliding_file():
+    """Byte-identical file collisions are pure duplicates (a transcript copied
+    rather than moved at some point) — the stray copy is dropped and the heal
+    completes (GH #192)."""
+    env = _Env()
+    try:
+        alpha = env.accounts_dir / "account-alpha"
+        (env.claude_dir / "projects" / "-home-x").mkdir()
+        (env.claude_dir / "projects" / "-home-x" / "s.jsonl").write_text("same-bytes")
+        real = alpha / "projects"
+        (real / "-home-x").mkdir(parents=True)
+        (real / "-home-x" / "s.jsonl").write_text("same-bytes")
+
+        cus.doctor_mount(alpha, fix=True)
+        assert (alpha / "projects").is_symlink(), "identical duplicate deduped, dir relinked"
+        assert (env.claude_dir / "projects" / "-home-x" / "s.jsonl").read_text() == "same-bytes"
     finally:
         env.restore()
 

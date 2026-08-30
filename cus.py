@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import filecmp
 import hashlib
 import json
 import os
@@ -2598,7 +2599,8 @@ def create_slot(state: dict, config: dict | None = None) -> tuple[str, Path]:
 
 
 def acquire_slot(state: dict, prefer_account: str | None = None,
-                 config: dict | None = None) -> tuple[str, Path]:
+                 config: dict | None = None,
+                 exclude: set[str] | None = None) -> tuple[str, Path]:
     """Find a free slot for a launch (create one if none), reserving it.
 
     Runs the free-scan + reservation under the swap lock on a freshly-reloaded
@@ -2619,6 +2621,13 @@ def acquire_slot(state: dict, prefer_account: str | None = None,
     happily auto-pick a locked slot. Incident 2026-07-08: a new `cus launch`
     pane landed on slot-3, a locked slot already held by the watchdog session.
     None ⇒ no lock filtering (legacy callers with no config in scope).
+
+    `exclude` (optional, GH #192): slot NAMES the caller has already tried and
+    found structurally broken (projects/ not resolving to the shared tree even
+    after a heal). They're skipped in the free-scan so the launch verify-loop
+    can re-pick without landing on the same broken slot; a fresh allocation
+    can't collide with them either (their dirs still exist on disk, so
+    _allocate_slot_unlocked never reuses their indices).
     """
     with _swap_lock():
         fresh = load_state()
@@ -2634,6 +2643,8 @@ def acquire_slot(state: dict, prefer_account: str | None = None,
                 continue
             if d.name in locked:
                 continue
+            if exclude and d.name in exclude:
+                continue  # caller-rejected (broken layout — GH #192 verify loop)
             free.append(d)
         chosen: Path | None = None
         if prefer_account:
@@ -2846,6 +2857,71 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
     return {"action": "reaped", "slot": name, "saveback": saveback}
 
 
+def _merge_real_dir_into_shared(src: Path, dst: Path) -> tuple[int, int]:
+    """Recursively merge a stray REAL directory into its shared canonical
+    target. Returns (merged, collisions): entries unified into the shared
+    tree vs entries that could not be safely unified and were left in place.
+
+    Why recursive (GH #192): the old shallow merge moved only TOP-LEVEL
+    children and skipped any whose NAME already existed in the shared target.
+    For `projects/` the children are per-project encoded-cwd directories
+    (e.g. `-home-rayi-repos-desk/`) that almost always exist in the shared
+    tree too — so the shallow merge no-op'd on exactly the dir it was built
+    to heal, the slot stayed forked off the share, and `claude --resume`
+    under that slot couldn't see the shared transcripts ("No conversation
+    found"). One level down, session files are uuid-keyed, so descending
+    into same-named directories resolves virtually every real-world case.
+
+    Merge rules per child (conservative — never destroy divergent content):
+      - dst absent            → move the child across (files, dirs, symlinks)
+      - both REAL dirs        → recurse; drop the src dir once fully drained
+      - both REAL files, byte-identical → drop the src copy (pure duplicate,
+        e.g. a transcript that was copied rather than moved at some point)
+      - anything else (divergent files, file-vs-dir, symlinks on either
+        side) → collision: left in place for operator judgment
+    Symlinks are never recursed through: a symlink child could point back
+    into the shared tree (or into src itself) and turn the walk into a loop
+    or merge content into an unintended location.
+    """
+    merged = collisions = 0
+    for child in sorted(src.iterdir()):
+        target = dst / child.name
+        # `exists()` follows symlinks (False for a dangling one), so check
+        # is_symlink() too — moving onto a dangling symlink path would write
+        # through it somewhere unintended.
+        if not target.exists() and not target.is_symlink():
+            shutil.move(str(child), str(target))
+            merged += 1
+            continue
+        if (child.is_dir() and not child.is_symlink()
+                and target.is_dir() and not target.is_symlink()):
+            m, c = _merge_real_dir_into_shared(child, target)
+            merged, collisions = merged + m, collisions + c
+            if c == 0:
+                # Fully drained → remove the now-empty stray subdir so the
+                # PARENT can empty out and be relinked. rmdir is safe: it
+                # refuses (OSError) if anything unexpectedly remains.
+                try:
+                    child.rmdir()
+                except OSError:
+                    collisions += 1
+            continue
+        if (child.is_file() and not child.is_symlink()
+                and target.is_file() and not target.is_symlink()):
+            try:
+                # shallow=False: compare CONTENT, not just stat signature —
+                # a stale same-size copy must count as divergent, not equal.
+                identical = filecmp.cmp(child, target, shallow=False)
+            except OSError:
+                identical = False
+            if identical:
+                child.unlink()  # exact duplicate — shared copy already has it
+                merged += 1
+                continue
+        collisions += 1  # divergent / type-mismatched / symlink-involved
+    return merged, collisions
+
+
 def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
     """Check (and with fix=True, heal) one mount dir against the canonical
     layout. Idempotent: a healed mount reports no findings on re-run.
@@ -2869,8 +2945,17 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
     """
     findings: list[dict] = []
 
-    def note(entry: str, problem: str, action: str) -> None:
-        findings.append({"entry": entry, "problem": problem, "action": action})
+    def note(entry: str, problem: str, action: str, healed: bool | None = None) -> None:
+        # `healed` records whether the problem is actually FIXED after this
+        # call. GH #192: launch printed "doctor healed …" for EVERY finding —
+        # including the real-dir merge's own "left as real dir, resolve
+        # manually" failure — so a no-op heal read as success in the logs.
+        # Default: under fix=True a noted action IS the heal; under fix=False
+        # nothing changed. Branches that fix nothing pass healed=False
+        # explicitly so callers (launch pre-flight, doctor --fix-dirs) can
+        # fail loudly instead of claiming success.
+        findings.append({"entry": entry, "problem": problem, "action": action,
+                         "healed": fix if healed is None else healed})
 
     for sub in SHARED_SYMLINK_SUBDIRS:
         link = mount / sub
@@ -2886,21 +2971,21 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
                 note(sub, f"symlink → {old_target}", f"repoint{'ed' if fix else ''} → {target}")
             continue
         if link.is_dir():
-            moved, collisions = 0, 0
             if fix:
-                for child in list(link.iterdir()):
-                    dst = target / child.name
-                    if dst.exists():
-                        collisions += 1
-                        continue
-                    shutil.move(str(child), str(dst))
-                    moved += 1
+                # GH #192: merge RECURSIVELY (see _merge_real_dir_into_shared
+                # for why shallow silently no-op'd on projects/). Only genuine
+                # content conflicts are left for operator judgment — and the
+                # finding then carries healed=False so no caller can log the
+                # failure as a heal.
+                moved, collisions = _merge_real_dir_into_shared(link, target)
                 if not any(link.iterdir()):
                     link.rmdir()
                     link.symlink_to(target)
                     note(sub, "real dir where symlink expected", f"moved {moved} entries into shared, relinked")
                 else:
-                    note(sub, "real dir where symlink expected", f"moved {moved}, {collisions} collisions remain — left as real dir, resolve manually")
+                    note(sub, "real dir where symlink expected",
+                         f"moved {moved}, {collisions} collisions remain — left as real dir, resolve manually",
+                         healed=False)
             else:
                 note(sub, "real dir where symlink expected", "would merge into shared target and relink")
             continue
@@ -2928,7 +3013,9 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
                     stub = read_json(link)
                     shared = read_json(target)
                 except (json.JSONDecodeError, OSError) as e:
-                    note(fname, f"real file, unparseable ({e})", "left in place — resolve manually")
+                    # Nothing was fixed — healed=False keeps launch/doctor from
+                    # reporting this "resolve manually" outcome as a heal (#192).
+                    note(fname, f"real file, unparseable ({e})", "left in place — resolve manually", healed=False)
                     continue
                 folded = [k for k in stub if k not in shared]
                 conflicts = [k for k in stub if k in shared and shared[k] != stub[k]]
@@ -2964,7 +3051,9 @@ def doctor_mount(mount: Path, fix: bool = False) -> list[dict]:
         try:
             read_json(cj)
         except (json.JSONDecodeError, OSError) as e:
-            note(".claude.json", f"unparseable: {e}", "left in place — resolve manually (swap/sync would fail against it)")
+            # Diagnostic-only in BOTH modes (doctor never rewrites .claude.json)
+            # — never a heal, so healed=False unconditionally (#192).
+            note(".claude.json", f"unparseable: {e}", "left in place — resolve manually (swap/sync would fail against it)", healed=False)
 
     if shared_settings_changed:
         note("(shared settings.json)", "gained folded keys from a stub", "review ~/.claude/settings.json")
@@ -16808,11 +16897,16 @@ def doctor_cmd(fix_dirs: bool) -> None:
         click.echo("No account or slot dirs found.")
         return
     total = 0
+    unhealed = 0
     for m in mounts:
         findings = doctor_mount(m, fix=fix_dirs)
         if not findings:
             continue
         total += len(findings)
+        # GH #192: a --fix-dirs run used to exit 0 even when a heal failed
+        # (e.g. real-dir merge left collisions) — count failures so the
+        # command can fail loudly instead of implying everything is canonical.
+        unhealed += sum(1 for f in findings if not f.get("healed"))
         click.echo(click.style(m.name, bold=True))
         for f in findings:
             click.echo(f"  {f['entry']}: {f['problem']} — {f['action']}")
@@ -16820,6 +16914,11 @@ def doctor_cmd(fix_dirs: bool) -> None:
         click.echo(click.style("✓ all mounts canonical", fg="green"))
     elif not fix_dirs:
         click.echo(f"\n{total} finding(s). Re-run with --fix-dirs to heal.")
+        sys.exit(1)
+    elif unhealed:
+        click.echo(click.style(
+            f"\n{unhealed} of {total} finding(s) could NOT be healed — resolve manually "
+            f"(see the actions above).", fg="red"))
         sys.exit(1)
 
 
@@ -16860,6 +16959,52 @@ def sync_config_cmd(from_path: str | None, dry_run: bool) -> None:
             continue
         result = sync_mount_claude_json(d, canonical)
         click.echo(f"  {d.name}: {'updated ' + str(len(result['keys_updated'])) + ' keys' if result['changed'] else 'already in sync'}")
+
+
+def _projects_resolves_to_shared(mount: Path) -> bool:
+    """True when a mount's `projects/` is the SAME physical tree as the
+    canonical shared one (CLAUDE_DIR/projects), symlinks resolved.
+
+    WHY (GH #192): `--resume` + checkpoints only work under a mount whose
+    projects/ reaches the shared transcripts. A slot whose projects/ is a
+    real, isolated directory makes `claude --resume <id>` fail with "No
+    conversation found" even though the transcript exists in the shared
+    tree — and silently strands every NEW transcript the session writes.
+    Launch must verify this BEFORE exec'ing claude, not trust that a heal
+    ran. resolve()-vs-resolve() comparison (not "is it a symlink?") also
+    accepts the physical home of the tree itself (the mount whose projects/
+    IS ~/.claude/projects, e.g. when CLAUDE_DIR is a slot's alias) and any
+    chain of links that lands there.
+    """
+    target = CLAUDE_DIR / "projects"
+    if not target.exists():
+        # No shared tree at all (fresh install / weird CLAUDE_DIR): nothing
+        # to diverge from, so nothing to verify — don't block launches.
+        return True
+    link = mount / "projects"
+    try:
+        return link.exists() and link.resolve() == target.resolve()
+    except OSError:
+        return False  # unresolvable (permission/loop) counts as NOT shared
+
+
+def _launch_heal_mount(slot_name: str, mount: Path) -> None:
+    """Run the launch pre-flight doctor heal on a mount and report HONESTLY.
+
+    GH #192 bug 2: launch printed `doctor healed <slot>/<entry> (<problem>)`
+    for every finding — including the real-dir merge's own "collisions
+    remain, left as real dir, resolve manually" FAILURE — so a broken slot
+    logged as healed right before the resume failed. Findings now carry
+    `healed`; only genuine heals get the "healed" line, failures get a loud
+    red one that includes the doctor's own action text (what remains and why).
+    """
+    for f in doctor_mount(mount, fix=True):
+        if f.get("healed"):
+            click.echo(f"launch: doctor healed {slot_name}/{f['entry']} ({f['problem']})")
+        else:
+            click.echo(click.style(
+                f"launch: doctor could NOT heal {slot_name}/{f['entry']} "
+                f"({f['problem']}): {f['action']}", fg="red"))
 
 
 def _launch_prepare(account: str | None, state: dict, config: dict,
@@ -16988,8 +17133,20 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # Heal the lane's layout, but DON'T sync .claude.json: it has a live
             # writer (the sessions already on this lane), so a sync would race
             # their writes (same rule as the daemon's periodic save-back).
-            for f in doctor_mount(lane_dir, fix=True):
-                click.echo(f"launch: doctor healed {lane}/{f['entry']} ({f['problem']})")
+            _launch_heal_mount(lane, lane_dir)
+            # GH #192: refuse to JOIN a lane whose projects/ still doesn't
+            # reach the shared tree after the heal (unresolvable collisions).
+            # A joined session would strand its transcripts in the lane's
+            # isolated dir and `--resume` would report "No conversation
+            # found" — fail loudly with the remediation instead of exec'ing
+            # a session that's silently forked off the share.
+            if not _projects_resolves_to_shared(lane_dir):
+                raise click.ClickException(
+                    f"lane {lane}'s projects/ is a real directory that could not be merged into the "
+                    f"shared tree (see the 'could NOT heal' line above) — joining it would hide shared "
+                    f"transcripts from --resume and strand new ones (GH #192). Resolve the collisions "
+                    f"under {lane_dir / 'projects'} manually (`cus doctor --fix-dirs` to retry), or "
+                    f"launch a different account.")
             state = load_state()
             entry = state.setdefault("slots", {}).setdefault(lane, {"account": account, "created_ts": now_iso()})
             entry["last_launch_ts"] = now_iso()
@@ -17070,12 +17227,53 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # landed on locked slot-3, the watchdog session's slot).
         slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config)
 
-    # Pre-flight: heal the slot's layout quietly (a launch should never come
-    # up bare-hooked because a symlink rotted), then align its .claude.json
-    # with the canonical — UNLESS the mount has a live writer (an explicit --lane
-    # onto an already-live same-account lane), where a sync would race it.
-    for f in doctor_mount(slot_dir, fix=True):
-        click.echo(f"launch: doctor healed {slot_name}/{f['entry']} ({f['problem']})")
+    # Pre-flight: heal the slot's layout (a launch should never come up
+    # bare-hooked because a symlink rotted; failures now report as failures —
+    # GH #192 bug 2), then align its .claude.json with the canonical — UNLESS
+    # the mount has a live writer (an explicit --lane onto an already-live
+    # same-account lane), where a sync would race it.
+    _launch_heal_mount(slot_name, slot_dir)
+    # GH #192 root cause: launch exec'd claude onto a slot whose projects/ was
+    # a real ISOLATED dir (the heal had silently no-op'd on it), so
+    # `--resume <id>` failed "No conversation found" while the transcript sat
+    # in the shared tree — and every new transcript was stranded in the slot.
+    # Verify the heal actually took BEFORE the exec. Prefer repair (the doctor
+    # just attempted it); fall back to EXCLUDING the slot: auto-picked slots
+    # are re-acquired with the broken ones skipped, an explicit --lane fails
+    # loudly instead (the operator pinned it on purpose — silently landing
+    # elsewhere would be worse than refusing).
+    if not _projects_resolves_to_shared(slot_dir):
+        if lane is not None:
+            raise click.ClickException(
+                f"--lane {slot_name}'s projects/ does not resolve to the shared tree and could not be "
+                f"healed (see the 'could NOT heal' line above) — claude --resume would not find shared "
+                f"transcripts and new ones would be stranded (GH #192). Resolve the collisions under "
+                f"{slot_dir / 'projects'} manually (`cus doctor --fix-dirs` to retry), or launch "
+                f"without --lane.")
+        broken: set[str] = set()
+        # Bounded convergence: each failed try excludes one more EXISTING slot,
+        # and once every existing slot is excluded acquire_slot allocates a
+        # brand-new scaffolded one (fresh symlinks → verification passes), so
+        # len(existing)+1 tries always suffice; +1 belt-and-suspenders. The
+        # abandoned broken slots keep their (short-lived) reservations and
+        # their data — nothing is deleted; `cus doctor --fix-dirs` reports
+        # what's left to resolve.
+        max_tries = len(list_slot_dirs()) + 2
+        for _ in range(max_tries):
+            broken.add(slot_name)
+            click.echo(click.style(
+                f"launch: skipping {slot_name} — its projects/ does not resolve to the shared "
+                f"tree even after the heal (GH #192); re-picking a slot", fg="yellow"))
+            slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config,
+                                               exclude=broken)
+            _launch_heal_mount(slot_name, slot_dir)
+            if _projects_resolves_to_shared(slot_dir):
+                break
+        else:
+            raise click.ClickException(
+                f"no slot with a projects/ reaching the shared tree after excluding "
+                f"{sorted(broken)} (GH #192) — run `cus doctor --fix-dirs` and resolve the "
+                f"reported collisions.")
     if CLAUDE_JSON.exists() and not mount_in_use(slot_dir):
         try:
             sync_mount_claude_json(slot_dir, read_json(CLAUDE_JSON))
@@ -17212,7 +17410,17 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
                 continue
             healed = doctor_mount(d, fix=True)
             for f in healed:
-                click.echo(f"  doctor healed account-{name}/{f['entry']} ({f['problem']})")
+                # GH #192: only claim "healed" when the finding really was
+                # (findings now carry `healed`); a failed heal on an account
+                # dir doesn't block the mode switch (account dirs are
+                # storage-only — slots copy creds from them, not projects/),
+                # but it must not masquerade as a heal in the log either.
+                if f.get("healed"):
+                    click.echo(f"  doctor healed account-{name}/{f['entry']} ({f['problem']})")
+                else:
+                    click.echo(click.style(
+                        f"  doctor could NOT heal account-{name}/{f['entry']} "
+                        f"({f['problem']}): {f['action']}", fg="yellow"))
             creds = d / ".credentials.json"
             try:
                 oauth = read_json(creds).get("claudeAiOauth", {}) if creds.exists() else {}

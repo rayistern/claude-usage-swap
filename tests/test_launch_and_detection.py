@@ -187,6 +187,99 @@ def test_launch_prepare_rejects_unknown_account():
         env.restore()
 
 
+def _break_slot_projects(slot_dir, shared_projects, divergent: bool):
+    """Turn a slot's projects/ into the GH #192 incident shape: a REAL dir
+    whose per-project child collides with the shared tree. divergent=True
+    plants a same-path file with DIFFERENT bytes (unhealable — operator
+    judgment); divergent=False plants only a unique stray transcript
+    (healable by the recursive merge)."""
+    link = slot_dir / "projects"
+    if link.is_symlink():
+        link.unlink()
+    proj = link / "-home-user-repo"
+    proj.mkdir(parents=True)
+    (shared_projects / "-home-user-repo").mkdir(exist_ok=True)
+    (proj / "sess-stray.jsonl").write_text("stray")
+    if divergent:
+        (proj / "sess-clash.jsonl").write_text("slot-version")
+        (shared_projects / "-home-user-repo" / "sess-clash.jsonl").write_text("shared-version")
+
+
+def test_launch_prepare_repairs_broken_projects_slot():
+    """GH #192 bug 1+2: a slot whose projects/ is a real dir (colliding with
+    the shared tree by project-dir NAME) must be actually repaired by the
+    launch pre-flight — transcript reunited with the shared tree, dir
+    relinked — instead of exec'ing claude against an isolated projects/
+    ("No conversation found" on --resume)."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        name, d = cus.create_slot(state)
+        st = cus.load_state()
+        st["slots"][name].pop("reserved_until", None)  # slot is idle, make it acquirable
+        cus.save_state(st)
+        _break_slot_projects(d, env.claude_dir / "projects", divergent=False)
+
+        slot_name, slot_dir, _ = cus._launch_prepare("alpha", cus.load_state(), config)
+        assert slot_name == name, "healable slot is repaired and USED, not skipped"
+        assert (slot_dir / "projects").is_symlink()
+        assert (slot_dir / "projects").resolve() == (env.claude_dir / "projects").resolve()
+        assert (env.claude_dir / "projects" / "-home-user-repo" / "sess-stray.jsonl").read_text() == "stray", \
+            "stray transcript merged into the shared tree"
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_skips_unhealable_projects_slot():
+    """GH #192: when the heal genuinely cannot complete (divergent same-path
+    file content), auto-selection must EXCLUDE the broken slot and land on
+    one whose projects/ resolves to the shared tree — never exec onto the
+    isolated dir. The broken slot's divergent data is left intact."""
+    env = _Env()
+    try:
+        state = cus.load_state()
+        config = cus.load_config()
+        name, d = cus.create_slot(state)
+        st = cus.load_state()
+        st["slots"][name].pop("reserved_until", None)
+        cus.save_state(st)
+        _break_slot_projects(d, env.claude_dir / "projects", divergent=True)
+
+        slot_name, slot_dir, _ = cus._launch_prepare("alpha", cus.load_state(), config)
+        assert slot_name != name, "unhealable slot must be skipped in auto selection"
+        assert (slot_dir / "projects").resolve() == (env.claude_dir / "projects").resolve(), \
+            "chosen slot's projects/ verified against the shared tree pre-exec"
+        assert (d / "projects" / "-home-user-repo" / "sess-clash.jsonl").read_text() == "slot-version", \
+            "divergent content preserved on the abandoned slot (never destroyed)"
+    finally:
+        env.restore()
+
+
+def test_launch_prepare_lane_refuses_unhealable_projects():
+    """GH #192: an EXPLICIT --lane onto an unhealable slot fails loudly (the
+    operator pinned it on purpose — landing elsewhere silently would be
+    worse), instead of exec'ing a session forked off the shared tree."""
+    env = _Env()
+    try:
+        import click
+        state = cus.load_state()
+        config = cus.load_config()
+        name, d = cus.create_slot(state)
+        st = cus.load_state()
+        st["slots"][name].pop("reserved_until", None)
+        cus.save_state(st)
+        _break_slot_projects(d, env.claude_dir / "projects", divergent=True)
+
+        try:
+            cus._launch_prepare("alpha", cus.load_state(), config, lane=name)
+            raise AssertionError("expected ClickException for unhealable --lane projects/")
+        except click.ClickException as e:
+            assert "GH #192" in str(e.message)
+    finally:
+        env.restore()
+
+
 def test_mount_account_from_env():
     env = _Env()
     try:
