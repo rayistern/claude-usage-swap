@@ -241,6 +241,57 @@ def test_free_family_probe_report_then_execute_leased_never_probed():
 
 
 # ---------------------------------------------------------------------------
+# (1b) F-O-1 shield (GH #193 review): a DISTINCT-id FREE family sharing a LIVE
+#      mount's refresh generation is NEVER probed/retired — probing rotates the
+#      shared single-use token and logs the live holder out (#104; confirmed
+#      live logout 2026-08-30). Distinct from (1)'s leased-by-id skip: here the
+#      family is NOT leased (no login_family on the slot), so only the fingerprint
+#      shield — not leased_families — can protect it.
+# ---------------------------------------------------------------------------
+
+def test_free_family_sharing_live_mount_generation_never_probed():
+    env = _Env({"acct": _valid("at-c", "rt-c"), "other": _valid("at-o", "rt-o")},
+               active="other", config=_ILGATE)
+    try:
+        # A LIVE mount holding refresh generation "rt-live-gen". Crucially it is NOT
+        # leased to the free family below (no family_id), so leased_families won't
+        # shield that family — only the F-O-1 refresh-fingerprint shield can.
+        env.make_slot("acct", live=True, mount_creds=_valid("at-live", "rt-live-gen"))
+        # A FREE family with a DISTINCT id but the SAME single-use refresh token as
+        # the live mount (a duplicate-generation copy, e.g. an unrotated
+        # `--from-existing`). It is EXPIRED-shaped, so pre-shield the probe ladder
+        # WOULD fire a refresh grant on it — which would rotate "rt-live-gen" and
+        # dead-branch the live mount.
+        env.plant_family("acct", "family-1", _expired("rt-live-gen"))
+        grant_calls: list[str] = []
+        # Empty grant map: ANY probe of "rt-live-gen" raises (unmapped) AND we
+        # belt-and-braces assert no call was recorded.
+        env.patch(cus, "_oauth_refresh_grant", _grant_map({}, calls=grant_calls))
+
+        # execute=True + probe=True is the most aggressive pass; the shield must
+        # still refuse to probe OR retire the shared-generation family.
+        rows = cus._prune_free_families(cus.load_state(), cus.load_config(),
+                                        execute=True, probe=True)
+
+        # No refresh-grant probe fired for the shared generation.
+        assert grant_calls == [], (
+            f"F-O-1 shield must not probe a live-shared generation: {grant_calls}")
+        # The store was NOT retired — still on disk under its live-shape name.
+        fam_path = cus.login_family_creds_path("acct", "family-1")
+        assert fam_path.exists(), "shield must not retire a live-shared free family"
+        assert not [p for p in fam_path.parent.iterdir() if ".dead-" in p.name], \
+            "shield must not rename the shared-generation store to .dead-*"
+        # It emits no family row (hands off entirely, like the leased-skip) and is
+        # not counted toward free-pool depth (a duplicate of a live generation is
+        # not a usable free family).
+        assert not [r for r in rows if r.get("family") == "family-1"], rows
+        depth = [r for r in rows if r["kind"] == "pool_depth" and r["account"] == "acct"]
+        assert depth and depth[0]["live_free"] == 0, rows
+    finally:
+        env.restore()
+
+
+# ---------------------------------------------------------------------------
 # (2) alive free family → rotation persisted into the store
 # ---------------------------------------------------------------------------
 

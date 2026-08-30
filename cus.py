@@ -10028,6 +10028,23 @@ def _prune_free_families(state: dict, config: dict, *, execute: bool, probe: boo
         "probe_cooldown_minutes": hk.get("family_probe_cooldown_minutes", 60),
     }
     pool_size = config.get("independent_logins", {}).get("pool_size", 3)
+    # ---- F-O-1 shield (GH #193 review; confirmed live-logout 2026-08-30) --------
+    # leased_families only shields families held BY ID. A FREE family with a
+    # DISTINCT id can still carry the SAME single-use refresh-token generation as a
+    # LIVE mount (a duplicate-generation copy — e.g. an unrotated `--from-existing`
+    # snapshot). Such a copy is NOT in `leased`, so pre-fix it fell straight through
+    # to the probe below — and `_store_creds_dead`'s refresh-grant probe ROTATES
+    # that shared single-use token, dead-branching the live mount and logging out a
+    # running session (violates #104 / "never log out a live session"; this was the
+    # confirmed root cause of a live logout on 2026-08-30). The deep-walk retire
+    # (rung 3, `_deep_prune_stores`) already shields on this fingerprint; the base
+    # free-family PROBE did not. Reuse the SAME helpers the deep walk uses
+    # (`_live_surface_fingerprints` / `_refresh_fingerprint`) rather than
+    # reimplementing fingerprinting. Computed once here (not per-account) because
+    # this base pass runs in BOTH plain `cus prune` and `cus prune --deep`, so the
+    # shield protects both. Best-effort: an unreadable live surface simply
+    # contributes nothing, exactly as the deep walk treats it.
+    live_fps = _live_surface_fingerprints(state)
     out: list[dict] = []
     for acct in sorted(accounts if accounts is not None else state.get("accounts", {})):
         fams = _all_family_store_ids(acct)
@@ -10045,6 +10062,18 @@ def _prune_free_families(state: dict, config: dict, *, execute: bool, probe: boo
             assert fam not in leased_families(acct, state), \
                 f"housekeeping must never probe leased family {acct}/{fam}"
             path = login_family_creds_path(acct, fam)
+            # F-O-1: a free family whose refresh generation is shared with a live
+            # surface must never be probed OR retired here — probing rotates the
+            # shared single-use token and logs the live holder out. Hand it off
+            # entirely (the deep walk retires it disk-only via rung 3). Not counted
+            # as free-pool depth: a duplicate of a live generation is not a usable
+            # free family, mirroring the leased-skip above.
+            try:
+                _fam_rt = _credential_refresh_token(read_json(path))
+            except (json.JSONDecodeError, OSError):
+                _fam_rt = None
+            if _fam_rt and _refresh_fingerprint(_fam_rt) in live_fps:
+                continue
             dead = _store_creds_dead(path, f"fam:{acct}/{fam}", probe_cfg, allow_probe=probe)
             if not dead:
                 live_free += 1
@@ -19238,8 +19267,13 @@ def prune_cmd(execute: bool, reseed: str | None, no_probe: bool, deep: bool = Fa
     Probing is SAFE here by construction: only FREE families are ever probed
     — a free family's token is held by nobody, so rotating it is claim-
     verify's (#127) own discipline. Leased families (a live mount's
-    generation) are never touched. --no-probe restricts even that to
-    disk-only shape/expiry checks.
+    generation) are never touched. This safety also depends on the F-O-1
+    fingerprint shield (GH #193 review): the free-family pass ALSO skips any
+    family whose refresh generation is SHARED with a live mount/shared-mount/
+    canonical surface — a distinct-id duplicate of a live token is not
+    "held by nobody", and probing it would rotate the single-use token and log
+    the live holder out (#104; live-logout incident 2026-08-30). --no-probe
+    restricts even the genuinely-free families to disk-only shape/expiry checks.
     """
     if not STATE_JSON.exists():
         click.echo("Not initialized. Run `cus init` first.")
@@ -19871,6 +19905,21 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                 slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config,
                                                    exclude=excluded)
                 continue
+            except RuntimeError as e:
+                # F-O-5 (GH #193 review): a NON-dead-store RuntimeError from
+                # execute_swap on a FRESH-slot install (lock timeout, pool
+                # exhaustion, dead-snapshot / verified-install refusal, ...) was
+                # propagating as a raw traceback out of `cus launch auto`. Re-picking
+                # would not help — the refusal is not slot-specific the way a dead
+                # legacy store is — so fail LOUD with remediation instead of a
+                # crash. DeadLegacyStoreError is caught ABOVE (it subclasses
+                # RuntimeError, so its re-pick is unchanged); a click.ClickException
+                # from _install_creds's same-account launch-gate reinstall is NOT a
+                # RuntimeError and propagates past this handler already-clean.
+                raise click.ClickException(
+                    f"launch auto: could not install '{account}' onto {slot_name} — {e} "
+                    f"Provision a fresh family (`cus login-mount {account}`), free/add a slot, "
+                    f"or retry.") from e
             break  # slot healed + creds installed
         else:
             # Every existing slot excluded AND a fresh scaffold still refused —
