@@ -6263,6 +6263,32 @@ def classify_live_creds_owner(live_creds: dict, expected: str, state: dict) -> t
             "account's refresh token was rotated since the last swap)")
 
 
+class DeadLegacyStoreError(RuntimeError):
+    """A swap refused because the chosen (account, slot) LEGACY per-slot login
+    store is DEAD (its OAuth refresh grant returns invalid_grant — typically an
+    unrotated `--from-existing` copy whose token family was rotated away by
+    another live mount). Installing it would blank the mount and log the session
+    out (the 2026-08-10 slot-14->03 incident), so `_execute_swap_locked` raises
+    this at the dead-legacy-store guard instead of installing.
+
+    WHY a dedicated subclass (2026-08-30 follow-up): `cus launch auto` picks the
+    best (account, slot) then installs via execute_swap. When the picked slot has
+    a dead legacy store the guard fires, and before this change the resulting
+    RuntimeError propagated straight out of `_launch_prepare` and crashed the
+    whole `cus launch` with a traceback. `auto` should instead EXCLUDE that slot
+    and re-pick (the operator didn't choose that particular slot), so the launch
+    path needs to catch THIS failure specifically without swallowing unrelated
+    RuntimeErrors (lock timeout, pool exhaustion, dead-snapshot refusal, ...).
+
+    It subclasses RuntimeError so every EXISTING handler — the daemon lane-move
+    `except (RuntimeError, ...)`, `cus slot move`'s `except (..., RuntimeError)`,
+    the same-account launch-gate reinstall — keeps catching it byte-for-byte:
+    the only new behavior is the launch auto path's targeted re-pick. Explicit
+    `cus slot move` / `cus launch --lane` still fail LOUD (the operator named the
+    slot); only the auto picker re-picks.
+    """
+
+
 def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = None,
                  bump_ladder: bool = True, force_reinstall: bool = False) -> dict:
     """Atomically swap to `target_name`. Returns updated state dict.
@@ -6789,7 +6815,11 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                     "likely an unrotated --from-existing copy whose family rotated elsewhere); "
                     "refusing to install creds that would blank the mount (2026-08-10 slot-14)",
                     slot=slot, mount=slot, account=target_name)
-        raise RuntimeError(
+        # DeadLegacyStoreError (subclass of RuntimeError): lets `cus launch auto`
+        # catch THIS specific refusal and re-pick a different slot (2026-08-30
+        # follow-up) while every other caller — which only ever does
+        # `except RuntimeError` — keeps catching it exactly as before.
+        raise DeadLegacyStoreError(
             f"refusing to install '{target_name}' onto lane {slot}: its legacy per-slot login "
             f"store is DEAD (the OAuth refresh grant returns invalid_grant — typically an "
             f"unrotated `--from-existing` copy whose token family was rotated away by another "
@@ -19713,88 +19743,145 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # landed on locked slot-3, the watchdog session's slot).
         slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config)
 
-    # Pre-flight: heal the slot's layout (a launch should never come up
-    # bare-hooked because a symlink rotted; failures now report as failures —
-    # GH #192 bug 2), then align its .claude.json with the canonical — UNLESS
-    # the mount has a live writer (an explicit --lane onto an already-live
-    # same-account lane), where a sync would race it.
-    _launch_heal_mount(slot_name, slot_dir)
-    # GH #192 root cause: launch exec'd claude onto a slot whose projects/ was
-    # a real ISOLATED dir (the heal had silently no-op'd on it), so
-    # `--resume <id>` failed "No conversation found" while the transcript sat
-    # in the shared tree — and every new transcript was stranded in the slot.
-    # Verify the heal actually took BEFORE the exec. Prefer repair (the doctor
-    # just attempted it); fall back to EXCLUDING the slot: auto-picked slots
-    # are re-acquired with the broken ones skipped, an explicit --lane fails
-    # loudly instead (the operator pinned it on purpose — silently landing
-    # elsewhere would be worse than refusing).
-    if not _projects_resolves_to_shared(slot_dir):
-        if lane is not None:
+    # Pre-flight (heal → verify projects/ → sync .claude.json → install creds).
+    #
+    # A picked slot can be refused for TWO reasons, and `auto` must re-pick past
+    # BOTH rather than fail (the operator didn't choose this particular slot):
+    #   1. GH #192: its projects/ won't resolve to the shared tree even after the
+    #      heal (a launch onto it would strand transcripts / break --resume).
+    #   2. 2026-08-30 follow-up: its LEGACY per-slot login store for this account
+    #      is DEAD — `_execute_swap_locked` raises DeadLegacyStoreError from the
+    #      c03767b guard, because installing it would blank the mount and log the
+    #      session out (the 2026-08-10 slot-14->03 incident). Before this fix
+    #      that RuntimeError propagated straight out and crashed `cus launch auto`
+    #      with a traceback; now `auto` excludes the slot and re-picks.
+    # Both reasons funnel through ONE exclude set + the GH #192 acquire_slot
+    # `exclude` re-pick machinery. An explicit --lane fails LOUD on either (the
+    # operator pinned that slot — silently landing elsewhere would be worse).
+
+    def _sync_slot_json(sdir: Path) -> None:
+        """Align the slot's .claude.json with the canonical — UNLESS the mount
+        has a live writer (an explicit --lane onto an already-live same-account
+        lane), where a sync would race it."""
+        if CLAUDE_JSON.exists() and not mount_in_use(sdir):
+            try:
+                sync_mount_claude_json(sdir, read_json(CLAUDE_JSON))
+            except (json.JSONDecodeError, OSError) as e:
+                click.echo(click.style(f"warning: canonical .claude.json sync skipped: {e}", fg="yellow"))
+
+    def _install_creds(sname: str, sdir: Path) -> None:
+        """Install `account` into the acquired (sname, sdir) — the same in-place
+        swap primitive the daemon uses (a no-op when the slot already holds it).
+        Reloads + persists state itself, under the swap lock.
+
+        Raises DeadLegacyStoreError when the (account, slot) legacy login store
+        is dead so the CALLER decides re-pick (auto) vs loud-fail (--lane); other
+        install refusals on the same-account heal path surface as ClickException.
+        """
+        if state.get("slots", {}).get(sname, {}).get("account") != account:
+            execute_swap(account, trigger="launch", slot=sname)
+        elif (config.get("launch_gate", {}).get("enabled", True)
+              and _slot_mount_creds_dead(sname, sdir, account, state, config,
+                                         allow_probe=config.get("launch_gate", {}).get("probe_suspect", True))):
+            # ---- GH #190 launch gate: same-account fast path liveness check ----
+            # The slot ALREADY holds the requested account, so historically no
+            # swap ran and the session exec'd onto whatever bytes sat in the
+            # mount — including well-shaped-but-DEAD creds (expired access token
+            # whose refresh grant returns invalid_grant), which opened the new
+            # session straight into "Not logged in · Run /login". When the
+            # mount's creds prove dead: retire the slot's (dead) family lease so
+            # the reinstall claims a FRESH source, then run the real swap
+            # primitive with force_reinstall (same-account swaps are otherwise
+            # no-ops) so the full verified-install guard stack decides the source
+            # — snapshot, or the dead-snapshot family-seed, or a clean refusal.
+            # bump_ladder=False: a heal-in-place is not rotation churn, so the
+            # account's swap-threshold ladder must not advance.
+            _retire_slot_family_and_lease(sname, account, state, config)
+            try:
+                execute_swap(account, trigger="launch-liveness-reinstall", slot=sname,
+                             bump_ladder=False, force_reinstall=True)
+            except DeadLegacyStoreError:
+                # Same as the new-account branch above: let the caller re-pick
+                # (auto) or fail loud (--lane) rather than masking it as a
+                # generic launch-gate refusal. (2026-08-30 follow-up.)
+                raise
+            except RuntimeError as e:
+                raise click.ClickException(
+                    f"launch gate (GH #190): {sname}'s '{account}' credentials are dead and a "
+                    f"verified reinstall was refused — {e}") from e
+
+    if lane is not None:
+        # ---- Explicit --lane: single-shot, every refusal is LOUD ----
+        # The operator pinned this slot on purpose; silently landing elsewhere
+        # would be worse than refusing. Heal + verify projects/ + sync + install
+        # exactly once; an unhealable projects/ or a dead legacy store both stop
+        # the launch (the dead store as a clean ClickException, not a traceback).
+        _launch_heal_mount(slot_name, slot_dir)
+        if not _projects_resolves_to_shared(slot_dir):
             raise click.ClickException(
                 f"--lane {slot_name}'s projects/ does not resolve to the shared tree and could not be "
                 f"healed (see the 'could NOT heal' line above) — claude --resume would not find shared "
                 f"transcripts and new ones would be stranded (GH #192). Resolve the collisions under "
                 f"{slot_dir / 'projects'} manually (`cus doctor --fix-dirs` to retry), or launch "
                 f"without --lane.")
-        broken: set[str] = set()
-        # Bounded convergence: each failed try excludes one more EXISTING slot,
-        # and once every existing slot is excluded acquire_slot allocates a
-        # brand-new scaffolded one (fresh symlinks → verification passes), so
-        # len(existing)+1 tries always suffice; +1 belt-and-suspenders. The
-        # abandoned broken slots keep their (short-lived) reservations and
-        # their data — nothing is deleted; `cus doctor --fix-dirs` reports
-        # what's left to resolve.
+        _sync_slot_json(slot_dir)
+        try:
+            _install_creds(slot_name, slot_dir)
+        except DeadLegacyStoreError as e:
+            # --lane on a dead-store slot FAILS LOUD (operator chose it); only
+            # `auto` re-picks. Surface the guard's remediation cleanly rather
+            # than crashing with a raw traceback. (2026-08-30 follow-up.)
+            raise click.ClickException(str(e)) from e
+    else:
+        # ---- Auto-pick: bounded re-pick past an unusable slot ----
+        # GH #192 root cause: launch exec'd claude onto a slot whose projects/
+        # was a real ISOLATED dir (the heal silently no-op'd), so `--resume <id>`
+        # failed "No conversation found" and new transcripts were stranded. That
+        # fix re-picks past such slots; this follow-up ALSO re-picks past a slot
+        # whose legacy login store is dead. Bounded convergence: each failed try
+        # excludes one more EXISTING slot, and once every existing slot is
+        # excluded acquire_slot allocates a brand-new scaffolded one (fresh
+        # symlinks → projects/ verification passes; no legacy store → no dead
+        # store), so len(existing)+1 tries always suffice; +1 belt-and-braces.
+        # Excluded slots keep their (short-lived) reservations and their data —
+        # nothing is deleted; `cus doctor --fix-dirs` reports what's left.
+        excluded: set[str] = set()
         max_tries = len(list_slot_dirs()) + 2
         for _ in range(max_tries):
-            broken.add(slot_name)
-            click.echo(click.style(
-                f"launch: skipping {slot_name} — its projects/ does not resolve to the shared "
-                f"tree even after the heal (GH #192); re-picking a slot", fg="yellow"))
-            slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config,
-                                               exclude=broken)
             _launch_heal_mount(slot_name, slot_dir)
-            if _projects_resolves_to_shared(slot_dir):
-                break
+            # Verify the heal actually took BEFORE the exec (GH #192).
+            if not _projects_resolves_to_shared(slot_dir):
+                excluded.add(slot_name)
+                click.echo(click.style(
+                    f"launch: skipping {slot_name} — its projects/ does not resolve to the shared "
+                    f"tree even after the heal (GH #192); re-picking a slot", fg="yellow"))
+                slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config,
+                                                   exclude=excluded)
+                continue
+            _sync_slot_json(slot_dir)
+            try:
+                _install_creds(slot_name, slot_dir)
+            except DeadLegacyStoreError:
+                # The picked slot's legacy per-slot store is dead — installing it
+                # would blank the mount. Exclude it and re-pick (2026-08-30).
+                excluded.add(slot_name)
+                click.echo(click.style(
+                    f"launch: skipping {slot_name} — its legacy login store for '{account}' is DEAD "
+                    f"(installing it would blank the mount, 2026-08-30); re-picking a slot", fg="yellow"))
+                slot_name, slot_dir = acquire_slot(state, prefer_account=account, config=config,
+                                                   exclude=excluded)
+                continue
+            break  # slot healed + creds installed
         else:
+            # Every existing slot excluded AND a fresh scaffold still refused —
+            # fail LOUD with the SAME remediation the guard raises, not a raw
+            # traceback (2026-08-30 follow-up).
             raise click.ClickException(
-                f"no slot with a projects/ reaching the shared tree after excluding "
-                f"{sorted(broken)} (GH #192) — run `cus doctor --fix-dirs` and resolve the "
-                f"reported collisions.")
-    if CLAUDE_JSON.exists() and not mount_in_use(slot_dir):
-        try:
-            sync_mount_claude_json(slot_dir, read_json(CLAUDE_JSON))
-        except (json.JSONDecodeError, OSError) as e:
-            click.echo(click.style(f"warning: canonical .claude.json sync skipped: {e}", fg="yellow"))
-
-    # Install the account into the slot — the same in-place swap primitive the
-    # daemon uses (no-op when the slot already holds it). Reloads and persists
-    # state itself, under the swap lock.
-    if state.get("slots", {}).get(slot_name, {}).get("account") != account:
-        execute_swap(account, trigger="launch", slot=slot_name)
-    elif (config.get("launch_gate", {}).get("enabled", True)
-          and _slot_mount_creds_dead(slot_name, slot_dir, account, state, config,
-                                     allow_probe=config.get("launch_gate", {}).get("probe_suspect", True))):
-        # ---- GH #190 launch gate: same-account fast path liveness check ----
-        # The slot ALREADY holds the requested account, so historically no swap
-        # ran and the session exec'd onto whatever bytes sat in the mount —
-        # including well-shaped-but-DEAD creds (expired access token whose
-        # refresh grant returns invalid_grant), which opened the new session
-        # straight into "Not logged in · Run /login". When the mount's creds
-        # prove dead: retire the slot's (dead) family lease so the reinstall
-        # claims a FRESH source, then run the real swap primitive with
-        # force_reinstall (same-account swaps are otherwise no-ops) so the full
-        # verified-install guard stack decides the source — snapshot, or the
-        # dead-snapshot family-seed, or a clean refusal. bump_ladder=False: a
-        # heal-in-place is not rotation churn, so the account's swap-threshold
-        # ladder must not advance.
-        _retire_slot_family_and_lease(slot_name, account, state, config)
-        try:
-            execute_swap(account, trigger="launch-liveness-reinstall", slot=slot_name,
-                         bump_ladder=False, force_reinstall=True)
-        except RuntimeError as e:
-            raise click.ClickException(
-                f"launch gate (GH #190): {slot_name}'s '{account}' credentials are dead and a "
-                f"verified reinstall was refused — {e}") from e
+                f"no launchable slot for '{account}' after excluding {sorted(excluded)}: each either "
+                f"has a projects/ that won't reach the shared tree (GH #192) or a DEAD legacy login "
+                f"store that would blank the mount (2026-08-30). Provision a fresh family "
+                f"(`cus login-mount {account}`), run `cus doctor --fix-dirs`, or free/add a slot, "
+                f"then retry.")
 
     state = load_state()
     entry = state.setdefault("slots", {}).setdefault(slot_name, {"account": account, "created_ts": now_iso()})
