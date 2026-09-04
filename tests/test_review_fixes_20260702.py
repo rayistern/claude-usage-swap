@@ -250,7 +250,11 @@ def test_429_attributes_to_current_slot_occupant_not_stale_log():
         state["last_429_check_ts"] = _iso(5)
         # session sX currently runs on `name` (which now holds beta).
         cus.session_current_slot = lambda sid: name if sid == "sX" else None
-        cfg = cus.deep_merge(cus.DEFAULT_CONFIG, {"mode": "per_session", "swap_hysteresis": {"enabled": False}})
+        # PR #187 incorporation (safety fix 1): reactive ships OFF in DEFAULT_CONFIG;
+        # enable it explicitly for this current-slot-attribution regression test.
+        cfg = cus.deep_merge(cus.DEFAULT_CONFIG,
+                             {"mode": "per_session", "swap_hysteresis": {"enabled": False},
+                              "reactive": {"enabled": True}})
         moves = cus.check_rate_limit_reactive_per_session(state, cfg)
         assert len(moves) == 1
         assert moves[0]["from"] == "beta", "must attribute to the slot's CURRENT account, not stale alpha"

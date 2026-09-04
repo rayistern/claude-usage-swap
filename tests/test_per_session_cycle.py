@@ -54,6 +54,12 @@ def _config(**overrides) -> dict:
         "defer_swap_near_5h_reset": {"enabled": False},
         "lazy_swap": {"enabled": False},
         "strategy": "lowest_usage",
+        # PR #187 incorporation (safety fix 1): the reactive master gate ships
+        # DISABLED in DEFAULT_CONFIG. These per_session tests exercise the reactive
+        # path deliberately, so they enable it explicitly — exactly what an operator
+        # does in config.yaml. (An empty 429 log still yields no move, so this stays
+        # a no-op for the non-reactive decision tests that also use _config.)
+        "reactive": {"enabled": True},
     })
     return cus.deep_merge(cfg, overrides)
 
@@ -209,6 +215,129 @@ def test_reactive_429_attributes_to_slot_account():
             cus.session_current_slot = _orig_scs
     finally:
         env.restore()
+
+
+def test_reactive_429_event_binding_refuses_new_slot_account():
+    """A delayed event from alpha must never move beta after alpha→beta rescue."""
+    env = _Env(accounts=("alpha", "beta", "gamma"))
+    try:
+        slot = env.make_slot("beta", live=True)
+        state = cus.load_state()
+        original = cus.session_current_slot
+        cus.session_current_slot = lambda sid: slot if sid == "sA" else None
+        event = {"ts": cus.now_iso(), "session_id": "sA", "match": "rate_limit",
+                 "source": "stopfailure", "slot": slot, "account": "alpha"}
+        try:
+            assert cus.check_rate_limit_reactive_per_session(state, _config(), entries=[event]) == []
+            assert not event.get("_retry"), "stale generation is settled, not replayed"
+        finally:
+            cus.session_current_slot = original
+    finally:
+        env.restore()
+
+
+def test_reactive_429_hysteresis_persists_pending_event():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({
+            "current_5h_pct": 100.0, "last_swap_ts": cus.now_iso(),
+        })
+        cus.save_state(state)
+        original = cus.session_current_slot
+        cus.session_current_slot = lambda sid: slot if sid == "sA" else None
+        event_ts = cus.now_iso()
+        cus.RATE_LIMIT_LOG.write_text(
+            f"{event_ts},sA,rate_limit,stopfailure,{slot},alpha\n"
+        )
+        try:
+            cfg = _config(swap_hysteresis={
+                "enabled": True, "min_seconds_between_reactive_swaps": 300,
+            })
+            assert cus.check_rate_limit_reactive_per_session(state, cfg) == []
+            assert state["pending_429_entries"][0]["account"] == "alpha"
+            assert state["last_429_check_ts"], "disk cursor advances only after pending is persisted"
+        finally:
+            cus.session_current_slot = original
+    finally:
+        env.restore()
+
+
+def test_reactive_429_refuses_degraded_immediate_retrip_target():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        slot = env.make_slot("alpha", live=True)
+        state = cus.load_state()
+        state["accounts"]["alpha"].update({"current_5h_pct": 100.0, "current_7d_pct": 10.0})
+        state["accounts"]["beta"].update({"current_5h_pct": 98.0, "current_7d_pct": 10.0})
+        original = cus.session_current_slot
+        cus.session_current_slot = lambda sid: slot if sid == "sA" else None
+        event = {"ts": cus.now_iso(), "session_id": "sA", "match": "rate_limit",
+                 "source": "stopfailure", "slot": slot, "account": "alpha"}
+        try:
+            assert cus.check_rate_limit_reactive_per_session(state, _config(), entries=[event]) == []
+            assert event.get("_retry") is True
+        finally:
+            cus.session_current_slot = original
+    finally:
+        env.restore()
+
+
+def test_reactive_resume_targets_each_pane_once():
+    # PR #187 incorporation adaptations:
+    #   safety fix 1 — resume ships OFF; enable it explicitly for this test.
+    #   safety fix 3 — exactly ONE Escape per pane, then a settle wait longer than
+    #                  the escape-code timeout BEFORE the message (never a double
+    #                  Escape: a second clears the draft / opens Rewind, and no
+    #                  settle drops the message's first char as Alt+<char>).
+    #   safety fix 4 — the injected message identifies as an automated agent (Claude).
+    sessions = [
+        type("S", (), {"pane": "%1", "tmux_socket": "/tmp/tmux-a"})(),
+        type("S", (), {"pane": "%1", "tmux_socket": "/tmp/tmux-a"})(),
+        type("S", (), {"pane": "%1", "tmux_socket": "/tmp/tmux-b"})(),
+    ]
+    original_live = cus.live_sessions_on_slot
+    original_keys = cus.tmux_send_keys
+    original_text = cus.tmux_send_text
+    original_sleep = cus.time.sleep
+    events: list[tuple] = []
+    texts: list[tuple] = []
+    cus.live_sessions_on_slot = lambda slot: sessions
+    cus.tmux_send_keys = lambda pane, *sent, tmux_socket=None: events.append(("keys", pane, sent, tmux_socket)) or True
+    cus.tmux_send_text = lambda pane, message, tmux_socket=None: (
+        events.append(("text", pane, message, tmux_socket))
+        or texts.append((pane, message, tmux_socket)) or True)
+    cus.time.sleep = lambda s: events.append(("sleep", s))
+    try:
+        panes = cus._resume_reactive_slot_sessions(
+            "slot-2", _config(reactive={"resume_after_slot_swap": True}))
+        assert panes == ["%1", "%1"], "same pane id on distinct tmux servers is two sessions"
+        # Exactly one Escape per pane (never a pair), each with its own socket.
+        keys = [e for e in events if e[0] == "keys"]
+        assert keys == [
+            ("keys", "%1", ("Escape",), "/tmp/tmux-a"),
+            ("keys", "%1", ("Escape",), "/tmp/tmux-b"),
+        ], f"expected a single Escape per pane, got {keys}"
+        # Per-pane ordering: Escape → settle(> parser timeout) → message.
+        assert events == [
+            ("keys", "%1", ("Escape",), "/tmp/tmux-a"),
+            ("sleep", cus.ESCAPE_SETTLE_SECONDS),
+            ("text", "%1", texts[0][1], "/tmp/tmux-a"),
+            ("keys", "%1", ("Escape",), "/tmp/tmux-b"),
+            ("sleep", cus.ESCAPE_SETTLE_SECONDS),
+            ("text", "%1", texts[1][1], "/tmp/tmux-b"),
+        ], f"escape→settle→message ordering violated: {events}"
+        assert cus.ESCAPE_SETTLE_SECONDS > cus.ESCAPE_CODE_TIMEOUT_SECONDS
+        assert [socket for _, _, socket in texts] == ["/tmp/tmux-a", "/tmp/tmux-b"]
+        assert all("Continue from exactly where" in msg for _, msg, _ in texts)
+        assert all(msg.startswith("[automated cus watchdog — Claude, not Rayi] ")
+                   for _, msg, _ in texts), "injected message must identify as an automated agent"
+    finally:
+        cus.live_sessions_on_slot = original_live
+        cus.tmux_send_keys = original_keys
+        cus.tmux_send_text = original_text
+        cus.time.sleep = original_sleep
 
 
 def test_fast_cadence_tracks_occupancy_in_per_session():
@@ -499,6 +628,49 @@ def test_hybrid_cycle_moves_slot_and_shared_mount_together():
         shared_moves = [c for c in calls if c[1] is None]
         assert slot_moves, f"expected a slot move for {s1}; calls={calls}"
         assert shared_moves, f"expected a shared-mount swap (slot=None); calls={calls}"
+    finally:
+        env.restore()
+
+
+def test_shared_reactive_dry_run_requeues_consumed_event():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        state = cus.load_state()
+        event = {"ts": cus.now_iso(), "session_id": "bare", "match": "rate_limit",
+                 "source": "stopfailure", "account": "alpha"}
+        decision = cus.SwapDecision(
+            target="beta", reason="test", tier=3, gate="reactive_429",
+            deferrable=False, reactive_entries=[event],
+        )
+        cus._execute_global_mount_swap(decision, state, _config(), no_execute=True)
+        pending = cus.load_state()["pending_429_entries"]
+        assert pending == [event]
+    finally:
+        env.restore()
+
+
+def test_shared_reactive_execution_failure_requeues_consumed_event():
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        state = cus.load_state()
+        event = {"ts": cus.now_iso(), "session_id": "bare", "match": "rate_limit",
+                 "source": "stopfailure", "account": "alpha"}
+        decision = cus.SwapDecision(
+            target="beta", reason="test", tier=3, gate="reactive_429",
+            deferrable=False, reactive_entries=[event],
+        )
+        original = cus.execute_swap
+        cus.execute_swap = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            try:
+                cus._execute_global_mount_swap(decision, state, _config(), no_execute=False)
+                raise AssertionError("expected swap failure")
+            except RuntimeError as exc:
+                assert str(exc) == "boom"
+        finally:
+            cus.execute_swap = original
+        pending = cus.load_state()["pending_429_entries"]
+        assert pending == [event]
     finally:
         env.restore()
 
