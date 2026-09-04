@@ -209,3 +209,27 @@ Moves a live lane onto a target account **in place, session uninterrupted** (cla
 - **72-hour weekly reset:** the `seven_day` cap actually resets ~every 72h (fixed ~04:50–05:00 UTC anchor), *not* every 7 days; `seven_day.resets_at` from the API is misleading. cus now projects the real 72h reset, so "resets in Xh" reflects reality.
 - **Autonomy:** for reversible fixes (restore, retag, slot move, config tweak) just do them and log a walk-back — don't escalate a question that a reversible command resolves.
 - **New reference:** `docs/DIAGNOSTICS.md` now covers mount topology, the two-dimensional (5h vs per-model-weekly) exhaustion model, the premium/standard split, the blank-mount signature, and the stale-poll gotcha.
+
+## Update 2026-09-04 — the build-babysitter layer + transcript ground truth
+
+Two additions from the flagship-site retrospective (2026-09-02 → 04), both additive to
+this skill:
+
+- **`build-babysitter` skill** (`~/repos/vibeCoding/skills/build-babysitter/`, PR #330):
+  the *momentum* companion to this *keep-alive* skill. Where `watch` keeps sessions
+  alive, logged in and under cap, the babysitter holds the owner's chair over ONE build
+  family — next-item nudges instead of bare "keep going", the D-queue defaults with a
+  logged trail, owner-lens QA on a cadence, and the effort scorecard at the end. It
+  **uses** this skill's mechanics (dead-pane relaunch, `cus slot move` + nudge, the
+  sign-and-verify rules) and does not restate them. Load both when a build is running
+  unattended.
+- **Session state from transcripts, not panes.** `python3
+  ~/repos/context-dashboard/ingest/session_metrics.py <family-slug> --live` (PR #60)
+  prints each owner-prompted session with a state judged from its transcript's last
+  assistant message — `working` / `parked` / `died_limit` / `died_login` /
+  `died_killed` / `cut_off` — plus idle minutes and last words. This is immune to the two
+  failure modes above (stale scrollback, 2026-07-07; the Fable soft-limit `⎿` block
+  above the prompt that `tail -5` misses, 2026-07-14). Pane capture is still needed to
+  confirm a pane is DEAD before relaunching (login shell at the bottom, no claude child)
+  and to verify a nudge submitted — the sensor tells you *what* stopped and *why*, the
+  pane tells you *whether a process is there to nudge*.
