@@ -244,6 +244,11 @@ this skill:
   dead. Nudge only on `idle` with `unchanged_for_s` ≥ 60; press Enter only on your own
   `[automated …` draft. Pane text still decides liveness and submission; the transcript
   sense below decides WHY it stopped.
+  (Since 2026-09-04 that path is a SHIM: the reader's code and tests live in
+  `~/repos/vibeCoding/skills/build-babysitter/pane_state.py`, the build-babysitter skill's
+  directory, so that skill runs without cus; the shim execs the vibeCoding copy — or, if it
+  is not cloned, prints one `{"error": …}` line and exits 3, distinct from the reader's
+  exit 2 for "tmux unusable". `PANE_STATE_PY=<file>` overrides the lookup.)
 - **Session state from transcripts, not panes.** `python3
   ~/repos/context-dashboard/ingest/session_metrics.py <family-slug> --live` (PR #60)
   prints each owner-prompted session with a state judged from its transcript's last
