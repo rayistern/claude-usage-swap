@@ -223,6 +223,24 @@ this skill:
   **uses** this skill's mechanics (dead-pane relaunch, `cus slot move` + nudge, the
   sign-and-verify rules) and does not restate them. Load both when a build is running
   unattended.
+- **Read panes through `skills/pane_state.py`, not by hand.** `python3
+  ~/repos/claude-usage-swap/skills/pane_state.py <tmux session names or pane ids>` prints
+  one JSON line per named pane: `state` ∈ `working` (a live spinner row like
+  `· Zigzagging… (12s · ↓ 1.2k tokens)`, "Waiting for N background agent", a live
+  `◯ agent … 21m 55s` row, `⎿ Running…`) / `idle` / `idle_with_draft` (with
+  `draft_signed` — press Enter ONLY on your own `[automated …` nudge, and only after it
+  has sat `unchanged_for_s` ≥ 30; any other draft is a human mid-sentence) / `approval`
+  (a numbered box — never answer it) / `limit_menu` / `login_menu` / `exited` (banner
+  while a process is still alive — re-read, never relaunch into it) / `no_claude` (TUI on
+  screen, no process — re-read) / `dead` (no process and no TUI — the only relaunch
+  state) / `unknown` (a shell under a live node, a redraw) / `tmux_error`. Menus and
+  boxes are judged only in the active block above the input rule, so answered boxes and
+  dismissed menus higher in scrollback cannot re-trigger. `bg_agents` is the footer's
+  `← N agents` count (`← for agents` = 0), not busy-ness. Name your panes: `--all` lists
+  live processes only, so a dead pane vanishes from it; a named pane with no process
+  prints `not_found`, which for a protected pane means dead. Nudge only on `idle` with
+  `unchanged_for_s` ≥ 60. Pane text still decides liveness and submission; the transcript
+  sense below decides WHY it stopped.
 - **Session state from transcripts, not panes.** `python3
   ~/repos/context-dashboard/ingest/session_metrics.py <family-slug> --live` (PR #60)
   prints each owner-prompted session with a state judged from its transcript's last
