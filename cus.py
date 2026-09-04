@@ -81,7 +81,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import click
@@ -574,6 +574,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # throttled, so this is belt-and-suspenders against hammering the
         # profile endpoint during a fleet-wide real rate-limit storm.
         "probe_cooldown_minutes": 30,
+        # 2026-09-03 (03 subscription-ended incident): auto-MIGRATE the shared
+        # bare ~/.claude mount OFF its account the moment that account becomes
+        # unusable — subscription-ended (auto-flagged `subscription_disabled`) OR
+        # its canonical refresh token dead (`snapshot_refresh_dead`) — onto a
+        # healthy live account. Before this, the guard only auto-EXCLUDED the dead
+        # account from FUTURE rotation; the ALREADY-LIVE shared mount kept riding
+        # it, so every bare session errored "organization has disabled Claude
+        # subscription access" / "Login expired" until an operator moved it by
+        # hand. Slots already get this via decide_swap Trigger 0 / the evacuate
+        # sweep — the shared mount was the uncovered case. Set false to restore the
+        # exclude-only behavior. See _auto_migrate_shared_mount_enabled.
+        "auto_migrate_shared_mount": True,
     },
     "poll_interval_seconds": 300,
     "strategy": "smart",  # smart | headroom | lowest_usage | drain | strict_priority | round_robin
@@ -4979,6 +4991,120 @@ def _disabled_accounts(config: dict, state: dict | None = None) -> set:
     return out
 
 
+def _auto_migrate_shared_mount_enabled(config: dict) -> bool:
+    """2026-09-03: whether the hybrid daemon auto-migrates the shared bare mount
+    off a subscription-ended / dead-canonical-refresh account onto a healthy live
+    account (see DEFAULT_CONFIG subscription_guard.auto_migrate_shared_mount).
+
+    Independent of the subscription_guard master gate on purpose: the dead-refresh
+    failure mode has nothing to do with subscription probing, and the sub-ended
+    mode is already fed by whatever set `subscription_disabled` (which is itself
+    guard-gated at the detection point). Default ON."""
+    return bool(config.get("subscription_guard", {}).get("auto_migrate_shared_mount", True))
+
+
+def _shared_mount_account_unhealthy(account: str | None, state: dict, config: dict) -> str | None:
+    """Return a short human reason iff the account currently backing the SHARED
+    bare ~/.claude mount is unusable — so every bare session on it would open/keep
+    erroring — else None. Drives the hybrid cycle's auto-migration (2026-09-03
+    03-subscription-ended incident).
+
+    Two failure modes, both seen that day:
+      (a) subscription-ended / operator-disabled — `_disabled_accounts(config,
+          state)` (org-disabled bare sessions answer "organization has disabled
+          Claude subscription access for Claude Code"). UNCONDITIONAL: an
+          org-disabled account 429s every request even with a live token, so it
+          is a real block no matter what the live mount looks like.
+      (b) dead canonical refresh — the cached `snapshot_refresh_dead` flag (set by
+          the un-stale sweep's refresh-grant probe; bare sessions answer "Login
+          expired"). We read the CACHED flag here, not a fresh probe: this runs
+          every cycle and must stay cheap + side-effect-free (the probe rotates a
+          token). The migration's TARGET-side check does the authoritative re-probe
+          (`_account_snapshot_dead`) — decision layer optimistic, execution layer
+          authoritative, the same split the picker uses.
+
+          FIX 2026-09-04 (F-F-1, blind review): mode (b) additionally requires that
+          the LIVE shared mount itself CANNOT self-heal before flagging unhealthy.
+          `snapshot_refresh_dead` describes the CANONICAL snapshot store, NOT the
+          live mount — and for a shared-mount account the canonical goes refresh-
+          dead BY CONSTRUCTION: bare sessions rotate the live token, so the
+          snapshot's single-use refresh grant becomes a dead branch, the un-stale
+          sweep sets `snapshot_refresh_dead` (cus.py ~3861), and the success-poll
+          clear is DELIBERATELY skipped for the active account (cus.py ~9134, "live
+          family fine, snapshot dead"). So the flag sticks on a perfectly healthy,
+          self-healing live mount (exactly merkos's steady state). Migrating the
+          whole bare fleet off that would violate the proven "the bare mount has
+          its OWN live refresh; a dead canonical is NOT a reason to act" model and
+          churn every bare session repeatedly. So we read the live mount creds
+          (the same way the #141 live-mount health code does) and only treat mode
+          (b) as unhealthy when the live mount is blank/invalid OR carries no
+          refresh token to regenerate from — i.e. it genuinely can't self-heal (the
+          rayi1 trap: dead canonical AND blanked live mount). A live mount with a
+          usable refresh token self-heals on its next API call, so we return None.
+
+    Note this only detects the SHARED mount's own account; per-lane eviction off
+    the same conditions already exists (decide_swap Trigger 0 + the evacuate
+    sweep)."""
+    if not account:
+        return None
+    # Mode (a): org-disabled / subscription-ended — unconditional real block.
+    if account in _disabled_accounts(config, state):
+        return f"{account} is subscription-ended / disabled"
+    # Mode (b): dead canonical refresh, BUT only when the live mount can't heal.
+    acct = (state.get("accounts") or {}).get(account)
+    if isinstance(acct, dict) and acct.get("snapshot_refresh_dead"):
+        # Read the LIVE shared-mount creds the same way the #141 live-mount health
+        # code does (read_json of CREDS_JSON; unreadable/missing == unusable). A
+        # dead canonical only strands bare sessions if the live mount ALSO can't
+        # self-heal — blank/invalid token, or no refresh token to mint a new access
+        # token from. Otherwise the live refresh regenerates on the next request.
+        try:
+            live_creds = read_json(CREDS_JSON) if CREDS_JSON.exists() else None
+        except (json.JSONDecodeError, OSError):
+            live_creds = None  # unreadable == unusable, treat as blanked/stuck
+        if _live_mount_creds_invalid(live_creds) or not _credential_refresh_token(live_creds):
+            return f"{account}'s canonical refresh token is dead and the live mount cannot self-heal"
+    return None
+
+
+def _pick_shared_mount_migration_target(
+        state: dict, config: dict, base_exclude: set,
+        dead_check: "Callable[[str], bool]") -> "SwapTarget | None":
+    """Pick a healthy account to migrate the shared bare mount ONTO, re-picking
+    past any dead-canonical candidate (2026-09-04, F-F-2 blind review).
+
+    `pick_swap_target` deliberately ADMITS a dead-snapshot account when it still
+    has a free login family (cus.py ~5151) — safe for a LANE (the install seeds
+    from the family) but FATAL for the shared mount, which installs the canonical
+    directly and BLANKS on a dead one (the rayi1 trap). A single pick that lands on
+    such an account must NOT abort the migration when a healthy account is available
+    behind it (a dead-snapshot-with-family account can outrank a healthy one under
+    smart scoring). So we loop: add each dead-canonical pick to the exclusion set
+    and re-pick, until we find a non-dead target or the pool is exhausted.
+
+    `dead_check(name) -> bool` decides "dead canonical": the daemon passes the
+    authoritative (network-capable, cooldown-cached) `_account_snapshot_dead`;
+    diagnose() passes a pure state-flag proxy so it stays side-effect-free. The
+    loop is bounded by the account count so it can never spin. Returns the first
+    non-dead `SwapTarget`, or None when no live target exists (caller URGENT-
+    surfaces / holds)."""
+    shared_active = state.get("active")
+    excl = set(base_exclude)
+    # +1 headroom: at most one pick per account, plus the terminating None pick.
+    for _ in range(len((state.get("accounts") or {})) + 1):
+        cand = pick_swap_target(
+            _state_excluding_accounts(state, shared_active, excl), config)
+        if cand is None:
+            return None
+        if dead_check(cand.name):
+            # Installing a dead canonical onto the shared mount would blank it —
+            # exclude this pick and keep looking for a live target behind it.
+            excl.add(cand.name)
+            continue
+        return cand
+    return None
+
+
 def _spread_lanes_enabled(config: dict) -> bool:
     """Master gate for the anti-clustering lane-spread levers (2026-07-06).
     False ⇒ scoring penalty and the deferrable-move HOLD both revert to prior
@@ -6885,6 +7011,33 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
                 f"and log the session out (the 2026-07-07 merkos dead-snapshot incident, which blanked "
                 f"chats1a). Re-login the account first: `cus relogin {target_name}`. Lane left on its "
                 f"prior account (no creds written).")
+    # ---- 2026-09-03 shared-mount dead-snapshot refuse (03-subscription-ended
+    # incident follow-on) ----
+    # The lane guard above (slot is not None) family-seeds a dead canonical so a
+    # LANE never blanks. The SHARED mount (slot is None) has NO family-seed path —
+    # it installs the account's canonical snapshot directly — so a dead canonical
+    # BLANKS ~/.claude/.credentials.json on Claude Code's first refresh (every bare
+    # session → "Login expired"). This is the rayi1 trap hit while migrating the
+    # bare mount off subscription-ended 03: `cus switch rayi1` installed rayi1's
+    # dead canonical and blanked the mount. The #141 blank-SHAPE guards don't catch
+    # a well-SHAPED-but-dead snapshot (see _account_snapshot_dead). So REFUSE (a
+    # clean no-op — nothing is written until the atomic_copy further down) rather
+    # than blank. Both callers benefit: the daemon auto-migrate (which already
+    # re-probes its target) and a manual `cus switch`. The probe is cheap when the
+    # snapshot's access token is valid, persists a rotation when it refreshes, and
+    # fails OPEN on a transient — so a healthy switch is never wrongly refused.
+    if (slot is None and claimed_family is None and not used_independent
+            and _account_snapshot_dead(target_name, config)):
+        _cred_audit("shared-mount-dead-snapshot", "refused-would-blank",
+                    "shared-mount target canonical snapshot is DEAD (refresh invalid_grant) — "
+                    "refusing to install (would blank the bare mount; no family-seed path for slot=None)",
+                    mount="shared-mount", account=target_name)
+        raise RuntimeError(
+            f"refusing to switch the shared ~/.claude mount onto '{target_name}': its canonical "
+            f"snapshot's OAuth refresh grant returns invalid_grant (DEAD), and the shared mount has no "
+            f"login-family seed path — installing it would BLANK the mount and log every bare session out "
+            f"('Login expired'). Re-login first: `cus relogin {target_name}`. Mount left on its prior "
+            f"account (no creds written). [2026-09-03 rayi1 dead-canonical trap]")
     # ---- 2026-07-07 divergence-logout guard (GH #104 lane invariant) ----
     # INVARIANT: a SLOT swap that lands on an account ALSO held by the shared
     # ~/.claude mount or by another live lane MUST run a DISTINCT login family —
@@ -8842,6 +8995,58 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         global_decision = decide_swap(
             _state_excluding_accounts(state, shared_active, shared_excl), config, usage_by_account, {})
 
+    # Auto-migrate the shared bare mount OFF an unhealthy account (2026-09-03
+    # 03-subscription-ended incident). The subscription guard already auto-EXCLUDES
+    # a sub-ended account from FUTURE rotation and decide_swap Trigger 0 evicts a
+    # lane off an operator-disabled one, but nothing moved the ALREADY-LIVE SHARED
+    # mount off a sub-ended (or dead-canonical) account — bare sessions kept riding
+    # the dead account until they errored ("organization has disabled Claude
+    # subscription access" / "Login expired"). Fire only when no proactive/reactive
+    # swap already claims the mount (global_decision is None) so this never
+    # overrides a ladder/429 choice, and reuse `shared_excl` (computed identically
+    # in the else-branch above — the migrate block is reachable only when
+    # global_decision is None, i.e. that else-branch ran) so we can't double-book
+    # an account a slot holds (GH #104).
+    shared_migrate_hold_logged = False  # FIX 2026-09-04 (F-F-6): dedup the hold record
+    if global_decision is None and _auto_migrate_shared_mount_enabled(config):
+        unhealthy = _shared_mount_account_unhealthy(shared_active, state, config)
+        if unhealthy:
+            # Re-pick past a dead-canonical target before giving up (F-F-2): the
+            # picker admits a dead-snapshot-with-free-family account, which would
+            # BLANK the shared mount (no seed path) — reject it authoritatively with
+            # `_account_snapshot_dead` and keep looking for a live target behind it.
+            # `shared_excl` is the same set computed at the else-branch above.
+            tgt = _pick_shared_mount_migration_target(
+                state, config, shared_excl,
+                lambda name: _account_snapshot_dead(name, config))
+            if tgt is not None:
+                reason = (f"shared-mount account {unhealthy} — migrating bare sessions "
+                          f"onto {tgt.name} ({tgt.reason})")
+                click.echo(f"  shared-mount-migrate: {reason}")
+                global_decision = SwapDecision(
+                    target=tgt.name,
+                    reason=reason,
+                    # Pin tier 3 (force / most-urgent): the mount is genuinely
+                    # unusable, so the rescue must not wait for a session Stop under
+                    # hot_swap. determine_tier() off the ~0%-usage dead account would
+                    # yield tier 1 and, under non-default hot_swap, add a wait-for-
+                    # Stop delay to an urgent migration (F-F-6 / F-O-5).
+                    tier=3,
+                    gate="shared_mount_migrate",
+                    deferrable=False,
+                )
+            else:
+                # No live target after re-picking past every dead-canonical one.
+                msg = (f"shared bare mount is on {unhealthy} but no healthy target — "
+                       f"all clean accounts are slot-held / disabled / dead-canonical; "
+                       f"free one with `cus slot move <slot> <acct>` or relogin an "
+                       f"account. Bare sessions will error until this is resolved")
+                click.echo(f"  [URGENT] shared-mount-migrate: {msg}")
+                _log_decision(_build_decision_record(
+                    state, config, action="hold", gate="shared_mount_migrate_blocked",
+                    reason=msg))
+                shared_migrate_hold_logged = True
+
     # Persist usage + 429 watermark BEFORE acting (crash-safe ordering).
     save_state(state)
 
@@ -8849,7 +9054,10 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         _execute_slot_moves(slot_moves, state, config, no_execute)
     _execute_global_mount_swap(global_decision, state, config, no_execute)
 
-    if not slot_moves and global_decision is None:
+    # Suppress the generic no_moves hold when the shared-mount-migrate block already
+    # logged a blocked hold this cycle (F-F-6): the blocked record is the specific,
+    # actionable one; a second no_moves line for the same cycle is pure noise.
+    if not slot_moves and global_decision is None and not shared_migrate_hold_logged:
         occupied = occupied_slot_accounts(state)
         _log_decision(_build_decision_record(
             state, config, action="hold", gate="no_moves",
@@ -12366,6 +12574,43 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                         f"To acknowledge + silence while it stays dead: `cus disable {name} --reason 'subscription ended'`."),
                 affected=name,
             ))
+
+    # Condition 1c (2026-09-04, F-F-4 = F-O-1 blind-review consensus): the SHARED
+    # bare mount's own account is unhealthy (subscription-ended/disabled, or a dead
+    # canonical the live mount can't self-heal) AND the daemon has NO healthy slot-
+    # free account to auto-migrate it onto. The 2026-09-03 incident's root cause was
+    # "nobody noticed until bare sessions errored"; the auto-migration (hybrid cycle)
+    # only writes an [URGENT] line to the daemon's stdout + a decisions.jsonl hold
+    # when it's blocked — surfaces an operator watching `cus sos` / SOS.md never see.
+    # This raises that blocked state as an URGENT SOS so the escalation surface shows
+    # it. Only meaningful where the shared mount serves sessions (global/hybrid); in
+    # per_session it is observe-only/authless. Mirrors the migrate block's target
+    # search but stays PURE (diagnose is also called from the statusline + `cus sos`,
+    # where a token-rotating probe would race): the dead-canonical re-pick uses the
+    # cached `snapshot_refresh_dead` state flag, not the network `_account_snapshot_dead`
+    # the daemon uses. `_shared_mount_account_unhealthy` does one cheap creds read of
+    # the live mount (same as Condition 0 above), no network.
+    if config.get("mode", "global") in ("global", "hybrid"):
+        _sm_active = state.get("active")
+        _sm_reason = _shared_mount_account_unhealthy(_sm_active, state, config)
+        if _sm_reason:
+            _sm_target = _pick_shared_mount_migration_target(
+                state, config, _live_slot_accounts(state),
+                lambda n: bool((accounts.get(n) or {}).get("snapshot_refresh_dead")))
+            if _sm_target is None:
+                out.append(SOSCondition(
+                    severity="urgent",
+                    summary=(f"shared bare mount stuck on {_sm_reason} — no healthy target, "
+                             f"bare sessions are erroring with no auto-fix coming"),
+                    action=(f"The shared ~/.claude mount is on '{_sm_active}' ({_sm_reason}); every "
+                            f"BARE session on it errors, and cus cannot auto-migrate it because no "
+                            f"clean, slot-free account is available (all are slot-held / disabled / "
+                            f"dead-canonical). Free a target and cus will migrate on its next cycle:\n"
+                            f"      cus slot move <slot> <clean-account>   # frees that account\n"
+                            f"    or relogin an account so it becomes a healthy target:\n"
+                            f"      cus relogin <account>   # then: cus poll"),
+                    affected=_sm_active or "system",
+                ))
 
     # Condition 2 + 3: targets available?
     # Honor allow_rate_limited_targets (issue #5): if set, rate_limited
