@@ -237,9 +237,12 @@ this skill:
   boxes are judged only in the active block above the input rule, so answered boxes and
   dismissed menus higher in scrollback cannot re-trigger. `bg_agents` is the footer's
   `← N agents` count (`← for agents` = 0), not busy-ness. Name your panes: `--all` lists
-  live processes only, so a dead pane vanishes from it; a named pane with no process
-  prints `not_found`, which for a protected pane means dead. Nudge only on `idle` with
-  `unchanged_for_s` ≥ 60. Pane text still decides liveness and submission; the transcript
+  live processes only, so a dead pane vanishes from it; a name that matches no pane at
+  all prints `not_found` (the pane is gone or renamed — look the session up by uuid
+  before assuming death); a pane with no process is `dead`. A whole-tmux failure prints
+  one `{"error": …}` line and exits 2 — every protected pane is unknown that tick, not
+  dead. Nudge only on `idle` with `unchanged_for_s` ≥ 60; press Enter only on your own
+  `[automated …` draft. Pane text still decides liveness and submission; the transcript
   sense below decides WHY it stopped.
 - **Session state from transcripts, not panes.** `python3
   ~/repos/context-dashboard/ingest/session_metrics.py <family-slug> --live` (PR #60)
