@@ -911,6 +911,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # >= 2 live lanes are affected, so under normal one-lane-per-account
         # operation this is inert (no extra polling → no 429-budget cost).
         "cluster_within_bonus_pct": 10,
+        # PR #187 outer-sleep acceleration gate (2026-09-04 incorporation).
+        # main's poll_accel only shortens the PER-ACCOUNT `_account_poll_due`
+        # interval; #187 additionally folds the near-step fast interval into the
+        # daemon's OUTER inter-cycle sleep (`_adaptive_sleep_seconds`) so the whole
+        # loop wakes at `fast_interval_seconds` when any account is near a step.
+        # SHIPS INERT: this defaults False so incorporating #187 does NOT change
+        # the running daemon's poll cadence (the live config sets `poll` = 180s and
+        # does not set this key; the documented poll-burnout hazard makes a silent
+        # cadence change unacceptable). It is a SEPARATE flag from `enabled` on
+        # purpose — `enabled` defaults True, and `reactive.enabled` is True in the
+        # live config, so gating on either would auto-activate. Flip to true to let
+        # the daemon wake early near a ladder step. When false, `_adaptive_sleep_
+        # seconds` is byte-for-byte main's GH #59-only behavior.
+        "accelerate_daemon_sleep": False,
     },
     # Anti-clustering lane spread (2026-07-06 incident: the daemon piled ALL live
     # lanes onto ONE "best-scored" account — first rayi5, then rayi4 — instead of
@@ -4787,6 +4801,29 @@ def _poll_accel_enabled(config: dict) -> bool:
     """Master gate for both near-threshold fixes. False ⇒ prior behavior
     bit-for-bit (trigger reads raw polled %, no fast cadence)."""
     return bool(config.get("poll_accel", {}).get("enabled", True))
+
+
+def _adaptive_accel_daemon_sleep_enabled(config: dict) -> bool:
+    """Gate for PR #187's NEW behavior: folding near-step poll acceleration into
+    the daemon's OUTER inter-cycle sleep (`_adaptive_sleep_seconds`), so the whole
+    daemon wakes on `fast_interval_seconds` when an account is near a step — not
+    just the per-account `_account_poll_due` interval that main's poll_accel
+    already shortens.
+
+    SHIPS INERT (2026-09-04, PR #187 incorporation). This defaults False and is a
+    SEPARATE sub-gate from `poll_accel.enabled` on purpose: the live operator's
+    config.yaml sets neither `poll_accel` (so the master gate defaults True) nor
+    `reactive.enabled: false` (it sets it True), so gating this new outer-sleep
+    acceleration on EITHER of those would silently change the running daemon's
+    documented poll cadence (poll=180s is deliberate; there was an overnight
+    5-hour poll-burnout once). A dedicated flag that the live config does not set
+    keeps `_adaptive_sleep_seconds` byte-for-byte main's GH #59-only behavior until
+    the owner explicitly opts in with `poll_accel.accelerate_daemon_sleep: true`.
+
+    Requires the poll_accel master gate too — accelerating the outer sleep is
+    meaningless when poll_accel itself is off."""
+    return _poll_accel_enabled(config) and bool(
+        config.get("poll_accel", {}).get("accelerate_daemon_sleep", False))
 
 
 def _next_ladder_step(acct: dict, config: dict) -> float:
@@ -18085,13 +18122,24 @@ def _adaptive_sleep_seconds(state: dict, config: dict, base_interval: float) -> 
 
     Still only ever SHORTENS `base_interval` (returns it unchanged when nothing
     resets sooner and no account is near a step), floored by `min_repoll_seconds`
-    so we never busy-loop. poll_accel is gated by `poll_accel.enabled` (main's
-    pre-existing default; `enabled: False` reverts to the GH #59-only behavior).
+    so we never busy-loop.
+
+    INERT-GATED (2026-09-04, PR #187 incorporation): the outer-sleep folding is
+    behind `_adaptive_accel_daemon_sleep_enabled` — a dedicated
+    `poll_accel.accelerate_daemon_sleep` flag defaulting False — NOT behind
+    `poll_accel.enabled` (which defaults True) nor `reactive.enabled` (which the
+    live config sets True). With the flag off, `intended` stays `base_interval`
+    and every return path below reduces to main's GH #59-only formula
+    byte-for-byte, so deploying this onto the live config does NOT change the
+    daemon's poll cadence. The owner opts in explicitly to get the near-step fast
+    wake.
     """
     # PR #187: fold near-step poll acceleration into the outer sleep, not just the
     # per-account due interval, so a fast due interval is actually evaluated in time.
+    # Gated OFF by default (see docstring): when off, `intended` == `base_interval`
+    # and the function is identical to main's pre-#187 behavior.
     intended = base_interval
-    if _poll_accel_enabled(config):
+    if _adaptive_accel_daemon_sleep_enabled(config):
         occupied = occupied_slot_accounts(state)
         for name, acct in state.get("accounts", {}).items():
             in_backoff, _ = account_in_backoff(state, name)

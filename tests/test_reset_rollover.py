@@ -177,13 +177,19 @@ def test_adaptive_sleep_disabled_returns_base():
 
 
 def test_adaptive_sleep_honors_near_step_poll_accel():
+    # PR #187 incorporation (2026-09-04): folding poll_accel into the OUTER daemon
+    # sleep SHIPS INERT behind `poll_accel.accelerate_daemon_sleep` (default False)
+    # so a deploy onto the live config does not change poll cadence. Opt in here to
+    # exercise the accelerated path — same pattern as the reactive.enabled:True
+    # test-config adaptations.
     state = {"active": "a", "accounts": {"a": {
         "current_5h_pct": 62.0, "current_7d_pct": 10.0, "next_swap_at_pct": 65,
     }}}
     cfg = {
         "poll_interval_seconds": 600,
         "thresholds": {"steps": [65, 75, 90]},
-        "poll_accel": {"enabled": True, "within_pct_of_step": 5, "fast_interval_seconds": 45},
+        "poll_accel": {"enabled": True, "within_pct_of_step": 5, "fast_interval_seconds": 45,
+                       "accelerate_daemon_sleep": True},
         "reset_inference": {"adaptive_repoll": False},
     }
     assert cus._adaptive_sleep_seconds(state, cfg, 600) == 45
@@ -196,6 +202,26 @@ def test_adaptive_sleep_keeps_base_when_account_far_from_step():
     cfg = {
         "poll_interval_seconds": 600,
         "thresholds": {"steps": [65, 75, 90]},
+        "poll_accel": {"enabled": True, "within_pct_of_step": 5, "fast_interval_seconds": 45,
+                       "accelerate_daemon_sleep": True},
+        "reset_inference": {"adaptive_repoll": False},
+    }
+    assert cus._adaptive_sleep_seconds(state, cfg, 600) == 600
+
+
+def test_adaptive_sleep_outer_accel_off_by_default_keeps_base():
+    """INERT-gate guard (PR #187 incorporation 2026-09-04): with poll_accel's
+    master gate ON but the NEW `accelerate_daemon_sleep` sub-gate at its shipped
+    default (absent → False), a near-step account must NOT shrink the outer daemon
+    sleep — the daemon keeps its base poll cadence, byte-for-byte main's behavior.
+    This is the property that makes deploying #187 onto the live config a no-op."""
+    state = {"active": "a", "accounts": {"a": {
+        "current_5h_pct": 62.0, "current_7d_pct": 10.0, "next_swap_at_pct": 65,
+    }}}
+    cfg = {
+        "poll_interval_seconds": 600,
+        "thresholds": {"steps": [65, 75, 90]},
+        # master gate on, sub-gate ABSENT (defaults False) — the live-config shape.
         "poll_accel": {"enabled": True, "within_pct_of_step": 5, "fast_interval_seconds": 45},
         "reset_inference": {"adaptive_repoll": False},
     }
