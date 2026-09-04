@@ -49,13 +49,16 @@ States (priority order — the first that matches wins; this list IS the code or
                     live subagent row ("◯ general-purpose … 21m 55s"), or "⎿ Running…".
                     A finished row ("✻ Brewed for 2m 7s · done 1:56 PM", "⏺ Bash(…)")
                     is NOT activity; prose containing these words is not either.
-  approval          a numbered box the human must answer: a `❯ 1.` row with a sibling
-                    `2.` row or an "Esc to cancel / Enter to confirm" caption, or a
-                    "Do you want to proceed?" row — in the active block. NEVER answer it.
   limit_menu        the harness's rate-limit menu (`❯ 1. Stop and wait` / `2. Upgrade
-                    your plan` / `/rate-limit-options`) or the soft-limit block
-                    (`⎿ You've reached your … limit`) in the active block, nothing
-                    running — swap + nudge territory, no Escape without a fresh re-read
+                    your plan` / `/rate-limit-options`) — a numbered box too, but the
+                    one a watcher may act on, so it is named before `approval`; the
+                    soft-limit block (`⎿ You've reached your … limit`) is judged later,
+                    after `login_menu`. Nothing running — swap + nudge territory, no
+                    Escape without a fresh re-read
+  approval          any other numbered box the human must answer: a `❯ 1.` row with a
+                    sibling `2.` row or an "Esc to cancel / Enter to confirm" caption,
+                    or a "Do you want to proceed?" row — in the active block. NEVER
+                    answer it.
   login_menu        `Login expired · Please run /login` / `Not logged in` / OAuth expired
                     rendered as a block row in the active block — cus slot move + nudge
                     fixes a live pane; only an interactive /login is human-only
@@ -76,8 +79,10 @@ Usage
   pane_state.py --all              # every pane with a live Claude process — a DEAD pane
                                    # produces NO row here; trackers must name their panes
   pane_state.py --table            # human table (JSON lines is the default)
-A named target with no live pane prints {"pane": <target>, "state": "not_found"} — for a
-tracked build pane that means dead, never healthy. `--all` with targets is an error.
+A named target that matches NO pane at all (gone or renamed) prints {"pane": <target>,
+"state": "not_found"} — for a tracked build pane that means the pane is gone, never
+healthy; a pane that exists but has no process is `dead`. `--all` with targets is an
+error.
 Exit code 0 unless tmux is unusable (2).
 """
 from __future__ import annotations
