@@ -120,9 +120,17 @@ def test_live_spinner_outranks_stale_limit_block():
     assert classify(lines, True)[0] == "working"
 
 
-def test_approval_outranks_activity_lines():
-    lines = ["  ⏺ Bash(pytest -q)", "  ⎿ Running…", "  Do you want to proceed?",
-             "  ❯ 1. Yes", "    2. No", "  Esc to cancel"]
+def test_live_activity_outranks_box_text_in_scrollback():
+    # an ANSWERED permission box stays in scrollback while the tool now runs:
+    # the live "Running…" row is the truth, and nothing may be sent at it
+    lines = ["  Do you want to proceed?", "  ❯ 1. Yes", "    2. No", "  Esc to cancel",
+             "  ⏺ Bash(pytest -q)", "  ⎿ Running… (esc to interrupt)", "────", "❯ ", *FOOTER]
+    assert classify(lines, True)[0] == "working"
+
+
+def test_box_without_activity_is_approval():
+    lines = ["  ⏺ Bash(pytest -q)", "  Do you want to proceed?", "  ❯ 1. Yes",
+             "    2. No", "  Esc to cancel"]
     assert classify(lines, True)[0] == "approval"
 
 

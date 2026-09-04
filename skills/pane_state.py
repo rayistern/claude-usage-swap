@@ -160,10 +160,11 @@ def classify(lines: list[str], claude_alive: bool) -> tuple[str, str]:
             input_seen = True
             draft = m.group("draft").strip()
             break
-    # LIVE activity outranks the menus: after an account swap the session
-    # resumes while the old `⎿ You've reached your … limit` block is still on
-    # screen (blind review 2026-09-04, F-O-2) — a spinner means it is working,
-    # and no keystroke may be sent at it.
+    # LIVE activity outranks every textual state. A "(esc to interrupt)"
+    # spinner cannot coexist with a box the TUI is waiting on, while the text
+    # of an ANSWERED box, a dismissed rate-limit menu, or the old `⎿ … limit`
+    # block all persist in scrollback after the session resumed (blind review
+    # 2026-09-04, F-O-2). A spinner means working, and nothing may be sent at it.
     if any(_R["working"].search(ln) for ln in tail):
         return "working", draft
     # The harness's rate-limit menu is itself a numbered box; it is the one
