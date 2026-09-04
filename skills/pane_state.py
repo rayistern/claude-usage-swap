@@ -92,8 +92,10 @@ _R = {
     "exited": re.compile(r"Resume this session with:\s*claude --resume", re.I),
     "login": re.compile(r"please run /login|not logged in|login expired|oauth session expired"
                         r"|failed to authenticate", re.I),
-    "limit": re.compile(r"/rate-limit-options|stop and wait|upgrade your plan"
-                        r"|(reached|hit) your .{0,40}limit|run /usage-credits", re.I),
+    # The harness's own rate-limit MENU (a numbered box, but one cus can fix — judged
+    # before the generic approval rule) vs. the soft-limit BLOCK above the prompt.
+    "limit_menu": re.compile(r"/rate-limit-options|stop and wait|upgrade your plan", re.I),
+    "limit": re.compile(r"(reached|hit) your .{0,40}limit|run /usage-credits", re.I),
     "approval": re.compile(r"^\s*❯\s*1\.\s|enter to confirm|esc to cancel|do you want to (proceed|allow"
                            r"|make this edit)|yes, and don'?t ask again|\(y/n\)", re.I),
     # LIVE activity only. A finished tool row keeps its ⏺ glyph in the scrollback, so ⏺
@@ -158,15 +160,19 @@ def classify(lines: list[str], claude_alive: bool) -> tuple[str, str]:
             input_seen = True
             draft = m.group("draft").strip()
             break
-    # A box that needs a human outranks everything a watcher might act on.
-    if any(_R["approval"].search(ln) for ln in tail):
-        return "approval", draft
     # LIVE activity outranks the menus: after an account swap the session
     # resumes while the old `⎿ You've reached your … limit` block is still on
     # screen (blind review 2026-09-04, F-O-2) — a spinner means it is working,
     # and no keystroke may be sent at it.
     if any(_R["working"].search(ln) for ln in tail):
         return "working", draft
+    # The harness's rate-limit menu is itself a numbered box; it is the one
+    # box a watcher may act on (swap + nudge), so it is named before approval.
+    if _R["limit_menu"].search(text):
+        return "limit_menu", draft
+    # Any other box that needs a human outranks everything a watcher might do.
+    if any(_R["approval"].search(ln) for ln in tail):
+        return "approval", draft
     if _R["login"].search(text):
         return "login_menu", draft
     if _R["limit"].search(text):
