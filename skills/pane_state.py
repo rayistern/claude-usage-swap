@@ -41,10 +41,11 @@ States (priority order — the first that matches wins)
                     `⎿ You've reached your … limit` block — swap + nudge territory
   approval          a numbered yes/no box ("❯ 1. Yes …", "Enter to confirm · Esc to
                     cancel", "Do you want to proceed?") — NEVER answer these for the human
-  working           a LIVE spinner row: "(esc to interrupt)", a ✻/braille spinner glyph,
-                    "Running…/Thinking…/Brewed for". A finished tool row keeps its ⏺
-                    glyph in scrollback and is NOT activity; "← N agents" in the footer
-                    means background agents exist and is reported as bg_agents, not busy
+  working           a LIVE spinner row: "(esc to interrupt)", a braille spinner glyph, a
+                    "✻ Baking…" verb still in progress, "Running…". Finished rows persist
+                    in scrollback and are NOT activity — "⏺ Bash(…)" and "✻ Baked for
+                    2m 7s · done 1:56 PM" alike; "← N agents" in the footer means
+                    background agents exist and is reported as bg_agents, not busy-ness
   idle_with_draft   the input line holds text nobody submitted (a nudge whose Enter
                     never registered — watch.md, 2026-07-14: press Enter, re-read)
   idle              the input line is an empty `❯` and nothing is running
@@ -89,8 +90,10 @@ _R = {
     # is not evidence; the ✻-family glyphs and braille dots are the spinner prefix of an
     # in-flight "Thinking…/Brewed for 12s/Running…" row and vanish when it completes.
     # "(esc to interrupt)" is the harness's own "I am busy" caption.
-    "working": re.compile(r"esc to interrupt|^\s*[✻✳✶✽✢⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s"
-                          r"|\b(running|thinking|brewed for|cogitating|pondering|working)…", re.I),
+    # The ✻ row PERSISTS after the turn ("✻ Baked for 2m 7s · done 1:56 PM"); only its
+    # live form carries "(esc to interrupt)" or a verb still in progress ("✻ Baking…").
+    "working": re.compile(r"esc to interrupt|^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s"
+                          r"|^\s*[✻✳✶✽✢]\s+[A-Za-z]+…|\brunning…", re.I),
     # Footer hint "· ← N agents": background agents EXIST (a Monitor, a subagent) — not
     # proof the main thread is busy. Reported separately as bg_agents.
     "bg_agents": re.compile(r"←\s*(\d+)\s+agents?\b", re.I),

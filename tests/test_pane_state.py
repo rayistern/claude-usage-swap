@@ -36,6 +36,18 @@ def test_finished_tool_row_is_not_activity():
     assert classify(lines, True)[0] == "idle"
 
 
+def test_finished_thinking_row_is_not_activity():
+    for done in ("✻ Baked for 2m 7s · done 1:56 PM", "✻ Cooked for 1m 15s",
+                 "✻ Worked for 2m 15s · done 9:02 PM"):
+        assert classify([done, "────", "❯ ", *FOOTER], True)[0] == "idle"
+
+
+def test_live_thinking_row_is_working():
+    for live in ("✻ Baking… (esc to interrupt)", "✻ Brewed for 41s (esc to interrupt)",
+                 "✻ Cogitating…", "⠹ Running…"):
+        assert classify([live, "────", "❯ ", *FOOTER], True)[0] == "working"
+
+
 def test_running_tool_row_is_working():
     lines = ["  ⏺ Bash(pytest -q)", "  ⎿ Running… (esc to interrupt)", "────", "❯ ", *FOOTER]
     assert classify(lines, True)[0] == "working"
