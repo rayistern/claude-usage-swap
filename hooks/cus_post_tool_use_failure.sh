@@ -17,7 +17,12 @@
 #     does not trip);
 #   - records the failing tool_name in 429.log for forensics.
 #
-# Appends to ~/claude-accounts/429.log:  <ts>,<session_id>,<token>,<tool_name>
+# Appends to ~/claude-accounts/429.log:
+#   <ts>,<session_id>,<token>,<tool_name>,<event_slot>,<event_account>
+#
+# Event-time slot+account (PR #187) let a delayed 429 attribute to the account that
+# was live WHEN it fired. Additive: legacy 4-field records still parse, and the
+# daemon only acts on them when reactive.enabled (ships off — safety fix 1).
 #
 # Walk-back: set hooks.install_post_tool_use_failure: false (StopFailure remains
 # the real detector) or remove the entry from ~/.claude/settings.json.
@@ -65,7 +70,24 @@ TOOL=$(printf '%s' "$RESULT" | cut -f2)
 TOKEN=$(printf '%s' "$RESULT" | cut -f3)
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+# PR #187: capture the event-time slot + account (best-effort; empty on any error).
+BINDING=$(ACCOUNTS_DIR="$ACCOUNTS_DIR" python3 -c '
+import json, os
+from pathlib import Path
+cfg = os.environ.get("CLAUDE_CONFIG_DIR", "").rstrip("/")
+slot = Path(cfg).name if cfg and Path(cfg).name.startswith("slot-") else ""
+try:
+    state = json.loads((Path(os.environ["ACCOUNTS_DIR"]) / "state.json").read_text())
+except Exception:
+    state = {}
+account = (state.get("slots", {}).get(slot, {}).get("account", "")
+           if slot else state.get("active", ""))
+print(f"{slot}\t{account}")
+' 2>/dev/null || true)
+SLOT=${BINDING%%$'\t'*}
+ACCOUNT=${BINDING#*$'\t'}
+
 mkdir -p "$ACCOUNTS_DIR"
-echo "$TS,$SESSION_ID,$TOKEN,$TOOL" >> "$LOG"
+echo "$TS,$SESSION_ID,$TOKEN,$TOOL,$SLOT,$ACCOUNT" >> "$LOG"
 
 exit 0
