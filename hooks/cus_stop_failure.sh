@@ -16,7 +16,10 @@
 # last_assistant_message ("...rate limit...") can't false-trigger.
 #
 # Appends one line per detection to ~/claude-accounts/429.log:
-#   <ts>,<session_id>,<error_enum>,stopfailure
+#   <ts>,<session_id>,<error_enum>,stopfailure,<event_slot>,<event_account>
+#
+# Event-time binding prevents a delayed hook record from being applied to a
+# different account that was installed into the same slot before the daemon woke.
 #
 # Walk-back: set hooks.install_stop_failure: false (or remove the StopFailure
 # entry from ~/.claude/settings.json). The daemon still swaps proactively on
@@ -45,7 +48,23 @@ fi
 SESSION_ID=$(echo "$EVENT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || echo "unknown")
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+BINDING=$(ACCOUNTS_DIR="$ACCOUNTS_DIR" python3 -c '
+import json, os
+from pathlib import Path
+cfg = os.environ.get("CLAUDE_CONFIG_DIR", "").rstrip("/")
+slot = Path(cfg).name if cfg and Path(cfg).name.startswith("slot-") else ""
+try:
+    state = json.loads((Path(os.environ["ACCOUNTS_DIR"]) / "state.json").read_text())
+except Exception:
+    state = {}
+account = (state.get("slots", {}).get(slot, {}).get("account", "")
+           if slot else state.get("active", ""))
+print(f"{slot}\t{account}")
+' 2>/dev/null || true)
+SLOT=${BINDING%%$'\t'*}
+ACCOUNT=${BINDING#*$'\t'}
+
 mkdir -p "$ACCOUNTS_DIR"
-echo "$TS,$SESSION_ID,$ERR,stopfailure" >> "$LOG"
+echo "$TS,$SESSION_ID,$ERR,stopfailure,$SLOT,$ACCOUNT" >> "$LOG"
 
 exit 0
