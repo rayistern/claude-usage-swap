@@ -111,3 +111,22 @@ def test_menu_row_is_not_the_input_line():
     lines = ["  Do you want to proceed?", "  ❯ 1. Yes", "    2. No"]
     state, draft = classify(lines, True)
     assert state == "approval" and draft == ""
+
+
+def test_live_spinner_outranks_stale_limit_block():
+    # after an account swap the session resumes while the old ⎿ limit block is on screen
+    lines = ["  ⎿ You've reached your Fable 5 limit. Run /usage-credits to continue",
+             "  ✻ Baking… (esc to interrupt)", "────", "❯ ", *FOOTER]
+    assert classify(lines, True)[0] == "working"
+
+
+def test_approval_outranks_activity_lines():
+    lines = ["  ⏺ Bash(pytest -q)", "  ⎿ Running…", "  Do you want to proceed?",
+             "  ❯ 1. Yes", "    2. No", "  Esc to cancel"]
+    assert classify(lines, True)[0] == "approval"
+
+
+def test_exited_only_while_alive():
+    banner = ["  Resume this session with: claude --resume abcd", "rayi in ~ ❯"]
+    assert classify(banner, True)[0] == "exited"
+    assert classify(banner, False)[0] == "dead"

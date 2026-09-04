@@ -33,19 +33,26 @@ What it reads
 
 States (priority order — the first that matches wins)
 ------
-  dead              no claude/node process under the pane (shell prompt, or gone)
-  exited            Claude printed "Resume this session with: claude --resume …" (process
-                    still winding down or already gone)
-  login_menu        "Please run /login" / "Not logged in" / OAuth expired — human only
-  limit_menu        `/rate-limit-options` menu, "Stop and wait", or the Fable soft-limit
-                    `⎿ You've reached your … limit` block — swap + nudge territory
+  dead              no claude/node process under the pane (shell prompt, or gone). This
+                    is the ONLY state in which relaunching is correct.
+  exited            Claude printed "Resume this session with: claude --resume …" while a
+                    claude process is STILL alive (dead is judged first) — it is winding
+                    down or /exit-ed inside a wrapper. Re-read before acting; never type
+                    a relaunch into it.
   approval          a numbered yes/no box ("❯ 1. Yes …", "Enter to confirm · Esc to
                     cancel", "Do you want to proceed?") — NEVER answer these for the human
   working           a LIVE spinner row: "(esc to interrupt)", a braille spinner glyph, a
-                    "✻ Baking…" verb still in progress, "Running…". Finished rows persist
-                    in scrollback and are NOT activity — "⏺ Bash(…)" and "✻ Baked for
-                    2m 7s · done 1:56 PM" alike; "← N agents" in the footer means
-                    background agents exist and is reported as bg_agents, not busy-ness
+                    "✻ Baking…" verb still in progress, "Running…". Outranks the menus:
+                    a session that resumed after a swap still shows the old limit block.
+                    Finished rows persist in scrollback and are NOT activity — "⏺ Bash(…)"
+                    and "✻ Baked for 2m 7s · done 1:56 PM" alike; "← N agents" in the
+                    footer means background agents exist and is reported as bg_agents
+  login_menu        "Please run /login" / "Not logged in" / OAuth expired, with nothing
+                    running — a `cus slot move` + nudge fixes a live pane (watch.md);
+                    only an interactive /login is human-only
+  limit_menu        `/rate-limit-options` menu, "Stop and wait", or the Fable soft-limit
+                    `⎿ You've reached your … limit` block, with nothing running — swap +
+                    nudge territory; no Escape until a fresh read confirms the menu
   idle_with_draft   the input line holds text nobody submitted (a nudge whose Enter
                     never registered — watch.md, 2026-07-14: press Enter, re-read)
   idle              the input line is an empty `❯` and nothing is running
@@ -54,9 +61,12 @@ States (priority order — the first that matches wins)
 Usage
 -----
   pane_state.py %12 %13            # explicit pane ids or tmux session names
-  pane_state.py --all              # every pane with a live claude/node process
+  pane_state.py --all              # every pane with a live claude/node process — so a
+                                   # DEAD pane produces NO row here; a watcher tracking
+                                   # specific panes must name them (below)
   pane_state.py --all --table      # human table (JSON lines is the default)
-Exit code 0 always; the caller reads the `state` field.
+A named target with no live pane prints {"pane": <target>, "state": "not_found"} — for
+a tracked build pane that is "dead", never "healthy". Exit code 0 always.
 """
 from __future__ import annotations
 
@@ -135,11 +145,10 @@ def classify(lines: list[str], claude_alive: bool) -> tuple[str, str]:
     if not claude_alive:
         return "dead", ""
     if _R["exited"].search(text):
+        # NOTE: reachable only while a claude process is still alive (dead is
+        # judged first) — the banner is printed by a claude that is winding
+        # down, or one that /exit-ed inside a wrapper. Re-read before acting.
         return "exited", ""
-    if _R["login"].search(text):
-        return "login_menu", ""
-    if _R["limit"].search(text):
-        return "limit_menu", ""
     # The input line: the LAST line starting with ❯ that is not a numbered menu row.
     draft = ""
     input_seen = False
@@ -149,10 +158,19 @@ def classify(lines: list[str], claude_alive: bool) -> tuple[str, str]:
             input_seen = True
             draft = m.group("draft").strip()
             break
+    # A box that needs a human outranks everything a watcher might act on.
     if any(_R["approval"].search(ln) for ln in tail):
         return "approval", draft
+    # LIVE activity outranks the menus: after an account swap the session
+    # resumes while the old `⎿ You've reached your … limit` block is still on
+    # screen (blind review 2026-09-04, F-O-2) — a spinner means it is working,
+    # and no keystroke may be sent at it.
     if any(_R["working"].search(ln) for ln in tail):
         return "working", draft
+    if _R["login"].search(text):
+        return "login_menu", draft
+    if _R["limit"].search(text):
+        return "limit_menu", draft
     if input_seen:
         return ("idle_with_draft" if draft else "idle"), draft
     return "unknown", draft
