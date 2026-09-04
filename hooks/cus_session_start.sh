@@ -4,10 +4,13 @@
 # Reads the SessionStart hook JSON event from stdin (per Claude Code hooks spec):
 #   {"session_id": "...", "transcript_path": "...", "cwd": "...", ...}
 # Writes one line per session to ~/claude-accounts/sessions.log:
-#   <ts>,<session_id>,<account>,<tmux_pane>,<cwd>
+#   <ts>,<session_id>,<account>,<tmux_pane>,<tmux_socket>,<cwd>
 #
 # Account is whichever is active in state.json at the moment this fires.
 # TMUX_PANE comes from the env (set by tmux if running under it).
+# TMUX_SOCKET is the server socket path (${TMUX%%,*}) so pane ids — which are
+# only unique WITHIN one tmux server — can be disambiguated across servers;
+# "no-tmux" when not running under tmux. cwd stays LAST so it may contain commas.
 #
 # Walk-back: this hook only writes to a log file. Removing the hook entry
 # from ~/.claude/settings.json reverts visibility. The log itself is
@@ -52,9 +55,15 @@ fi
 
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 PANE="${TMUX_PANE:-no-tmux}"
+# $TMUX is "<socket-path>,<server-pid>,<session-id>"; the socket path is the
+# leading comma-delimited field. Unset ⇒ not under tmux ⇒ "no-tmux".
+TMUX_SOCKET="no-tmux"
+if [[ -n "${TMUX:-}" ]]; then
+    TMUX_SOCKET="${TMUX%%,*}"
+fi
 
 mkdir -p "$ACCOUNTS_DIR"
-echo "$TS,$SESSION_ID,$ACCOUNT,$PANE,$CWD" >> "$LOG"
+echo "$TS,$SESSION_ID,$ACCOUNT,$PANE,$TMUX_SOCKET,$CWD" >> "$LOG"
 
 # Hooks should not block the session — exit 0 always.
 exit 0

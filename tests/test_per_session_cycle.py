@@ -211,6 +211,93 @@ def test_reactive_429_attributes_to_slot_account():
         env.restore()
 
 
+def test_parse_sessions_log_preserves_tmux_socket_and_legacy_rows():
+    """The 6-col line (…,<pane>,<tmux_socket>,<cwd>) surfaces the socket and
+    keeps cwd greedy-last; a legacy 5-col line (no socket column) still parses
+    with tmux_socket=None. Backward-compat for logs written before the migration.
+    """
+    env = _Env()
+    try:
+        cus.SESSIONS_LOG.write_text(
+            "2026-07-06T00:00:00Z,new,alpha,%0,/tmp/tmux-1000/committee-loop,/work,tree\n"
+            "2026-07-06T00:00:01Z,old,beta,%1,/legacy\n"
+            "2026-07-06T00:00:02Z,notmux,gamma,no-tmux,no-tmux,/x\n"
+        )
+        entries = cus._parse_sessions_log()
+        # 6-col: socket parsed, cwd is the greedy remainder (comma preserved).
+        assert entries[0]["tmux_socket"] == "/tmp/tmux-1000/committee-loop"
+        assert entries[0]["cwd"] == "/work,tree"
+        # legacy 5-col: no socket column → None, cwd = last field.
+        assert entries[1]["tmux_socket"] is None
+        assert entries[1]["cwd"] == "/legacy"
+        # explicit "no-tmux" socket normalizes to None.
+        assert entries[2]["tmux_socket"] is None
+        assert entries[2]["cwd"] == "/x"
+    finally:
+        env.restore()
+
+
+def test_session_current_slot_uses_tmux_socket_to_disambiguate_duplicate_panes():
+    """session_current_slot must pass the recorded socket to pane_mount_name so
+    a %0 on one tmux server resolves to that server's mount, not a same-named
+    pane on the default socket."""
+    orig_parse = cus._parse_sessions_log
+    orig_pane_mount_name = cus.pane_mount_name
+    seen = []
+    try:
+        cus._parse_sessions_log = lambda: [{
+            "ts": "2026-07-06T00:00:00Z",
+            "session_id": "sess",
+            "account": "alpha",
+            "pane": "%0",
+            "tmux_socket": "/tmp/tmux-1000/committee-loop",
+            "cwd": "/worktree",
+        }]
+
+        def fake_pane_mount_name(pane, tmux_socket=None):
+            seen.append((pane, tmux_socket))
+            return "slot-2" if tmux_socket == "/tmp/tmux-1000/committee-loop" else "slot-1"
+
+        cus.pane_mount_name = fake_pane_mount_name
+        assert cus.session_current_slot("sess") == "slot-2"
+        assert seen == [("%0", "/tmp/tmux-1000/committee-loop")]
+    finally:
+        cus._parse_sessions_log = orig_parse
+        cus.pane_mount_name = orig_pane_mount_name
+
+
+def test_pane_mount_name_disambiguates_same_pane_across_tmux_sockets():
+    """Core cross-server fix: the SAME pane id (%3) on two tmux servers must
+    resolve to DIFFERENT mounts. The socket selects which server's pane PID is
+    read; without it both %3s hit the default socket and collapse to one mount
+    → wrong account attribution."""
+    env = _Env()
+    try:
+        sock_a = "/tmp/tmux-1000/default"
+        sock_b = "/tmp/tmux-1000/committee-loop"
+        pid_by_socket = {sock_a: 101, sock_b: 202}
+        mount_by_pid = {101: cus.ACCOUNTS_DIR / "slot-1", 202: cus.ACCOUNTS_DIR / "slot-2"}
+        orig = (cus._pane_pid, cus._find_descendant_claude_pid, cus._pid_config_dir)
+        # A None socket means "the default tmux server" — pane_mount_name runs
+        # bare `tmux` (no -S), which connects to the default socket, modeled here
+        # as sock_a. So resolve None the same way _pane_pid would on the default
+        # server, rather than leaving a stub gap that masks the real behavior.
+        cus._pane_pid = lambda pane, tmux_socket=None: pid_by_socket.get(tmux_socket if tmux_socket is not None else sock_a)
+        cus._find_descendant_claude_pid = lambda pid: pid
+        cus._pid_config_dir = lambda pid: str(mount_by_pid[pid])
+        try:
+            assert cus.pane_mount_name("%3", sock_a) == "slot-1"
+            assert cus.pane_mount_name("%3", sock_b) == "slot-2"
+            # No socket → the DEFAULT tmux server (bare `tmux`), modeled as sock_a
+            # → slot-1; an EXPLICIT sock_b still resolves independently (%3 does
+            # not collapse across servers).
+            assert cus.pane_mount_name("%3", None) == "slot-1"
+        finally:
+            cus._pane_pid, cus._find_descendant_claude_pid, cus._pid_config_dir = orig
+    finally:
+        env.restore()
+
+
 def test_fast_cadence_tracks_occupancy_in_per_session():
     env = _Env()
     try:
