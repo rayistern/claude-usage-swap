@@ -161,6 +161,85 @@ def test_no_orphans_when_every_slot_has_a_pane():
     assert orphans == []
 
 
+# ---------------------------------------------------------------------------
+# _session_row_sort_key + pane_session_and_title (PR #206 readable-sessions;
+# both blind reviewers flagged these as untested — F-O-3 / F-F-2, 2026-09-09).
+# ---------------------------------------------------------------------------
+
+def test_sort_key_groups_by_account_then_name():
+    labels = {("%9", None): ("zsess", ""), ("%10", None): ("asess", "")}
+    rows = [
+        {"account": "acctB", "pane": "%1", "tmux_socket": None},
+        {"account": "acctA", "pane": "%9", "tmux_socket": None},
+        {"account": "acctA", "pane": "%10", "tmux_socket": None},
+    ]
+    ordered = sorted(rows, key=lambda r: cus._session_row_sort_key(r, labels))
+    # acctA before acctB; within acctA, name 'asess' (%10) before 'zsess' (%9)
+    assert [r["pane"] for r in ordered] == ["%10", "%9", "%1"]
+
+
+def test_sort_key_numeric_pane_tiebreak():
+    # same account + same name → pane sorts NUMERICALLY (%9 before %10, not str)
+    labels = {("%9", None): ("x", ""), ("%10", None): ("x", "")}
+    r9 = {"account": "a", "pane": "%9", "tmux_socket": None}
+    r10 = {"account": "a", "pane": "%10", "tmux_socket": None}
+    assert cus._session_row_sort_key(r9, labels) < cus._session_row_sort_key(r10, labels)
+
+
+def test_sort_key_missing_account_and_name_sort_last():
+    labels = {("%1", None): ("named", "")}
+    r_named = {"account": "acct", "pane": "%1", "tmux_socket": None}
+    r_noacct = {"account": None, "pane": "%2", "tmux_socket": None}
+    ordered = sorted([r_noacct, r_named], key=lambda r: cus._session_row_sort_key(r, labels))
+    assert ordered[0] is r_named  # None account ('~') sorts last
+
+
+def test_sort_key_per_server_pane_not_collapsed():
+    # identical pane id on two tmux servers must resolve to DISTINCT labels
+    # (F-O-2/F-F-3: keying by pane alone would collapse them).
+    labels = {("%3", "/sockA"): ("alpha", ""), ("%3", "/sockB"): ("beta", "")}
+    rA = {"account": "a", "pane": "%3", "tmux_socket": "/sockA"}
+    rB = {"account": "a", "pane": "%3", "tmux_socket": "/sockB"}
+    assert cus._session_row_sort_key(rA, labels)[1] == "alpha"
+    assert cus._session_row_sort_key(rB, labels)[1] == "beta"
+
+
+def _fake_completed(stdout: str):
+    class _R:
+        pass
+    r = _R()
+    r.stdout = stdout
+    return r
+
+
+def test_pane_session_and_title_parses_tab():
+    from unittest.mock import patch
+    with patch.object(cus, "tmux_is_available", lambda: True), \
+         patch.object(cus.subprocess, "run", lambda *a, **k: _fake_completed("7cc1a\tCredit building DB\n")):
+        assert cus.pane_session_and_title("%1", None) == ("7cc1a", "Credit building DB")
+
+
+def test_pane_session_and_title_empty_fields():
+    from unittest.mock import patch
+    with patch.object(cus, "tmux_is_available", lambda: True), \
+         patch.object(cus.subprocess, "run", lambda *a, **k: _fake_completed("\t\n")):
+        assert cus.pane_session_and_title("%1", None) == ("", "")
+
+
+def test_pane_session_and_title_swallows_subprocess_error():
+    from unittest.mock import patch
+    def _boom(*a, **k):
+        raise cus.subprocess.SubprocessError("tmux failed")
+    with patch.object(cus, "tmux_is_available", lambda: True), \
+         patch.object(cus.subprocess, "run", _boom):
+        assert cus.pane_session_and_title("%1", None) == ("", "")
+
+
+def test_pane_session_and_title_no_tmux_shortcircuits():
+    # pane 'no-tmux' returns ('','') without any tmux call (guard short-circuit)
+    assert cus.pane_session_and_title("no-tmux", None) == ("", "")
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
