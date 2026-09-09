@@ -14664,6 +14664,26 @@ def tmux_pane_name(pane: str, tmux_socket: str | None = None) -> str:
         return ""
 
 
+def pane_session_and_title(pane: str, tmux_socket: str | None = None) -> tuple[str, str]:
+    """Return (tmux session-name, pane title) for a pane — the HUMAN-READABLE
+    labels for `cus sessions`. The pane id (%NNN) is stable but opaque; the tmux
+    session-name ('7cc1a') and the pane title ('Credit building strategy DB') are
+    what an operator actually recognizes. Best-effort: ('', '') if tmux can't
+    answer (a tab separator is safe — tmux never emits one in either field)."""
+    if not tmux_is_available() or not pane:
+        return "", ""
+    try:
+        result = subprocess.run(
+            [*_tmux_cmd(tmux_socket), "display-message", "-p", "-t", pane,
+             "#{session_name}\t#{pane_title}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        name, _, title = result.stdout.strip().partition("\t")
+        return name, title
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return "", ""
+
+
 def pane_is_claude(pane: str, tmux_socket: str | None = None) -> bool:
     """True if a tmux pane is currently running a claude session (GH #37).
 
@@ -16965,6 +16985,15 @@ def sessions_cmd(as_json: bool) -> None:
         })
     rows = build_session_rows(resolved_inputs, state, config)
 
+    # Human-readable labels (tmux session-name + pane title) per pane, plus a
+    # stable sort so lanes on the same account group together — the pane id
+    # (%NNN) alone is opaque. (2026-09-09, Rayi: "would be nice to see pane
+    # names in that list, and in general more human readable, maybe sorted".)
+    pane_labels = {s.pane: pane_session_and_title(s.pane, s.tmux_socket) for s in live}
+    rows.sort(key=lambda r: ((r["account"] or "~"),
+                             (pane_labels.get(r["pane"], ("", ""))[0] or "~"),
+                             r["pane"]))
+
     # Orphan sweep: slots with live pids that no live pane resolves to.
     slot_pids: dict[str, int] = {}
     for d in list_slot_dirs():
@@ -17007,11 +17036,16 @@ def sessions_cmd(as_json: bool) -> None:
                     and (state.get("accounts", {}).get(r["account"], {}) or {}).get("subscription_disabled")
                     and _subscription_guard_enabled(config)):
                 acct = f"{acct} {click.style('[sub-ended]', fg='red', bold=True)}"
-            # Line 1: identity + where mounted.
+            # Line 1: identity + where mounted. Lead with the human-readable
+            # tmux session-name (bold) so the operator recognizes the lane at a
+            # glance, not just the opaque pane id / 8-char session hash.
             drift_tag = ""
             if r["drift"]:
                 drift_tag = click.style(f"  DRIFT: sessions.log said '{r['logged_account']}'", fg="red", bold=True)
-            click.echo(f"  {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
+            sname, stitle = pane_labels.get(r["pane"], ("", ""))
+            sname_disp = f"{(sname or '?'):<16}"
+            sname_txt = click.style(sname_disp, bold=True) if color_on else sname_disp
+            click.echo(f"  {sname_txt} {sid}  pane={r['pane']:<8} {str(where):<10}{pool}  account={acct}{drift_tag}")
             # Line 2: usage numbers.
             five = "?" if r["five_h_pct"] is None else f"{r['five_h_pct']:.0f}%"
             seven = "?" if r["seven_d_pct"] is None else f"{r['seven_d_pct']:.0f}%"
@@ -17023,6 +17057,8 @@ def sessions_cmd(as_json: bool) -> None:
             color = {"blocked": "red", "warn": "yellow", "ok": "green"}.get(sev)
             label = click.style(r["binding"], fg=color) if (color_on and color) else r["binding"]
             click.echo(f"            -> {label}")
+            if stitle:
+                click.echo(f"            title={stitle}")
             click.echo(f"            cwd={r['cwd']}")
     click.echo()
 
