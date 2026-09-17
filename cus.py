@@ -676,6 +676,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # DROP in current_7d_pct between two consecutive real observations — and
     # project the next one 72h forward. Both knobs are exposed so they stay
     # tunable if Anthropic changes the cadence.
+    # OWNER-CONFIRMED 2026-09-15: this ~72h window is REAL (empirically observed by
+    # the owner), NOT a display quirk. The statusline's near-term 7d countdown
+    # (projected_seven_day_reset) is the reset ETA the operator trusts — do NOT
+    # "correct" it to the API's ~7-day seven_day.resets_at (the misleading value
+    # noted above), and do NOT dismiss the statusline reset as a bug.
     "seven_day_reset_hours": 72,       # projected gap between real 7d refreshes
     "seven_day_reset_drop_pct": 15,    # min pct-point drop that counts as a reset (not noise)
     "smart_strategy": {
