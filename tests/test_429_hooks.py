@@ -29,13 +29,15 @@ STOP_FAILURE = HOOKS / "cus_stop_failure.sh"
 PTUF = HOOKS / "cus_post_tool_use_failure.sh"
 
 
-def _run(hook: Path, event: dict, accounts_dir: Path) -> list[str]:
+def _run(hook: Path, event: dict, accounts_dir: Path, env_overrides: dict | None = None) -> list[str]:
     """Pipe `event` JSON into `hook` and return the resulting 429.log lines."""
+    env = {"CUS_ACCOUNTS_DIR": str(accounts_dir), "PATH": "/usr/bin:/bin:/usr/local/bin"}
+    env.update(env_overrides or {})
     subprocess.run(
         ["bash", str(hook)],
         input=json.dumps(event),
         text=True,
-        env={"CUS_ACCOUNTS_DIR": str(accounts_dir), "PATH": "/usr/bin:/bin:/usr/local/bin"},
+        env=env,
         check=True,
     )
     log = accounts_dir / "429.log"
@@ -54,13 +56,24 @@ def test_stopfailure_logs_rate_limit(tmp_path):
     }, tmp_path)
     assert len(lines) == 1
     assert lines[0].split(",")[1:3] == ["S1", "rate_limit"]
-    assert lines[0].endswith(",stopfailure")
+    assert lines[0].split(",")[3] == "stopfailure"
 
 
 def test_stopfailure_logs_overloaded(tmp_path):
     lines = _run(STOP_FAILURE, {"hook_event_name": "StopFailure",
                                 "session_id": "S2", "error": "overloaded"}, tmp_path)
     assert len(lines) == 1 and lines[0].split(",")[2] == "overloaded"
+
+
+def test_stopfailure_logs_event_time_slot_and_account(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({
+        "active": "bare-account",
+        "slots": {"slot-2": {"account": "event-account"}},
+    }))
+    lines = _run(STOP_FAILURE, {
+        "hook_event_name": "StopFailure", "session_id": "S-bound", "error": "rate_limit",
+    }, tmp_path, {"CLAUDE_CONFIG_DIR": str(tmp_path / "slot-2")})
+    assert lines[0].split(",")[4:6] == ["slot-2", "event-account"]
 
 
 def test_stopfailure_ignores_other_error_types_even_with_rate_limit_prose(tmp_path):
@@ -112,6 +125,19 @@ def test_ptuf_logs_real_api_token_in_error_with_toolname(tmp_path):
     assert len(lines) == 1
     parts = lines[0].split(",")
     assert parts[1] == "S6" and parts[2] == "rate_limit_error" and parts[3] == "Agent"
+
+
+def test_ptuf_logs_event_time_slot_and_account(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({
+        "active": "bare-account",
+        "slots": {"slot-4": {"account": "bound-account"}},
+    }))
+    lines = _run(PTUF, {
+        "hook_event_name": "PostToolUseFailure", "session_id": "S7",
+        "tool_name": "Agent", "tool_input": {},
+        "error": '{"type":"rate_limit_error"}',
+    }, tmp_path, {"CLAUDE_CONFIG_DIR": str(tmp_path / "slot-4")})
+    assert lines[0].split(",")[4:6] == ["slot-4", "bound-account"]
 
 
 if __name__ == "__main__":
