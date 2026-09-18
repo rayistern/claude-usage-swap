@@ -18092,6 +18092,1312 @@ def sessions_cmd(as_json: bool) -> None:
         click.echo()
 
 
+# ==========================================================================
+# `cus panes` — per-pane live view (GH #230, 2026-09-18)
+# ==========================================================================
+# WHY: the daemon watches ACCOUNTS (state.json 5h/7d percentages). That tells
+# you the fleet is hot; it never tells you WHICH pane made it hot, how fast it
+# is spending, or how many subagents it already has in flight. Sessions were
+# fanning out subagents blind. This command answers "who is burning, on what
+# model, how fast, and is there headroom" from data ALREADY on disk — no API
+# call, no polling, no credential read, and no write by cus itself.
+# (Exact wording matters: the pane reader we shell out to keeps its own
+# fingerprint cache, ~/.cache/pane_state/<pane>.json, one small file per pane
+# per run. It is idempotent and holds no cus state, but "writes nothing" was
+# false end to end — dual review of PR #232, 2026-09-18.)
+#
+# Data sources (all verified against live transcripts on 2026-09-18, Claude
+# Code 2.1.251-2.1.273):
+#   - pane enumeration + state: skills/pane_state.py (the build-babysitter
+#     reader). NEVER hand-scrape tmux for state here — the classifier is that
+#     module's job and a missing reader is STOP, not a fabricated row.
+#   - pane -> session-id: Claude Code's own peer registry,
+#     <CLAUDE_DIR>/sessions/<pid>.json, which carries `pid`, `sessionId`,
+#     `cwd` and `tmux` ("<session>:@<win>.%<pane>"). This is far better than
+#     the sessions.log heuristic find_live_panes() uses: it is written by the
+#     live process, updates on in-process /resume, and covered 14/14 live
+#     panes on this box where sessions.log covered 6.
+#   - pane -> slot -> account: pane_mount_name() (/proc ground truth) +
+#     state["slots"], i.e. exactly what `cus sessions` trusts.
+#   - tokens: transcript `message.usage`, deduplicated by `message.id`.
+#   - subagents: <projects>/<slug>/<session-id>/subagents/agent-<id>.jsonl
+#     (these DO carry isSidechain:true; the PARENT transcript does not — the
+#     issue's "isSidechain in the main transcript" assumption is false on this
+#     version), paired against `<task-notification>` completions.
+#   - walls: `quotaLimits` {"status":"rejected", rateLimitType, resetsAt}.
+#
+# HONESTY CONTRACT: the per-pane percentage is an ATTRIBUTION derived from
+# token counts, not a measurement. The usage endpoint reports per-ACCOUNT
+# percentages only. Every renderer must say so, and an account whose
+# `last_observed_ts` is missing or stale renders "unknown", never a
+# healthy-looking number.
+
+PANES_WINDOW_DEFAULT = "30m"
+# Tail budget per transcript. Some transcripts here are >170MB; parsing whole
+# files would take minutes. We grow the tail until it covers the window (or
+# the file starts), capped here so one pathological file can't stall the table.
+PANES_TAIL_START_BYTES = 1 << 20          # 1MB first read
+PANES_TAIL_MAX_BYTES = 48 << 20           # 48MB hard cap per file
+# A subagent transcript untouched for this long with no completion notice is
+# treated as finished-or-stuck rather than live. Subagents write continuously
+# while they work, so 10 min is generous.
+PANES_SUBAGENT_LIVE_SECONDS = 600
+# An account reading older than this is NOT reported as a percentage. The
+# daemon polls every cycle; 15 min without a successful observation means the
+# number on disk is not a current one (CLAUDE.md: "a stale cached usage number
+# is not a current one" — it must not look healthy).
+PANES_ACCOUNT_STALE_SECONDS = 900
+# How far back a transcript is scanned for a 429, INDEPENDENT of --window.
+# A `five_hour` rejection describes the current wall for up to 5h, so that is
+# the horizon. The first cut scanned only as far as --window (30m default)
+# while treating a 429 as live for 1h: a real wall from 31-59 minutes ago was
+# never read and rendered as "no wall" — the exact false "clear" `--me` exists
+# to prevent (dual review of PR #232, 2026-09-18). `seven_day` rejections older
+# than this are covered by the account signal instead (see assess_wall).
+PANES_WALL_LOOKBACK_SECONDS = 5 * 3600
+# `--me` verdict thresholds, on the HIGHER of the account's 5h / 7d used-%.
+# Anchored to the daemon's own default swap steps [50, 75, 90] so the verdict
+# and the daemon agree about what "hot" means:
+#   >= 90 (the daemon's LAST step): DO NOT SPEND. On 2026-09-18 one pct-point of
+#      5h cost ~0.07M non-cache tokens fleet-wide and a busy pane burned ~33k/min
+#      (~0.5 pct/min) BEFORE any fan-out; 10% of headroom is minutes, not a task.
+#   >= 75 (the middle step): TIGHT. 25% is ~15-25 minutes of a 3-subagent
+#      fan-out — enough for one small batch, not for "start something big".
+#   otherwise: ROOM.
+# An unknown/stale reading is never ROOM: it gets its own cautious verdict.
+PANES_ME_STOP_USED_PCT = 90.0
+PANES_ME_TIGHT_USED_PCT = 75.0
+
+
+class PanesError(RuntimeError):
+    """Fatal, user-facing failure of `cus panes` (e.g. the pane reader is
+    missing). Raised instead of emitting a partial/fabricated table."""
+
+
+def parse_window_spec(spec: str) -> float:
+    """'30m' / '2h' / '90s' / bare minutes -> minutes (float). Raises ValueError.
+
+    Bare numbers mean MINUTES (the unit the burn rate is quoted in), so
+    `--window 30` and `--window 30m` agree.
+    """
+    s = str(spec).strip().lower()
+    if not s:
+        raise ValueError("empty window")
+    mult = {"s": 1 / 60.0, "m": 1.0, "h": 60.0, "d": 1440.0}
+    unit = 1.0
+    if s[-1] in mult:
+        unit = mult[s[-1]]
+        s = s[:-1]
+    val = float(s)
+    if val <= 0:
+        raise ValueError(f"window must be positive, got {spec!r}")
+    return val * unit
+
+
+def _panes_parse_ts(value) -> "datetime | None":
+    """ISO-8601 (transcript `timestamp`) or unix seconds -> aware datetime."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _panes_oldest_ts(lines) -> "datetime | None":
+    """Timestamp of the oldest line that has one (lines are oldest-first)."""
+    for ln in lines:
+        if '"timestamp"' not in ln:
+            continue
+        try:
+            ts = _panes_parse_ts(json.loads(ln).get("timestamp"))
+        except (ValueError, TypeError, AttributeError):
+            ts = None
+        if ts is not None:
+            return ts
+    return None
+
+
+def tail_lines(path: "Path", window_start: "datetime",
+               max_bytes: int = PANES_TAIL_MAX_BYTES) -> tuple[list[str], bool]:
+    """Read back from EOF just far enough to cover `window_start`.
+
+    `window_start` is simply "how far back to read". collect_pane_row passes
+    the DEEPER of the token window and the wall lookback, then judges each
+    horizon separately from the oldest line actually read.
+
+    Returns (lines, covers_window). `covers_window` is False when we hit the
+    byte cap before reaching a line older than the window — the caller must
+    then label its totals as a floor, not a total, because older in-window
+    lines were not read.
+
+    Doubling reads (1MB, 2MB, 4MB...) keeps the common case — an idle pane
+    whose last hour is a few hundred KB — to a single small read, while a hot
+    170MB transcript still terminates. The first line of a chunk is dropped
+    because a mid-file seek lands mid-line.
+    """
+    size = path.stat().st_size
+    # The cap binds even on the FIRST read: a caller that asks for a small
+    # budget must get `covers_window=False` rather than a silent whole-file read.
+    n = min(PANES_TAIL_START_BYTES, max_bytes, max(size, 1))
+    while True:
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - n))
+            raw = fh.read()
+        at_start = n >= size
+        text = raw.decode("utf-8", "replace")
+        lines = text.splitlines()
+        if not at_start and lines:
+            lines = lines[1:]       # partial first line from the mid-file seek
+        # Do we reach back past the window? Find the oldest parseable ts.
+        oldest = _panes_oldest_ts(lines)
+        if at_start or (oldest is not None and oldest <= window_start):
+            return lines, True
+        if n >= max_bytes:
+            return lines, False
+        n = min(n * 2, max_bytes, size)
+
+
+def _usage_total(usage: dict) -> dict:
+    """One `message.usage` blob -> flat token counts.
+
+    Cache reads are counted in `total` and kept separately, because callers
+    need BOTH: `total - cache_read` ("NEW") is the headline. Measured on this
+    box 2026-09-18 over 24h / 41 half-hour bins: fleet 5h-% growth correlates
+    0.83 with NEW vs 0.70 with the cache-inclusive total, and the partial
+    correlations settle it (NEW given total 0.62; total given NEW -0.14) —
+    cache reads are ~94% of the total and mostly measure context size. The
+    first cut claimed cache reads were "what the 5h window meters"; the data
+    says otherwise. One sample, mixed plan sizes — re-measure before relying
+    on it for anything finer than column order.
+    """
+    def _i(k):
+        v = usage.get(k)
+        return int(v) if isinstance(v, (int, float)) else 0
+    inp, out = _i("input_tokens"), _i("output_tokens")
+    cc, cr = _i("cache_creation_input_tokens"), _i("cache_read_input_tokens")
+    return {"input": inp, "output": out, "cache_creation": cc,
+            "cache_read": cr, "total": inp + out + cc + cr}
+
+
+def _add_model_tokens(by_model: dict, model: str, counts: dict) -> None:
+    slot = by_model.setdefault(model, {"input": 0, "output": 0, "cache_creation": 0,
+                                       "cache_read": 0, "total": 0})
+    for k, v in counts.items():
+        slot[k] += v
+
+
+def parse_transcript_facts(lines, window_start: "datetime") -> dict:
+    """Pure parser: JSONL lines -> the facts one transcript contributes.
+
+    Returns {by_model, total, message_ids, agents_launched, agents_finished,
+             wall, cost_first, cost_last, last_activity}.
+
+    DEDUPLICATION IS LOAD-BEARING. Claude Code writes ONE JSONL line per
+    content block of an assistant response (`apiBlockIndex` 0..n), and every
+    one of those lines repeats the SAME cumulative `message.usage`. Summing
+    lines naively over-counted a single 4-block response 4x in the first cut
+    of this parser. We key on `message.id` and keep the largest total seen.
+    """
+    by_id: dict[str, tuple[str, dict]] = {}
+    agents_launched: dict[str, dict] = {}
+    agents_finished: dict[str, str] = {}
+    wall = None
+    cost_first = cost_last = None
+    last_activity = None
+
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or not ln.startswith("{"):
+            continue
+        try:
+            d = json.loads(ln)
+        except (ValueError, TypeError):
+            continue          # truncated tail line / non-JSON noise: skip, never guess
+        if not isinstance(d, dict):
+            continue
+        ts = _panes_parse_ts(d.get("timestamp"))
+        if ts is not None and (last_activity is None or ts > last_activity):
+            last_activity = ts
+        in_window = ts is None or ts >= window_start
+
+        # --- cost-state: cumulative per-model totals incl. costUSD.
+        # Cost over the window is the DELTA between the last pre-window
+        # snapshot and the latest one. With no pre-window snapshot in the tail
+        # the delta is unknowable, and we report null rather than the
+        # session-lifetime figure (which would read as a 30-minute burn).
+        if d.get("type") == "cost-state":
+            tot = d.get("totalCostUSD")
+            if isinstance(tot, (int, float)):
+                if in_window:
+                    cost_last = float(tot)
+                else:
+                    cost_first = float(tot)
+            continue
+
+        # --- 429 wall. Latest rejected quotaLimits wins.
+        ql = d.get("quotaLimits")
+        if isinstance(ql, dict) and ql.get("status") == "rejected":
+            resets = _panes_parse_ts(ql.get("resetsAt"))
+            # `resets_at` alone does NOT mean "walled now": a 429 seen days ago
+            # can still carry a future-looking reset, and the pane may have been
+            # moved to another account since. Liveness is decided by the caller
+            # from observed_at (see _wall_active) — we only record the facts.
+            wall = {
+                "rate_limit_type": ql.get("rateLimitType"),
+                "resets_at": resets.isoformat().replace("+00:00", "Z") if resets else None,
+                "observed_at": ts.isoformat().replace("+00:00", "Z") if ts else None,
+            }
+
+        msg = d.get("message")
+        if not isinstance(msg, dict):
+            continue
+
+        # --- subagent launches (tool_use Agent) and completions
+        # (<task-notification> ... <status>). The tool is `Agent`; its
+        # toolUseResult carries agentId + resolvedModel.
+        content = msg.get("content")
+        if isinstance(content, str) and "<task-notification>" in content:
+            tid = _panes_between(content, "<task-id>", "</task-id>")
+            status = _panes_between(content, "<status>", "</status>")
+            if tid:
+                agents_finished[tid] = status or "finished"
+        elif isinstance(content, list):
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "text" and "<task-notification>" in str(blk.get("text", "")):
+                    txt = str(blk.get("text"))
+                    tid = _panes_between(txt, "<task-id>", "</task-id>")
+                    status = _panes_between(txt, "<status>", "</status>")
+                    if tid:
+                        agents_finished[tid] = status or "finished"
+
+        tur = d.get("toolUseResult")
+        if isinstance(tur, dict) and tur.get("agentId"):
+            agents_launched[str(tur["agentId"])] = {
+                "agent_id": str(tur["agentId"]),
+                "model": tur.get("resolvedModel"),
+                "description": tur.get("description"),
+                "started_at": ts.isoformat().replace("+00:00", "Z") if ts else None,
+                "async": bool(tur.get("isAsync")),
+            }
+
+        usage = msg.get("usage")
+        if isinstance(usage, dict) and in_window:
+            counts = _usage_total(usage)
+            if counts["total"]:
+                key = msg.get("id") or d.get("requestId") or d.get("uuid")
+                model = msg.get("model") or "unknown"
+                prev = by_id.get(key)
+                if prev is None or counts["total"] > prev[1]["total"]:
+                    by_id[key] = (model, counts)
+
+    by_model: dict[str, dict] = {}
+    for model, counts in by_id.values():
+        _add_model_tokens(by_model, model, counts)
+    cost = None
+    if cost_last is not None and cost_first is not None:
+        cost = max(0.0, round(cost_last - cost_first, 6))
+    return {
+        "by_model": by_model,
+        "total": sum(m["total"] for m in by_model.values()),
+        "messages": len(by_id),
+        "agents_launched": agents_launched,
+        "agents_finished": agents_finished,
+        "wall": wall,
+        "cost_window_usd": cost,
+        "last_activity": last_activity,
+    }
+
+
+def _panes_between(text: str, open_tag: str, close_tag: str) -> str | None:
+    i = text.find(open_tag)
+    if i < 0:
+        return None
+    j = text.find(close_tag, i + len(open_tag))
+    if j < 0:
+        return None
+    return text[i + len(open_tag):j].strip() or None
+
+
+def account_headroom(acct: dict | None, now: "datetime",
+                     stale_seconds: int = PANES_ACCOUNT_STALE_SECONDS) -> dict:
+    """Per-ACCOUNT 5h/7d headroom from state.json — or `unknown`.
+
+    A missing account, a missing `last_observed_ts`, or an observation older
+    than `stale_seconds` all render as unknown. This is deliberate: an
+    unrefreshed 0% looks like "wide open" and is exactly the number that gets
+    a fleet walled (CLAUDE.md operating principles).
+    """
+    out = {"known": False, "reason": "no account record", "five_hour_pct": None,
+           "seven_day_pct": None, "headroom_5h_pct": None, "headroom_7d_pct": None,
+           "five_hour_resets_at": None, "seven_day_resets_at": None,
+           "last_observed_ts": None, "age_seconds": None}
+    if not acct:
+        return out
+    observed = acct.get("last_observed_ts")
+    out["last_observed_ts"] = observed
+    out["five_hour_resets_at"] = acct.get("five_hour_resets_at")
+    out["seven_day_resets_at"] = acct.get("seven_day_resets_at")
+    t0 = _panes_parse_ts(observed)
+    if t0 is None:
+        out["reason"] = "never observed"
+        return out
+    age = (now - t0).total_seconds()
+    out["age_seconds"] = round(age, 1)
+    if age > stale_seconds:
+        aged = f"{age / 3600:.1f}h" if age >= 3600 else f"{int(age // 60)}m"
+        out["reason"] = f"last observation is {aged} old (stale)"
+        return out
+    p5, p7 = acct.get("current_5h_pct"), acct.get("current_7d_pct")
+    if not isinstance(p5, (int, float)) or not isinstance(p7, (int, float)):
+        out["reason"] = "no percentage recorded"
+        return out
+    out.update({"known": True, "reason": None, "five_hour_pct": float(p5),
+                "seven_day_pct": float(p7),
+                "headroom_5h_pct": round(max(0.0, 100.0 - float(p5)), 1),
+                "headroom_7d_pct": round(max(0.0, 100.0 - float(p7)), 1)})
+    return out
+
+
+def attribute_account_shares(rows: list[dict]) -> None:
+    """Fill each row's `attribution` in place.
+
+    THIS IS AN ATTRIBUTION, NOT A MEASUREMENT. It answers "of the tokens we
+    can see this account spend in the window, what fraction came from this
+    pane", which is the only per-pane number the on-disk data supports. The
+    account's real 5h percentage comes from the usage endpoint and covers
+    spend we cannot see (other machines, bare sessions, panes whose transcript
+    we failed to resolve). Never present this as the account's percentage.
+
+    UNMEASURED panes (no readable transcript) are excluded from BOTH the
+    numerator and the denominator and get a null share. Counting them as 0
+    printed `SHARE 0%` for a pane that may be the actual culprit and made the
+    measured panes sum to a tidy 100% of a total that was missing a pane. Each
+    row carries `unmeasured_panes_on_account` so renderers can say the shares
+    are of the observed remainder. A pane whose tail hit the byte cap is a
+    FLOOR, so every share on that account is marked approximate.
+    """
+    def _spend(r: dict):
+        # NEW (cache reads excluded) is the measure that tracks the cap — see
+        # _usage_total. A legacy row with no `new` falls back to `total`.
+        tw = r.get("tokens_window") or {}
+        v = tw.get("new")
+        return v if isinstance(v, (int, float)) else tw.get("total")
+
+    def _measured(r: dict) -> bool:
+        return (not r.get("unmeasured", r.get("transcript_status", "ok") != "ok")
+                and isinstance(_spend(r), (int, float)))
+
+    totals: dict[str, int] = {}
+    unmeasured: dict[str, int] = {}
+    floors: dict[str, int] = {}
+    for r in rows:
+        acct = r.get("account")
+        if not acct:
+            continue
+        if not _measured(r):
+            unmeasured[acct] = unmeasured.get(acct, 0) + 1
+            continue
+        totals[acct] = totals.get(acct, 0) + int(_spend(r))
+        if not r.get("window_covered", True):
+            floors[acct] = floors.get(acct, 0) + 1
+    for r in rows:
+        acct = r.get("account")
+        measured = _measured(r)
+        denom = totals.get(acct, 0) if acct else 0
+        share = None
+        if measured and denom:
+            share = round(int(_spend(r)) * 100.0 / denom, 1)
+        r["attribution"] = {
+            "kind": "estimate",
+            "basis": ("share of window NEW tokens (cache reads excluded) observed on this "
+                      "account's MEASURED panes"),
+            "account_window_tokens": denom,
+            "pane_pct_of_account_window": share,
+            "unmeasured": not measured,
+            "unmeasured_panes_on_account": unmeasured.get(acct, 0) if acct else 0,
+            "approximate": bool(acct and floors.get(acct)),
+        }
+
+
+def _pane_state_script() -> "Path":
+    """Path to the pane reader shim. `CUS_PANE_STATE_PY` overrides it (tests)."""
+    override = os.environ.get("CUS_PANE_STATE_PY")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parent / "skills" / "pane_state.py"
+
+
+def read_panes_from_reader(include_all: bool = True) -> list[dict]:
+    """Pane rows from skills/pane_state.py (JSON lines), or raise PanesError.
+
+    We shell out rather than import: the reader is a separately-versioned file
+    in vibeCoding reached through a shim, and its `--all` / exit-code contract
+    is the stable interface. Exit 3 = reader missing, exit 2 = tmux unusable;
+    both are STOP-and-escalate, never a hand-scraped substitute (the reader's
+    own docstring and build-babysitter SKILL.md agree on this).
+    """
+    script = _pane_state_script()
+    cmd = [sys.executable, str(script)] + (["--all"] if include_all else [])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError as e:
+        raise PanesError(f"pane reader not runnable ({script}): {e}") from e
+    except subprocess.SubprocessError as e:
+        raise PanesError(f"pane reader failed ({script}): {e}") from e
+    if proc.returncode == 3:
+        raise PanesError(
+            "pane reader is missing — cannot enumerate panes. "
+            f"{proc.stdout.strip() or proc.stderr.strip()}")
+    if proc.returncode not in (0,):
+        raise PanesError(
+            f"pane reader exited {proc.returncode} "
+            f"({'tmux unusable' if proc.returncode == 2 else 'unknown failure'}): "
+            f"{proc.stdout.strip() or proc.stderr.strip()}")
+    rows = []
+    for ln in proc.stdout.splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            rows.append(json.loads(ln))
+        except ValueError:
+            continue
+    return rows
+
+
+def _proc_start_ticks(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat (start time, clock ticks since boot) as a
+    string — the same value Claude Code records as `procStart`. None if the
+    process is gone or unreadable. comm may contain spaces/parens, so split
+    after the LAST ')'."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 2:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _proc_cmdline_is_claude(pid: int) -> bool:
+    """True when the process's argv names claude (`claude ...`, or node hosting
+    the claude CLI). Unreadable cmdline => False: refuse, don't assume."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, PermissionError):
+        return False
+    return any(b"claude" in chunk.lower() for chunk in raw.split(b"\x00")[:4] if chunk)
+
+
+def registry_entry_is_live(pid: int, proc_start) -> bool:
+    """Is <pid> STILL THE PROCESS that wrote this registry entry?
+
+    `/proc/<pid>` existing proves only that SOME process holds the number. The
+    registry keeps thousands of dead entries (GH #199), so a recycled pid is a
+    live hazard: a dead session's session-id gets bound to a live pane and its
+    transcript's spend is attributed to whatever account that pane's slot now
+    holds — a confident wrong row, which is worse than no row (dual review of
+    PR #232, 2026-09-18; same class as the GH #33 stale-session bug).
+
+    Identity = the entry's own `procStart` must equal the kernel's start time
+    for that pid (exact; a recycled pid cannot match), AND the process must
+    look like claude. Entries from a Claude Code too old to write `procStart`
+    are held to the cmdline check alone. Any unreadable piece => not live.
+    """
+    actual = _proc_start_ticks(pid)
+    if actual is None:
+        return False                         # dead (or not ours to read)
+    if proc_start not in (None, "") and str(proc_start) != actual:
+        return False                         # pid was recycled
+    return _proc_cmdline_is_claude(pid)
+
+
+def read_peer_registry(now: "datetime | None" = None) -> dict[str, dict]:
+    """{pane_id: {pid, session_id, cwd, status}} from Claude Code's peer registry.
+
+    <CLAUDE_DIR>/sessions/<pid>.json is written by the live claude process and
+    carries `tmux` as "<tmux-session>:@<window>.%<pane>". Only entries whose
+    pid is still THE SAME live claude process count (registry_entry_is_live) —
+    the registry is append-mostly and holds thousands of dead entries (1,001
+    on slot-4 on 2026-09-11, GH #199). A failed identity check DROPS the entry:
+    the pane then reports `no-session-registered` (usage unknown) instead of
+    another session's spend.
+
+    This beats find_live_panes()'s sessions.log chain for THIS command: it is
+    current across in-process /resume (no stale --resume cmdline, GH #33) and
+    needs no per-pane tmux calls. It is read-only and holds no token material.
+    """
+    out: dict[str, dict] = {}
+    reg = CLAUDE_DIR / SESSIONS_SUBDIR
+    try:
+        entries = sorted(reg.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return out
+    for p in entries:
+        try:
+            d = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        pid, sid, tmux = d.get("pid"), d.get("sessionId"), d.get("tmux")
+        if not (pid and sid and isinstance(tmux, str) and "%" in tmux):
+            continue
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if not registry_entry_is_live(pid, d.get("procStart")):
+            continue                     # dead or recycled pid: stale entry
+        pane = "%" + tmux.rsplit("%", 1)[1]
+        # Newest mtime wins for a pane (sorted above) — a relaunched pane has
+        # two entries and the live one was written last.
+        out[pane] = {"pid": int(pid), "session_id": str(sid),
+                     "cwd": d.get("cwd") or "", "claude_status": d.get("status")}
+    return out
+
+
+def transcript_for(session_id: str, cwd: str) -> "Path | None":
+    """<CLAUDE_DIR>/projects/<encoded-cwd>/<session-id>.jsonl, with one bounded
+    fallback glob when the session has moved cwd. `projects/` is shared across
+    every slot mount (SHARED_SYMLINK_SUBDIRS), so the canonical tree is the
+    only place to look regardless of which slot the pane runs in."""
+    root = CLAUDE_DIR / "projects"
+    if cwd:
+        cand = root / cwd.replace("/", "-") / f"{session_id}.jsonl"
+        if cand.exists():
+            return cand
+    try:
+        for hit in root.glob(f"*/{session_id}.jsonl"):
+            return hit
+    except OSError:
+        pass
+    return None
+
+
+def subagent_files(transcript: "Path", session_id: str) -> list["Path"]:
+    """Subagent transcripts for a session: <project>/<session-id>/subagents/agent-*.jsonl.
+
+    Claude Code puts each subagent's own JSONL here (the /tmp `.output` path
+    quoted in the tool result is a symlink into this tree). These lines DO
+    carry isSidechain:true; the parent transcript's lines never do on 2.1.x,
+    so subagent spend is invisible unless we read these files.
+    """
+    d = transcript.parent / session_id / "subagents"
+    try:
+        return sorted(d.glob("agent-*.jsonl"))
+    except OSError:
+        return []
+
+
+def _panes_iso(dt) -> str | None:
+    return dt.isoformat().replace("+00:00", "Z") if dt else None
+
+
+def collect_pane_row(pane_row: dict, registry: dict, state: dict, config: dict,
+                     window_start: "datetime", now: "datetime") -> dict:
+    """One pane's full row. Read-only; never raises on a bad transcript."""
+    pane = pane_row.get("pane", "")
+    reg = registry.get(pane)
+    # Slot from the LIVE claude pid's own /proc environ when we have it: exact,
+    # free, and immune to the pane-id-repeats-across-tmux-servers ambiguity that
+    # pane_mount_name() has to resolve with a socket (GH #137). Fall back to the
+    # process-tree walk for a pane with no registry entry.
+    slot = None
+    if reg:
+        cfg = _pid_config_dir(reg["pid"])
+        if cfg:
+            cand = Path(cfg).expanduser()
+            if cand.parent == ACCOUNTS_DIR and (cand.name.startswith(SLOT_PREFIX)
+                                                or cand.name.startswith("account-")):
+                slot = cand.name
+    if slot is None:
+        slot = pane_mount_name(pane)
+    account = None
+    pool = None
+    if slot and slot.startswith(SLOT_PREFIX):
+        s = state.get("slots", {}).get(slot, {})
+        account, pool = s.get("account"), s.get("pool")
+    elif slot and slot.startswith("account-"):
+        account = slot.removeprefix("account-")
+    row = {
+        "pane": pane,
+        "tmux_session": pane_row.get("session"),
+        "pane_pid": pane_row.get("pane_pid"),
+        "state": pane_row.get("state"),
+        "unchanged_for_s": pane_row.get("unchanged_for_s"),
+        "slot": slot,
+        "account": account,
+        "pool": pool,
+        "locked": bool(slot and slot in _locked_slots(config)),
+        "session_id": None,
+        "cwd": None,
+        "transcript": None,
+        "transcript_status": "unresolved",
+        # UNMEASURED until a transcript is actually parsed. Token figures are
+        # None, not 0: a pane we could not read is not a pane that spent
+        # nothing, and a 0 here used to render `SHARE 0%` AND shrink the
+        # account denominator so the other panes looked like the whole story
+        # (dual review of PR #232, 2026-09-18 — same rule as headroom: an
+        # unreadable number must never display as a healthy one).
+        "unmeasured": True,
+        "window_covered": True,
+        "wall_scan_covered": False,
+        "subagents_live": None,      # derived from the transcript too: unknown, not 0
+        "subagent_models": {},
+        "subagents": [],
+        "tokens_window": {"total": None, "new": None, "by_model": {}, "subagent_total": None},
+        "burn_tokens_per_min": None,
+        "burn_new_tokens_per_min": None,
+        "cost_window_usd": None,
+        "last_activity": None,
+        "wall": None,
+    }
+
+    def _done(r: dict) -> dict:
+        # EVERY return path gets a wall verdict: a pane whose transcript we
+        # cannot read can still be sitting at the limit menu, or on an
+        # exhausted account, and must not render as clear.
+        r.update(assess_wall(r.get("wall"), r.get("state"),
+                             state.get("accounts", {}).get(account) if account else None,
+                             slot, state, now))
+        return r
+
+    if not reg:
+        # No peer-registry entry: claude is running (the reader said so) but
+        # has not published itself, the pid died between the two reads, or the
+        # entry failed the identity check in read_peer_registry.
+        # Report the pane with unknown usage rather than inventing zeroes.
+        row["transcript_status"] = "no-session-registered"
+        return _done(row)
+    row["session_id"] = reg["session_id"]
+    row["cwd"] = reg["cwd"]
+    transcript = transcript_for(reg["session_id"], reg["cwd"])
+    if transcript is None:
+        row["transcript_status"] = "missing"
+        return _done(row)
+    row["transcript"] = str(transcript)
+
+    window_minutes = max((now - window_start).total_seconds() / 60.0, 1e-9)
+    # Read back to the DEEPER of the token window and the wall lookback. Token
+    # sums still filter on window_start; only the read depth changes. Before
+    # this, `--window 30m` meant a 429 from 45 minutes ago was never read.
+    scan_start = min(window_start, now - timedelta(seconds=PANES_WALL_LOOKBACK_SECONDS))
+    try:
+        if datetime.fromtimestamp(transcript.stat().st_mtime, tz=timezone.utc) < scan_start:
+            # Untouched since before BOTH horizons: nothing to sum and every
+            # line is older than the wall lookback, so a small tail (for the
+            # subagent picture) is all there is to learn.
+            lines, scan_covered = tail_lines(transcript, scan_start,
+                                             max_bytes=PANES_TAIL_START_BYTES)
+        else:
+            lines, scan_covered = tail_lines(transcript, scan_start)
+    except OSError as e:
+        row["transcript_status"] = f"unreadable: {e.__class__.__name__}"
+        return _done(row)
+    # Two horizons, judged separately: hitting the byte cap short of the wall
+    # lookback must not relabel a fully-covered token window as a floor.
+    oldest = _panes_oldest_ts(lines)
+    covered = scan_covered or (oldest is not None and oldest <= window_start)
+
+    facts = parse_transcript_facts(lines, window_start)
+    row["transcript_status"] = "ok"
+    row["unmeasured"] = False
+    row["window_covered"] = covered
+    row["wall_scan_covered"] = scan_covered
+    row["wall"] = facts["wall"]
+    row["cost_window_usd"] = facts["cost_window_usd"]
+    row["last_activity"] = _panes_iso(facts["last_activity"])
+    by_model = dict(facts["by_model"])
+
+    # --- subagents. Live = launched and not finished, corroborated by its own
+    # transcript still being written. A subagent that launched before our tail
+    # window is still caught here, because we enumerate the subagents/ DIR and
+    # treat a file written within PANES_SUBAGENT_LIVE_SECONDS with no
+    # completion notice as live.
+    finished = facts["agents_finished"]
+    launched = facts["agents_launched"]
+    sub_total = 0
+    seen_ids: set[str] = set()
+    for f in subagent_files(transcript, reg["session_id"]):
+        aid = f.name.removeprefix("agent-").removesuffix(".jsonl")
+        seen_ids.add(aid)
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        fresh = (now - datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)).total_seconds()
+        meta = launched.get(aid, {})
+        model = meta.get("model")
+        if st.st_mtime >= window_start.timestamp():
+            try:
+                slines, _ = tail_lines(f, window_start)
+                sfacts = parse_transcript_facts(slines, window_start)
+            except OSError:
+                sfacts = None
+            if sfacts:
+                for m, c in sfacts["by_model"].items():
+                    _add_model_tokens(by_model, m, c)
+                    sub_total += c["total"]
+                    if not model:
+                        model = m
+        if aid in finished or fresh > PANES_SUBAGENT_LIVE_SECONDS:
+            continue
+        row["subagents"].append({"agent_id": aid, "model": model or "unknown",
+                                 "description": meta.get("description"),
+                                 "started_at": meta.get("started_at"),
+                                 "idle_seconds": round(fresh, 1)})
+    # Launched, not finished, and no transcript on disk yet (just spawned).
+    for aid, meta in launched.items():
+        if aid in seen_ids or aid in finished:
+            continue
+        row["subagents"].append({"agent_id": aid, "model": meta.get("model") or "unknown",
+                                 "description": meta.get("description"),
+                                 "started_at": meta.get("started_at"), "idle_seconds": None})
+    row["subagents_live"] = len(row["subagents"])
+    models: dict[str, int] = {}
+    for a in row["subagents"]:
+        models[a["model"]] = models.get(a["model"], 0) + 1
+    row["subagent_models"] = models
+
+    total = sum(m["total"] for m in by_model.values())
+    # `new` excludes cache_read. On a long session cache reads are 90%+ of the
+    # total, so the bare total makes an idle-ish pane look like a furnace; both
+    # numbers ship, and the table shows both — NEW leads (see _usage_total).
+    new_tokens = sum(m["total"] - m["cache_read"] for m in by_model.values())
+    row["tokens_window"] = {"total": total, "new": new_tokens, "by_model": by_model,
+                            "subagent_total": sub_total}
+    row["burn_tokens_per_min"] = round(total / window_minutes, 1)
+    row["burn_new_tokens_per_min"] = round(new_tokens / window_minutes, 1)
+    return _done(row)
+
+
+def build_panes_payload(window_minutes: float, now: "datetime | None" = None) -> dict:
+    """The whole `cus panes` data structure. Raises PanesError if the pane
+    reader is unusable — a caller must never print a table built on guesses."""
+    now = now or datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=window_minutes)
+    state = load_state()
+    config = load_config()
+    reader_rows = [r for r in read_panes_from_reader(include_all=True)
+                   if r.get("profile") == "claude-code" or r.get("claude_alive")]
+    registry = read_peer_registry()
+    rows = [collect_pane_row(r, registry, state, config, window_start, now)
+            for r in reader_rows]
+    attribute_account_shares(rows)
+    # EVERY configured account, not only those with a live pane: the watchdog
+    # reads this to pick a DESTINATION, and an empty account is the best one.
+    accounts = {}
+    for a, rec in (state.get("accounts") or {}).items():
+        accounts[a] = account_headroom(rec, now)
+        accounts[a]["disabled"] = bool(isinstance(rec, dict) and rec.get("subscription_disabled"))
+    for r in rows:
+        a = r.get("account")
+        if a and a not in accounts:
+            accounts[a] = account_headroom(None, now)
+            accounts[a]["disabled"] = False
+    for a in accounts:
+        mine = [r for r in rows if r.get("account") == a]
+        accounts[a]["live_panes"] = len(mine)
+        accounts[a]["unmeasured_panes"] = sum(1 for r in mine if r.get("unmeasured"))
+    account_order = order_panes_by_account(rows, accounts)
+    return {
+        "generated_at": _panes_iso(now),
+        "window_minutes": window_minutes,
+        "window_start": _panes_iso(window_start),
+        "schema_version": 1,
+        "attribution_note": (
+            "pane_pct_of_account_window is an ESTIMATE attributed from token counts, "
+            "not a measured per-pane percentage. The usage endpoint reports per-ACCOUNT "
+            "percentages only; accounts[].five_hour_pct is that measured number and is "
+            "null when the last observation is missing or stale. Panes with unmeasured:true "
+            "have null token figures and a null share and are excluded from the denominator "
+            "(accounts[].unmeasured_panes counts them), so shares are of the OBSERVED "
+            "remainder. Tokens are attributed to the slot's CURRENT account: a slot moved "
+            "mid-window has its pre-move spend credited to the new account."),
+        # `panes` is FLAT but ordered: grouped by account in `account_order`
+        # (hottest known account first, unknown next, no-account last), and
+        # within an account by NEW-token burn, highest first, unmeasured last.
+        # Group with the row's `account` key; the order is stable.
+        "account_order": account_order,
+        "panes": rows,
+        "accounts": accounts,
+    }
+
+
+def order_panes_by_account(rows: list[dict], accounts: dict) -> list:
+    """Sort `rows` IN PLACE for the watchdog's question — "which pane is eating
+    this hot account" must be the top row of each group — and return the
+    account order (None = panes with no resolvable account, always last).
+
+    Accounts: known readings by hottest window first; then unknown/stale ones
+    (they might be hot — they sort ABOVE the no-account bucket, and never look
+    like a cool known account because their header says unknown). Accounts with
+    no live pane are kept: they are the move destinations.
+    """
+    def _acct_key(a):
+        h = accounts.get(a) or {}
+        if h.get("known"):
+            return (0, -max(h.get("five_hour_pct") or 0.0, h.get("seven_day_pct") or 0.0), a)
+        return (1, 0.0, a)
+    order = sorted(accounts, key=_acct_key)
+    if any(not r.get("account") for r in rows):
+        order.append(None)
+    pos = {a: i for i, a in enumerate(order)}
+
+    def _row_key(r):
+        burn = r.get("burn_new_tokens_per_min")
+        return (pos.get(r.get("account") or None, len(order)),
+                1 if burn is None else 0, -(burn or 0.0),
+                r.get("tmux_session") or "", r.get("pane") or "")
+    rows.sort(key=_row_key)
+    return order
+
+
+def me_verdict(row: dict, headroom: dict) -> dict:
+    """One actionable verdict for `--me`: {level, headline, reason}.
+
+    level: "stop" | "unknown" | "tight" | "room". Precedence is by how costly
+    a wrong "go" would be: a wall beats everything; an UNKNOWN reading can
+    never come out as "room" (a stale 0% is exactly the number that gets a
+    fleet walled); then the thresholds above.
+    """
+    if row.get("wall_active"):
+        why = ", ".join(row.get("wall_evidence") or []) or "429"
+        return {"level": "stop", "headline": "DO NOT SPEND",
+                "reason": f"this pane is walled ({why})"}
+    if not headroom.get("known"):
+        # Worded so a caller grepping the verdict line for "ROOM" cannot match
+        # it ("HEADROOM" would).
+        return {"level": "unknown", "headline": "CAUTION — ACCOUNT READING UNKNOWN",
+                "reason": f"{headroom.get('reason') or 'no reading'}; do not assume room, "
+                          f"check `cus status` first"}
+    p5, p7 = headroom["five_hour_pct"], headroom["seven_day_pct"]
+    used, which = (p5, "5h") if p5 >= p7 else (p7, "7d")
+    left = 100.0 - used
+    if used >= PANES_ME_STOP_USED_PCT:
+        return {"level": "stop", "headline": "DO NOT SPEND",
+                "reason": f"account {which} window {used:.0f}% used, {left:.0f}% left"}
+    if used >= PANES_ME_TIGHT_USED_PCT:
+        return {"level": "tight", "headline": "TIGHT — one small batch at most",
+                "reason": f"account {which} window {used:.0f}% used, {left:.0f}% left"}
+    return {"level": "room", "headline": "ROOM TO SPEND",
+            "reason": f"{100 - p5:.0f}% of 5h and {100 - p7:.0f}% of 7d left"}
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+def _short_model(m: str) -> str:
+    """'claude-fable-5-1' -> 'fable-5-1'; 'claude-opus-5[1m]' -> 'opus-5[1m]'."""
+    return (m or "unknown").removeprefix("claude-").removeprefix("anthropic-")
+
+
+def _wall_active(wall: dict | None, now: "datetime") -> bool:
+    """The TRANSCRIPT signal alone: a recorded 429 whose reset has not passed,
+    seen within the wall lookback. One of several attestations — the row-level
+    verdict is assess_wall()'s, which is what every renderer must use."""
+    if not wall:
+        return False
+    observed = _panes_parse_ts(wall.get("observed_at"))
+    resets = _panes_parse_ts(wall.get("resets_at"))
+    if observed is None or (now - observed).total_seconds() > PANES_WALL_LOOKBACK_SECONDS:
+        return False
+    return bool(resets and resets > now)
+
+
+def _slot_rehomed_since(state: dict, slot: str | None, since: "datetime | None") -> bool:
+    """True when swap_history shows this slot changed ACCOUNT after `since`.
+
+    A 429 belongs to the account that was mounted when it happened. On
+    2026-09-18 pane %2 rendered `WALL five_hour` against an account at 45%
+    because its slot had been moved off the exhausted account 30 minutes
+    after the rejection. Only POSITIVE evidence of a move discounts a 429;
+    no matching history entry means "not moved" (over-report, never under).
+    """
+    if not slot or since is None:
+        return False
+    for e in reversed(state.get("swap_history") or []):
+        if not isinstance(e, dict) or e.get("slot") != slot:
+            continue
+        ts = _panes_parse_ts(e.get("ts"))
+        if ts is None or ts <= since:
+            continue
+        if e.get("from") != e.get("to"):
+            return True
+    return False
+
+
+def assess_wall(wall: dict | None, pane_state: str | None, acct: dict | None,
+                slot: str | None, state: dict, now: "datetime") -> dict:
+    """Row-level wall verdict from THREE independent signals; ANY one is enough.
+
+      transcript_429        a 429 in the transcript, reset still ahead, and the
+                            slot has not changed account since it was seen
+      pane_limit_menu       the pane reader classifies the pane as sitting at
+                            Claude Code's limit menu right now
+      account_5h_exhausted  state.json has the pane's account at >=100% of its
+      account_7d_exhausted  5h / 7d window with the reset still ahead
+
+    WHY three: the first cut trusted the transcript alone, gated on a 1h age
+    cutoff, and on 2026-09-18 rendered a pane that was AT the limit menu, on
+    an account at 5h 100%, as "(429 3h ago)". The asymmetry decides the
+    design: a false "walled" costs a caller some caution; a false "clear"
+    walls their account mid-fan-out. So this over-reports by construction.
+
+    The account signal deliberately ignores observation staleness: usage
+    within a window only goes up, so "100% with the reset still ahead" stays
+    true however old the reading is. The reset time is the gate.
+    """
+    evidence: list[str] = []
+    resets_candidates: list["datetime"] = []
+    kind = None
+    rehomed = False
+
+    if _wall_active(wall, now):
+        observed = _panes_parse_ts(wall.get("observed_at"))
+        rehomed = _slot_rehomed_since(state, slot, observed)
+        if not rehomed:
+            evidence.append("transcript_429")
+            kind = wall.get("rate_limit_type")
+            resets_candidates.append(_panes_parse_ts(wall.get("resets_at")))
+
+    if pane_state == "limit_menu":
+        evidence.append("pane_limit_menu")
+
+    if acct:
+        for pct_key, reset_key, tag, label in (
+                ("current_5h_pct", "five_hour_resets_at", "account_5h_exhausted", "five_hour"),
+                ("current_7d_pct", "seven_day_resets_at", "account_7d_exhausted", "seven_day")):
+            pct = acct.get(pct_key)
+            if not isinstance(pct, (int, float)) or pct < 100:
+                continue
+            resets = _panes_parse_ts(acct.get(reset_key))
+            if resets is not None and resets <= now:
+                continue            # reading predates the reset: not evidence
+            evidence.append(tag)
+            kind = kind or label
+            if resets is not None:
+                resets_candidates.append(resets)
+
+    future = [r for r in resets_candidates if r is not None and r > now]
+    return {
+        "wall_active": bool(evidence),
+        "wall_evidence": evidence,
+        "wall_kind": kind,
+        # Latest reset among the attesting signals: the pane is clear only
+        # once ALL of them have reset.
+        "wall_resets_at": _panes_iso(max(future)) if future else None,
+        "wall_429_discounted": "slot changed account after the 429" if rehomed else None,
+    }
+
+
+def _wall_text(row: dict, now: "datetime") -> str:
+    # Rows built by collect_pane_row carry a verdict; a bare dict (older
+    # callers, hand-built rows) falls back to the transcript signal.
+    if "wall_active" in row:
+        active, kind = row["wall_active"], row.get("wall_kind")
+        resets = _panes_parse_ts(row.get("wall_resets_at"))
+        evidence = row.get("wall_evidence") or []
+    else:
+        w0 = row.get("wall")
+        active = _wall_active(w0, now)
+        kind = (w0 or {}).get("rate_limit_type")
+        resets = _panes_parse_ts((w0 or {}).get("resets_at"))
+        evidence = ["transcript_429"] if active else []
+    if active:
+        label = kind or ("limit_menu" if "pane_limit_menu" in evidence else "429")
+        if resets and resets > now:
+            mins = int((resets - now).total_seconds() // 60)
+            return f"WALL {label} ↻{mins // 60}h{mins % 60:02d}m"
+        return f"WALL {label}"
+    w = row.get("wall")
+    if not w:
+        return "-"
+    observed = _panes_parse_ts(w.get("observed_at"))
+    if observed is None:
+        return "(old 429)"
+    age = (now - observed).total_seconds()
+    unit = f"{int(age // 3600)}h" if age >= 3600 else f"{int(age // 60)}m"
+    return f"(429 {unit} ago)"
+
+
+def _fmt_reset(value, now: "datetime") -> str:
+    """'↻1h29m' for a future reset, '?' when absent/unparseable/already past."""
+    t = _panes_parse_ts(value)
+    if t is None or t <= now:
+        return "↻?"
+    mins = int((t - now).total_seconds() // 60)
+    if mins >= 48 * 60:
+        return f"↻{mins // 1440}d{(mins % 1440) // 60}h"
+    return f"↻{mins // 60}h{mins % 60:02d}m"
+
+
+def _account_header(name, h: dict | None, now: "datetime") -> str:
+    """Group header: the account's MEASURED headroom, or a loud unknown."""
+    if name is None:
+        return "== (no account resolved) — cannot be attributed to any account"
+    h = h or {}
+    if h.get("known"):
+        body = (f"5h {h['five_hour_pct']:.0f}% used, {h['headroom_5h_pct']:.0f}% left "
+                f"{_fmt_reset(h.get('five_hour_resets_at'), now)} · "
+                f"7d {h['seven_day_pct']:.0f}% used, {h['headroom_7d_pct']:.0f}% left "
+                f"{_fmt_reset(h.get('seven_day_resets_at'), now)}")
+    else:
+        body = f"headroom UNKNOWN — {h.get('reason') or 'no reading'}"
+    tags = ""
+    if h.get("disabled"):
+        tags += "  [DISABLED]"
+    if h.get("unmeasured_panes"):
+        tags += (f"  [! {h['unmeasured_panes']} pane(s) UNMEASURED — shares are of the "
+                 f"observed remainder]")
+    return f"== {name}  {body}{tags}"
+
+
+def render_panes_table(payload: dict) -> str:
+    """Human table, GROUPED BY ACCOUNT. Every derived number is labelled;
+    nothing is invented.
+
+    Layout serves the watchdog's two questions from one screen: the top row of
+    each group is the pane eating that account (rows arrive sorted by NEW-token
+    burn — see order_panes_by_account), and every group header carries the
+    account's measured headroom, including accounts with no live pane, which
+    are the candidate destinations for a move.
+    """
+    now = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
+    out = [f"Live Claude panes — {payload['window_minutes']:g}m window "
+           f"(since {payload['window_start']}) — grouped by account, hottest first; "
+           f"within an account, highest NEW burn first"]
+    hdr = (f"  {'PANE':<5} {'TMUX SESSION':<22} {'SLOT':<8} {'STATE':<16} {'SUB':>3} "
+           f"{'NEW':>7} {'NEW/MIN':>8} {'SHARE*':>7} {'TOK':>7} {'WALL':<22} MODELS")
+    out += [hdr, "-" * len(hdr)]
+    accounts = payload.get("accounts") or {}
+    by_acct: dict = {}
+    for r in payload["panes"]:
+        by_acct.setdefault(r.get("account") or None, []).append(r)
+    # Payloads built by build_panes_payload carry the order; a hand-built one
+    # (tests, older callers) gets a deterministic fallback.
+    order = list(payload.get("account_order") or [])
+    for a in list(by_acct) + sorted(accounts):
+        if a not in order:
+            order.append(a)
+    for acct in order:
+        rows = by_acct.get(acct, [])
+        if acct is None and not rows:
+            continue
+        out.append(_account_header(acct, accounts.get(acct), now))
+        if not rows:
+            out.append("  (no live panes)")
+        for r in rows:
+            share = r["attribution"]["pane_pct_of_account_window"]
+            share_s = f"{share:.0f}%" if share is not None else "-"
+            if share is not None and r["attribution"].get("approximate"):
+                share_s += "~"      # repo convention: trailing ~ = not a confirmed number
+            # Unmeasured => "-", never 0: see collect_pane_row.
+            unmeasured = r.get("unmeasured", r["transcript_status"] != "ok")
+            tok_s = "-" if unmeasured else _fmt_tokens(r["tokens_window"]["total"])
+            new_s = "-" if unmeasured else _fmt_tokens(r["tokens_window"]["new"])
+            burn_s = "-" if unmeasured else f"{r['burn_new_tokens_per_min']:.0f}"
+            models = ", ".join(f"{_short_model(m)}:{_fmt_tokens(c['total'] - c.get('cache_read', 0))}"
+                               for m, c in sorted(r["tokens_window"]["by_model"].items(),
+                                                  key=lambda kv: -(kv[1]["total"] - kv[1].get("cache_read", 0))))
+            if r["transcript_status"] != "ok":
+                models = f"(usage unknown: {r['transcript_status']})"
+            elif not r["window_covered"]:
+                models += "  [tail capped — totals are a floor]"
+            subs = "-" if r["subagents_live"] is None else str(r["subagents_live"])
+            if r["subagent_models"]:
+                subs += "*"
+            out.append(
+                f"  {r['pane']:<5} {(r['tmux_session'] or '?')[:22]:<22} {(r['slot'] or '-'):<8} "
+                f"{(r['state'] or '?')[:16]:<16} {subs:>3} "
+                f"{new_s:>7} {burn_s:>8} {share_s:>7} {tok_s:>7} {_wall_text(r, now):<22} {models}")
+            for a in r["subagents"]:
+                desc = (a.get("description") or "")[:40]
+                out.append(f"        └─ subagent {_short_model(a['model'])}  {desc}")
+    out.append("")
+    out.append("NEW excludes cache reads and is the headline: on this fleet it tracks 5h-% growth")
+    out.append("  better than TOK (which includes them and is ~94% cache reads). NEW/MIN, SHARE,")
+    out.append("  the sort and the per-model figures all use NEW; TOK is kept for context size.")
+    out.append("* SHARE is an ATTRIBUTION from token counts — this pane's share of the NEW tokens")
+    out.append("  we can see its ACCOUNT spend in the window. It is NOT the account's usage")
+    out.append("  percentage; only the endpoint reports that (the == header of each group).")
+    out.append("  Spend is credited to the slot's CURRENT account, even if it moved mid-window.")
+    out.append("  '-' = unmeasured (not zero) and excluded from the shares; '~' = approximate,")
+    out.append("  a pane on that account hit the transcript size cap so its total is a floor.")
+    out.append("WALL = any of: a live 429 in the transcript, the pane at the limit menu, or its")
+    out.append("  account measured at 100% with the reset still ahead.")
+    return "\n".join(out)
+
+
+def resolve_me_pane(payload: dict, tmux_pane: str | None,
+                    config_dir: str | None) -> tuple[dict | None, str | None]:
+    """(row, error) for --me: $TMUX_PANE first, then $CLAUDE_CONFIG_DIR's slot.
+
+    The slot fallback is ambiguous when two panes share a mount (a joined
+    lane), so it refuses rather than guessing — picking the wrong pane would
+    hand a session another pane's headroom picture right before it fans out.
+    """
+    if tmux_pane:
+        for r in payload["panes"]:
+            if r["pane"] == tmux_pane:
+                return r, None
+    if config_dir:
+        slot = Path(config_dir).expanduser().name
+        hits = [r for r in payload["panes"] if r.get("slot") == slot]
+        if len(hits) == 1:
+            return hits[0], None
+        if len(hits) > 1:
+            return None, (f"$CLAUDE_CONFIG_DIR points at {slot}, which {len(hits)} live panes "
+                          f"share ({', '.join(h['pane'] for h in hits)}) — run inside tmux so "
+                          f"$TMUX_PANE can disambiguate.")
+    return None, ("could not resolve this pane: $TMUX_PANE "
+                  f"({tmux_pane or 'unset'}) matched no live pane and $CLAUDE_CONFIG_DIR "
+                  f"({config_dir or 'unset'}) resolved to no slot.")
+
+
+def render_me(payload: dict, row: dict) -> str:
+    """Compact pre-fanout answer. Headroom must be unmissable and honest."""
+    now = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
+    h = payload["accounts"].get(row.get("account") or "", account_headroom(None, now))
+    models = ", ".join(f"{_short_model(m)} {_fmt_tokens(c['total'] - c.get('cache_read', 0))}"
+                       for m, c in sorted(row["tokens_window"]["by_model"].items(),
+                                          key=lambda kv: -(kv[1]["total"] - kv[1].get("cache_read", 0)))) or "none"
+    subs = (", ".join(f"{n}x {_short_model(m)}" for m, n in row["subagent_models"].items())
+            or "none")
+    verdict = me_verdict(row, h)
+    lines = [
+        # The answer first; everything below is the working.
+        f"VERDICT: {verdict['headline']} — {verdict['reason']}",
+        f"pane {row['pane']} ({row.get('tmux_session') or '?'})  slot={row.get('slot') or '-'}  "
+        f"account={row.get('account') or '-'}  pool={row.get('pool') or '-'}"
+        f"{'  LOCKED' if row.get('locked') else ''}",
+        f"state={row.get('state')}  live subagents="
+        + ("UNKNOWN" if row["subagents_live"] is None else f"{row['subagents_live']} ({subs})"),
+    ]
+    if row.get("unmeasured", row["transcript_status"] != "ok"):
+        lines.append(f"last {payload['window_minutes']:g}m: tokens UNKNOWN (not zero)")
+    else:
+        lines.append(
+            f"last {payload['window_minutes']:g}m: {_fmt_tokens(row['tokens_window']['new'])} new tokens "
+            f"({row['burn_new_tokens_per_min']:.0f}/min; "
+            f"{_fmt_tokens(row['tokens_window']['total'])} including cache reads)"
+            + (f", ${row['cost_window_usd']:.2f}" if row.get("cost_window_usd") is not None else "")
+            + f"  [{models}]")
+    if row["transcript_status"] != "ok":
+        lines.append(f"WARNING: usage unknown for this pane — {row['transcript_status']}. "
+                     f"Treat the token figures above as absent, not zero.")
+    elif not row["window_covered"]:
+        lines.append("NOTE: transcript tail hit the size cap — token totals are a FLOOR.")
+    if row.get("wall_active", _wall_active(row.get("wall"), now)):
+        why = ", ".join(row.get("wall_evidence") or ["transcript_429"])
+        lines.append(f"{_wall_text(row, now)} — this pane is rate-limited; do NOT fan out here. "
+                     f"(attested by: {why})")
+    elif row.get("wall"):
+        note = f"; {row['wall_429_discounted']}" if row.get("wall_429_discounted") else ""
+        lines.append(f"Last 429 on this pane: {_wall_text(row, now)} (not current{note}).")
+    if row["transcript_status"] == "ok" and not row.get("wall_scan_covered", True) \
+            and not row.get("wall_active"):
+        lines.append("NOTE: transcript size cap hit before the 5h wall lookback was covered — "
+                     "an older 429 may be unread; the account line below is the backstop.")
+    if h["known"]:
+        lines.append(f"HEADROOM ({row.get('account')}, measured): 5h {h['headroom_5h_pct']:.0f}% left "
+                     f"(used {h['five_hour_pct']:.0f}%, resets {h['five_hour_resets_at'] or '?'}) · "
+                     f"7d {h['headroom_7d_pct']:.0f}% left (used {h['seven_day_pct']:.0f}%)")
+    else:
+        lines.append(f"HEADROOM ({row.get('account') or '?'}): UNKNOWN — {h['reason']}. "
+                     f"Do not treat this as free capacity; check `cus status` before fanning out.")
+    share = row["attribution"]["pane_pct_of_account_window"]
+    if share is not None:
+        approx = "~" if row["attribution"].get("approximate") else ""
+        lines.append(f"Attributed share of this account's observed window spend: {share:.0f}%{approx} "
+                     f"(estimate from token counts, not a measured percentage).")
+    n_un = row["attribution"].get("unmeasured_panes_on_account") or 0
+    if n_un:
+        lines.append(f"NOTE: {n_un} pane(s) on this account are UNMEASURED and excluded from that share.")
+    return "\n".join(lines)
+
+
+@cli.command(name="panes")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON (schema_version 1).")
+@click.option("--window", default=PANES_WINDOW_DEFAULT, show_default=True,
+              help="Look-back window: 30m / 2h / 90s / bare minutes.")
+@click.option("--me", "me", is_flag=True,
+              help="Just THIS pane's row plus its account's headroom — run it before fanning out subagents.")
+def panes_cmd(as_json: bool, window: str, me: bool) -> None:
+    """Per-pane live view: subagents, models, token burn, wall, account headroom.
+
+    READ-ONLY. Reads only files already on disk (tmux pane states via
+    skills/pane_state.py, Claude Code's session registry and transcripts, and
+    cus state.json). Makes no API call, writes no cus state, and never touches
+    credentials. (The pane reader it runs keeps its own small fingerprint
+    cache under ~/.cache/pane_state/ — that is the only write, and not cus's.)
+
+    WALL is reported when ANY of three signals attests it: a 429 in the
+    transcript whose reset is still ahead (scanned back 5h regardless of
+    --window), the pane sitting at the limit menu, or the pane's account
+    measured at 100% with its reset still ahead. It over-reports on purpose.
+
+    The table is GROUPED BY ACCOUNT (hottest first; accounts with no live pane
+    are listed too, as move destinations) with each account's measured
+    headroom on its header line; within an account, the pane burning the most
+    is on top. NEW (cache reads excluded) is the headline token figure — it
+    tracks cap consumption better than TOK, which is kept as a secondary
+    column. --me opens with one VERDICT line: ROOM TO SPEND / TIGHT /
+    DO NOT SPEND, or CAUTION when the account reading is unknown or stale.
+
+    The SHARE column is an ATTRIBUTION, not a measurement: it is this pane's
+    share of the NEW tokens we can observe its ACCOUNT spend in the window. The
+    usage endpoint reports percentages per ACCOUNT only, and those measured
+    numbers appear on the per-account lines — as "unknown" whenever the last
+    successful observation is missing or stale, never as a healthy-looking 0%.
+    A pane whose transcript could not be read shows "-" (null in --json), is
+    excluded from every share, and is counted on its account's line.
+
+    Token totals come from the tail of each transcript (bounded, so a >100MB
+    file stays cheap); a pane whose tail hit the cap is flagged and its totals
+    are a floor. Subagent spend is included: each subagent writes its own
+    transcript under <project>/<session-id>/subagents/.
+    """
+    try:
+        minutes = parse_window_spec(window)
+    except ValueError as e:
+        raise click.ClickException(f"bad --window {window!r}: {e}") from e
+    try:
+        payload = build_panes_payload(minutes)
+    except PanesError as e:
+        raise click.ClickException(str(e)) from e
+
+    if me:
+        row, err = resolve_me_pane(payload, os.environ.get("TMUX_PANE"),
+                                   os.environ.get("CLAUDE_CONFIG_DIR"))
+        if err:
+            raise click.ClickException(err)
+        if as_json:
+            now_ = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
+            head = payload["accounts"].get(row.get("account") or "", account_headroom(None, now_))
+            click.echo(json.dumps({**{k: v for k, v in payload.items() if k != "panes"},
+                                   "verdict": me_verdict(row, head),
+                                   "pane": row}, indent=2, default=str))
+        else:
+            click.echo(render_me(payload, row))
+        return
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, default=str))
+    else:
+        click.echo(render_panes_table(payload))
+
+
 @cli.command(name="check-orchestrate")
 @click.option("--target", default=None, help="Pretend we're swapping to this account (for relaunch-command preview).")
 def check_orchestrate_cmd(target: str | None) -> None:
