@@ -229,6 +229,36 @@ Written the afternoon six heavy panes sharing slot-3 walled five accounts in a r
 
 ---
 
+## Update 2026-09-18 (later) — how to actually SPLIT a pane, and the axis check that must precede the move
+
+Confirmed by the cus internals session (`cus1a`, 2026-09-18 ~17:00Z) after this watchdog stranded a pane learning it the hard way.
+
+**A running session cannot be re-pointed.** `CLAUDE_CONFIG_DIR` is read by `claude` at process START, so moving a session into its OWN lane REQUIRES a restart (close and reopen). Do not confuse this with `cus slot move <slot> <acct>`, which re-homes the ACCOUNT behind a lane in place, no restart — and which moves EVERY pane sharing that lane together. `slot move` is a reprieve for a whole lane; only a per-pane relaunch spreads panes across accounts.
+
+**The sanctioned one-step split:**
+```
+tmux respawn-pane -k -t %ID -c <cwd> \
+  "bash -lc 'python3 ~/repos/claude-usage-swap/cus.py launch <clean-acct> --lane <free-slot> -- --resume <session-id> --dangerously-skip-permissions; exec bash -l'"
+```
+`cus launch --lane` claims the login family AND writes the bookkeeping a raw launch skips: the #199 peer-registry wiring (session mail), `sessions.log` (drift detection), pane→slot records. The `; exec bash -l` tail is what keeps a refusal from stranding the pane at a dead prompt — **never omit it**.
+
+**Do NOT pre-`cus slot move` the free slot to claim a family and then launch into it.** That two-step is what tripped GH #104 here (`'rayi5' is already running on a live mount`) *after* the old claude was already dead. Two causes, worth separating: (1) the real trap — **rayi5 was the SHARED-MOUNT account**, so a second live rayi5 lane legitimately violates #104; pick a NON-mount account for a split (`cus status` names the shared-mount account on its first line). (2) Arguably a bug — a lane that already holds its own claimed independent family should not be refused; filed as cus #238-D. `--force` is safe *only* in that specific case (a pre-claimed family means no real clobber), and is otherwise still banned.
+
+**Fallback if a launch strands a pane:** `CLAUDE_CONFIG_DIR=/home/rayi/claude-accounts/<slot> claude --resume <id> --dangerously-skip-permissions` works and is not dangerous — `cus sessions` still attributes it correctly (it reads `/proc`, which is ground truth) and peer mail still works on a cus-scaffolded slot — but it skips the `sessions.log` write, so prefer the one-step launch.
+
+**Four things that bite when splitting:**
+1. `respawn-pane -k` kills the pane's whole process tree — in-flight subagents and shells die with it. **Split only a pane that is idle between tasks, never mid-fan-out.**
+2. A fresh slot dir shows the trust-folder prompt. Arrow **DOWN** to "Yes, I trust this folder" then Enter — the default is "No, exit", so a plain Enter kills the resume. (The owner authorized answering this prompt, 2026-09-18.)
+3. MCP: #227 carries `mcpOAuth` across credential writes, but a brand-new slot that never authed a server starts with a stub, so expect one `/mcp` re-auth per OAuth server on it. Each new lane also boots the whole user-scope MCP set — real memory, so watch `free -h` when spreading several panes.
+4. A babysitter pair tracks its build by pane id, which `respawn-pane` preserves — but TELL the sitter the restart was deliberate or it will fight the wake.
+5. A resumed session does NOT continue on its own: send the signed resume message.
+
+**The hard ceiling: one free login family per split pane.** Six heavy panes need six lanes need six free families. When families are exhausted (2026-09-18: rayi1's three all leased, rayi3 refusing), split only the heaviest one or two and report the ceiling to the owner — and never kill+respawn a pane you cannot then give a lane to.
+
+**CHECK EVERY AXIS OF THE TARGET BEFORE THE SPLIT, INCLUDING THE PER-MODEL ONE (2026-09-18, owner: *"wait, rayi2 is fable maxxed?"*).** This watchdog moved `8jira2a` — a pane whose own model is Fable — onto rayi2, having checked rayi2's 5h (15%) and weekly (62%) and not its Fable weekly (100% until Wednesday). The lane was correct and the account was useless for that pane. A split is more expensive to undo than a swap (it costs a restart and a rebuild), so the any-axis rule in § "Hard rules" applies *harder* here: **match the target's per-model headroom to the PANE'S OWN dominant model**, not to the fleet's average. `cus panes` prints each pane's models; `state.json` has `per_model_weekly_pct` per account.
+
+---
+
 ## Gotchas learned in the field
 
 - **Stale statuslines.** A pane's own `cus` statusline (account, %) lags until the session has an active turn; an idle pane can show its *previous* account for a while. Trust `cus sessions` (`/proc` ground truth), not the pane's status bar.
