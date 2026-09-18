@@ -15,6 +15,15 @@ Covered (the issue's acceptance list):
     once per content block
   - account headroom rendering "unknown" for a stale/missing observation
 
+Added by the dual-review follow-up on PR #232 (2026-09-18) — each block is
+named after the failure it locks out:
+  - a live wall OLDER than --window (the read depth used to be the window)
+  - the pane-state and account signals attesting a wall with no readable 429
+  - a 429 from before the slot changed account not reading as a current wall
+  - peer-registry identity: dead pid, RECYCLED pid (procStart mismatch),
+    non-claude process, newest-entry-wins, malformed `tmux`
+  - unmeasured panes: null share, excluded from the denominator, "-" not "0%"
+
 Run standalone:  python3 tests/test_panes_view.py
 Run under pytest: pytest tests/test_panes_view.py
 """
@@ -363,7 +372,11 @@ def test_row_for_missing_transcript_is_unknown_not_zero(monkeypatch, tmp_path):
     row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "idle"},
                                registry, STATE, CONFIG, WINDOW_START, NOW)
     assert row["transcript_status"] == "missing"
-    assert row["tokens_window"]["total"] == 0
+    # None, not 0: an unread transcript is not a pane that spent nothing.
+    assert row["unmeasured"] is True
+    assert row["tokens_window"]["total"] is None
+    assert row["burn_tokens_per_min"] is None
+    assert row["subagents_live"] is None      # also read from the transcript
     # and the table must SAY it is unknown rather than print a blank model list
     payload = {"generated_at": iso(NOW), "window_minutes": 30,
                "window_start": iso(WINDOW_START), "panes": [row], "accounts": {}}
@@ -386,7 +399,8 @@ def test_row_for_unreadable_transcript_is_flagged(monkeypatch, tmp_path):
         if row["transcript_status"] == "ok":       # running as root: chmod is a no-op
             return
         assert row["transcript_status"].startswith("unreadable")
-        assert row["tokens_window"]["total"] == 0
+        assert row["unmeasured"] is True
+        assert row["tokens_window"]["total"] is None
     finally:
         t.chmod(0o600)
 
@@ -523,3 +537,358 @@ def test_table_marks_stale_accounts_unknown():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ==========================================================================
+# Dual-review follow-up, PR #232 (2026-09-18)
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# Finding 1: wall detection must not be bounded by --window
+# --------------------------------------------------------------------------
+
+def _write_session(claude, sid, lines):
+    proj = claude / "projects" / "-home-rayi-repos-demo"
+    proj.mkdir(parents=True, exist_ok=True)
+    t = proj / f"{sid}.jsonl"
+    t.write_text("\n".join(lines) + "\n")
+    return t
+
+
+def _reg(sid):
+    return {"%9": {"pid": 1, "session_id": sid, "cwd": "/home/rayi/repos/demo"}}
+
+
+def _walled_45m_ago_transcript():
+    """The Sonnet seat's reproduction, as a fixture: a 429 at t-45m with the
+    reset still 15 minutes out, then >2MB of activity between t-45m and t-31m,
+    a line exactly on the window edge, and light recent activity. The first
+    1MB/2MB tail reads reach the 30m window WITHOUT reaching the 429."""
+    pad = "x" * 1800
+    filler = []
+    for i in range(1300):                      # ~2.4MB, all OUTSIDE the 30m window
+        ts = NOW - timedelta(minutes=44) + timedelta(seconds=i * 0.6)
+        filler.append(json.dumps({"type": "user", "timestamp": iso(ts), "uuid": f"f{i}",
+                                  "message": {"role": "user", "content": pad}}))
+    return ([wall_line(NOW - timedelta(minutes=45), NOW + timedelta(minutes=15))]
+            + filler
+            + [usage_line(WINDOW_START, "claude-opus-5", "edge", inp=10, out=0),
+               usage_line(NOW - timedelta(minutes=2), "claude-opus-5", "recent", inp=90, out=0)])
+
+
+def test_wall_older_than_window_is_still_detected(monkeypatch, tmp_path):
+    """THE regression. With --window 30m a wall from 45 minutes ago (reset still
+    ahead) rendered as "-": tail_lines stopped as soon as it covered the token
+    window, so the 429 was never read. A false "clear" is the one answer this
+    command must not give before a fan-out."""
+    claude = _fake_env(monkeypatch, tmp_path)
+    lines = _walled_45m_ago_transcript()
+    t = _write_session(claude, "sess-deepwall", lines)
+    assert t.stat().st_size > 2 * cus.PANES_TAIL_START_BYTES   # fixture really is deep
+
+    # Guard the fixture itself: reading only as far as the WINDOW misses the 429.
+    shallow, covered = cus.tail_lines(t, WINDOW_START)
+    assert covered is True
+    assert cus.parse_transcript_facts(shallow, WINDOW_START)["wall"] is None
+
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "working"},
+                               _reg("sess-deepwall"), STATE, CONFIG, WINDOW_START, NOW)
+    assert row["wall"] is not None, "429 outside --window was not read"
+    assert row["wall_active"] is True
+    assert row["wall_evidence"] == ["transcript_429"]
+    assert "WALL five_hour" in cus._wall_text(row, NOW) and "↻0h15m" in cus._wall_text(row, NOW)
+    # ...and reading deeper must not leak pre-window tokens into the window sum.
+    assert row["tokens_window"]["total"] == 100
+    assert row["window_covered"] is True and row["wall_scan_covered"] is True
+
+
+def test_wall_detection_is_independent_of_the_window_value(monkeypatch, tmp_path):
+    """Same transcript, three --window values: the wall verdict must not move."""
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, "sess-w", _walled_45m_ago_transcript())
+    for minutes in (1, 30, 120):
+        row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "working"},
+                                   _reg("sess-w"), STATE, CONFIG,
+                                   NOW - timedelta(minutes=minutes), NOW)
+        assert row["wall_active"] is True, f"--window {minutes}m lost the wall"
+
+
+def test_me_warns_off_a_pane_walled_before_the_window(monkeypatch, tmp_path):
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, "sess-me", _walled_45m_ago_transcript())
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "working"},
+                               _reg("sess-me"), STATE, CONFIG, WINDOW_START, NOW)
+    text = cus.render_me(_payload([row]), row)
+    assert "do NOT fan out here" in text and "transcript_429" in text
+
+
+def test_limit_menu_state_attests_a_wall_without_any_429(monkeypatch, tmp_path):
+    """The Opus seat's live case (%19, 2026-09-18): the reader said limit_menu
+    and the table said "(429 3h ago)". The pane state alone must be enough."""
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, "sess-menu",
+                   [usage_line(NOW - timedelta(hours=7), "claude-opus-5", "m", inp=5, out=5)])
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "limit_menu"},
+                               _reg("sess-menu"), STATE, CONFIG, WINDOW_START, NOW)
+    assert row["wall"] is None
+    assert row["wall_active"] is True and row["wall_evidence"] == ["pane_limit_menu"]
+    assert cus._wall_text(row, NOW).startswith("WALL")
+
+
+def test_exhausted_account_attests_a_wall_even_with_a_stale_reading(monkeypatch, tmp_path):
+    """5h at 100% with the reset still ahead is a wall however old the reading:
+    usage inside a window only goes up. A reading from BEFORE the reset is not."""
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, "sess-acct",
+                   [usage_line(NOW - timedelta(minutes=3), "claude-opus-5", "m", inp=5, out=5)])
+    walled = {"slots": STATE["slots"], "accounts": {"rayi5": {
+        "current_5h_pct": 100.0, "current_7d_pct": 40.0,
+        "five_hour_resets_at": iso(NOW + timedelta(hours=2)),
+        "last_observed_ts": iso(NOW - timedelta(hours=3))}}}          # stale on purpose
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "idle"},
+                               _reg("sess-acct"), walled, CONFIG, WINDOW_START, NOW)
+    assert row["wall_active"] is True
+    assert row["wall_evidence"] == ["account_5h_exhausted"]
+    assert "↻2h00m" in cus._wall_text(row, NOW)
+
+    already_reset = {"slots": STATE["slots"], "accounts": {"rayi5": {
+        "current_5h_pct": 100.0, "current_7d_pct": 40.0,
+        "five_hour_resets_at": iso(NOW - timedelta(minutes=1))}}}
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "idle"},
+                               _reg("sess-acct"), already_reset, CONFIG, WINDOW_START, NOW)
+    assert row["wall_active"] is False
+
+
+def test_unreadable_pane_at_the_limit_menu_is_still_walled(monkeypatch, tmp_path):
+    """No transcript must not mean no wall verdict."""
+    _fake_env(monkeypatch, tmp_path)
+    row = cus.collect_pane_row({"pane": "%99", "session": "orphan", "state": "limit_menu"},
+                               {}, STATE, CONFIG, WINDOW_START, NOW)
+    assert row["transcript_status"] == "no-session-registered"
+    assert row["wall_active"] is True
+
+
+def test_429_from_before_the_slot_changed_account_is_not_a_current_wall(monkeypatch, tmp_path):
+    """Live on 2026-09-18: %2 rendered WALL against an account at 45% because
+    its slot had been moved off the exhausted account after the 429. Positive
+    swap evidence discounts the transcript signal — and ONLY that signal."""
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, "sess-moved",
+                   [wall_line(NOW - timedelta(minutes=40), NOW + timedelta(minutes=20))])
+    moved = dict(STATE, swap_history=[
+        {"slot": "slot-7", "from": "rayi9", "to": "rayi5", "trigger": "reactive-429",
+         "ts": iso(NOW - timedelta(minutes=35))}])
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "working"},
+                               _reg("sess-moved"), moved, CONFIG, WINDOW_START, NOW)
+    assert row["wall_active"] is False
+    assert row["wall_429_discounted"]
+    assert "ago)" in cus._wall_text(row, NOW)
+    # The other signals are untouched by the discount: still at the menu => walled.
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "limit_menu"},
+                               _reg("sess-moved"), moved, CONFIG, WINDOW_START, NOW)
+    assert row["wall_active"] is True and row["wall_evidence"] == ["pane_limit_menu"]
+    # A move of a DIFFERENT slot, or one BEFORE the 429, discounts nothing.
+    for entry in ({"slot": "slot-8", "from": "a", "to": "b", "ts": iso(NOW - timedelta(minutes=35))},
+                  {"slot": "slot-7", "from": "a", "to": "b", "ts": iso(NOW - timedelta(minutes=50))}):
+        row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "working"},
+                                   _reg("sess-moved"), dict(STATE, swap_history=[entry]),
+                                   CONFIG, WINDOW_START, NOW)
+        assert row["wall_active"] is True
+
+
+def test_token_window_coverage_is_not_relabelled_by_the_deeper_wall_scan(monkeypatch, tmp_path):
+    """Hitting the byte cap short of the 5h wall lookback must not turn a fully
+    covered 30m token window into a "floor"."""
+    claude = _fake_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cus, "PANES_TAIL_MAX_BYTES", 64 * 1024)
+    pad = "y" * 900
+    old = [json.dumps({"type": "user", "timestamp": iso(NOW - timedelta(hours=2) + timedelta(seconds=i)),
+                       "uuid": f"o{i}", "message": {"role": "user", "content": pad}})
+           for i in range(400)]                                        # ~400KB, 2h old
+    recent = [usage_line(NOW - timedelta(minutes=40), "m", "pre", inp=7, out=0),
+              usage_line(NOW - timedelta(minutes=5), "m", "in", inp=50, out=0)]
+    t = _write_session(claude, "sess-cap", old + recent)
+    lines, scan_covered = cus.tail_lines(t, NOW - timedelta(hours=5), max_bytes=64 * 1024)
+    assert scan_covered is False                                       # cap binds on the scan
+    oldest = cus._panes_oldest_ts(lines)
+    assert oldest is not None and oldest <= WINDOW_START               # ...but the window is covered
+
+
+# --------------------------------------------------------------------------
+# Finding 2: peer-registry identity (dead pid, RECYCLED pid)
+# --------------------------------------------------------------------------
+
+def _registry_dir(monkeypatch, tmp_path):
+    claude = tmp_path / "dot-claude"
+    (claude / cus.SESSIONS_SUBDIR).mkdir(parents=True)
+    monkeypatch.setattr(cus, "CLAUDE_DIR", claude)
+    return claude / cus.SESSIONS_SUBDIR
+
+
+def _entry(d, name, mtime=None, **fields):
+    p = d / name
+    p.write_text(json.dumps(fields))
+    if mtime is not None:
+        import os as _os
+        _os.utime(p, (mtime, mtime))
+    return p
+
+
+def _dead_pid():
+    import subprocess as _sp
+    proc = _sp.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_registry_drops_a_recycled_pid(monkeypatch, tmp_path):
+    """THE regression. /proc/<pid> existing proves only that SOME process holds
+    the number. Here the pid is genuinely alive (it is this test process) and
+    even looks like claude — but the entry's procStart is another process's, so
+    it must be dropped, not bound to the pane."""
+    import os as _os
+    d = _registry_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(cus, "_proc_cmdline_is_claude", lambda pid: True)
+    me = _os.getpid()
+    real_start = cus._proc_start_ticks(me)
+    assert real_start and real_start.isdigit()            # real /proc, not a mock
+    _entry(d, "stale.json", pid=me, sessionId="dead-session", cwd="/x",
+           tmux="s:@1.%7", procStart=str(int(real_start) - 12345))
+    assert cus.read_peer_registry() == {}
+
+    # Same pid, the RIGHT procStart: accepted. Proves the drop above was the
+    # identity check and not the fixture being rejected for another reason.
+    _entry(d, "live.json", pid=me, sessionId="live-session", cwd="/x",
+           tmux="s:@1.%7", procStart=real_start)
+    reg = cus.read_peer_registry()
+    assert reg["%7"]["session_id"] == "live-session" and reg["%7"]["pid"] == me
+
+
+def test_recycled_pid_cannot_attribute_another_sessions_spend(monkeypatch, tmp_path):
+    """End to end: the dead session's transcript holds real tokens. With the
+    stale entry dropped the pane reports UNKNOWN usage — never those tokens
+    against the live pane's account."""
+    import os as _os
+    claude = _fake_env(monkeypatch, tmp_path)
+    (claude / cus.SESSIONS_SUBDIR).mkdir(parents=True)
+    monkeypatch.setattr(cus, "_proc_cmdline_is_claude", lambda pid: True)
+    _write_session(claude, "dead-session",
+                   [usage_line(NOW - timedelta(minutes=5), "claude-opus-5", "big", inp=900000, out=0)])
+    me = _os.getpid()
+    _entry(claude / cus.SESSIONS_SUBDIR, "stale.json", pid=me, sessionId="dead-session",
+           cwd="/home/rayi/repos/demo", tmux="s:@1.%9",
+           procStart=str(int(cus._proc_start_ticks(me)) + 999))
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "working"},
+                               cus.read_peer_registry(), STATE, CONFIG, WINDOW_START, NOW)
+    assert row["transcript_status"] == "no-session-registered"
+    assert row["session_id"] is None and row["tokens_window"]["total"] is None
+    cus.attribute_account_shares([row])
+    assert row["attribution"]["pane_pct_of_account_window"] is None
+
+
+def test_registry_drops_a_dead_pid(monkeypatch, tmp_path):
+    d = _registry_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(cus, "_proc_cmdline_is_claude", lambda pid: True)
+    _entry(d, "dead.json", pid=_dead_pid(), sessionId="s", cwd="/x",
+           tmux="s:@1.%7", procStart="1")
+    assert cus.read_peer_registry() == {}
+
+
+def test_registry_drops_a_live_pid_that_is_not_claude(monkeypatch, tmp_path):
+    """procStart absent (older Claude Code) => the cmdline check carries the
+    identity alone, and this pytest process is not claude. Runs the REAL check."""
+    import os as _os
+    d = _registry_dir(monkeypatch, tmp_path)
+    _entry(d, "notclaude.json", pid=_os.getpid(), sessionId="s", cwd="/x", tmux="s:@1.%7")
+    assert cus._proc_cmdline_is_claude(_os.getpid()) is False
+    assert cus.read_peer_registry() == {}
+
+
+def test_registry_newest_entry_wins_for_a_relaunched_pane(monkeypatch, tmp_path):
+    import os as _os
+    d = _registry_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(cus, "_proc_cmdline_is_claude", lambda pid: True)
+    me, start = _os.getpid(), cus._proc_start_ticks(_os.getpid())
+    _entry(d, "a.json", mtime=1_000_000, pid=me, sessionId="older", cwd="/x",
+           tmux="s:@1.%7", procStart=start)
+    _entry(d, "b.json", mtime=2_000_000, pid=me, sessionId="newer", cwd="/x",
+           tmux="s:@1.%7", procStart=start)
+    assert cus.read_peer_registry()["%7"]["session_id"] == "newer"
+
+
+def test_registry_skips_malformed_entries(monkeypatch, tmp_path):
+    import os as _os
+    d = _registry_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(cus, "_proc_cmdline_is_claude", lambda pid: True)
+    me, start = _os.getpid(), cus._proc_start_ticks(_os.getpid())
+    (d / "garbage.json").write_text("{not json")
+    _entry(d, "no-tmux.json", pid=me, sessionId="s", cwd="/x", procStart=start)
+    _entry(d, "no-pane.json", pid=me, sessionId="s", cwd="/x", tmux="s:@1", procStart=start)
+    _entry(d, "bad-pid.json", pid="abc", sessionId="s", cwd="/x", tmux="s:@1.%7", procStart=start)
+    (d / "secret.key").write_text("never-read")             # not *.json: never opened
+    assert cus.read_peer_registry() == {}
+
+
+# --------------------------------------------------------------------------
+# Finding 3: unmeasured is unknown, not 0%
+# --------------------------------------------------------------------------
+
+def _unmeasured_row(pane, account, status="missing"):
+    r = _full_row(pane, "slot-x", account, total=0)
+    r.update({"transcript_status": status, "unmeasured": True, "subagents_live": None,
+              "burn_tokens_per_min": None, "burn_new_tokens_per_min": None,
+              "tokens_window": {"total": None, "new": None, "by_model": {},
+                                "subagent_total": None}})
+    return r
+
+
+def test_unmeasured_pane_has_null_share_and_is_excluded_from_the_denominator():
+    rows = [_full_row("%1", "slot-1", "rayi3", total=600),
+            _full_row("%2", "slot-2", "rayi3", total=400),
+            _unmeasured_row("%3", "rayi3")]
+    cus.attribute_account_shares(rows)
+    a1, a2, a3 = (r["attribution"] for r in rows)
+    assert a3["pane_pct_of_account_window"] is None and a3["unmeasured"] is True
+    assert (a1["pane_pct_of_account_window"], a2["pane_pct_of_account_window"]) == (60.0, 40.0)
+    assert a1["account_window_tokens"] == 1000
+    # every row on the account says the picture is incomplete
+    assert a1["unmeasured_panes_on_account"] == a3["unmeasured_panes_on_account"] == 1
+
+
+def test_legacy_zero_total_row_with_a_bad_transcript_is_still_unmeasured():
+    """Belt: a row that arrives with total=0 but transcript_status != ok (the
+    pre-fix shape) must not sneak back in as a measured 0%."""
+    rows = [_full_row("%1", "slot-1", "rayi3", total=500),
+            {"pane": "%2", "account": "rayi3", "transcript_status": "missing",
+             "tokens_window": {"total": 0}}]
+    cus.attribute_account_shares(rows)
+    assert rows[1]["attribution"]["pane_pct_of_account_window"] is None
+    assert rows[0]["attribution"]["unmeasured_panes_on_account"] == 1
+
+
+def test_table_renders_unmeasured_as_dash_never_zero_percent():
+    rows = [_full_row("%1", "slot-1", "rayi3", total=1000), _unmeasured_row("%3", "rayi3")]
+    p = _payload(rows, {"rayi3": dict(cus.account_headroom(None, NOW), unmeasured_panes=1)})
+    text = cus.render_panes_table(p)
+    line = next(ln for ln in text.splitlines() if ln.startswith("%3"))
+    assert "0%" not in line and " 0 " not in line
+    assert "usage unknown: missing" in line
+    assert "1 pane(s) on rayi3 UNMEASURED" in text
+
+
+def test_me_says_tokens_unknown_not_zero_for_an_unmeasured_pane():
+    row = _unmeasured_row("%3", "rayi3")
+    text = cus.render_me(_payload([row]), row)
+    assert "tokens UNKNOWN (not zero)" in text
+    assert "0 tokens" not in text
+
+
+def test_capped_pane_marks_every_share_on_its_account_approximate():
+    capped = _full_row("%1", "slot-1", "rayi3", total=700)
+    capped["window_covered"] = False
+    rows = [capped, _full_row("%2", "slot-2", "rayi3", total=300),
+            _full_row("%4", "slot-4", "rayi2", total=50)]
+    text = cus.render_panes_table(_payload(rows))
+    assert rows[1]["attribution"]["approximate"] is True
+    assert rows[2]["attribution"]["approximate"] is False     # other account untouched
+    assert "70%~" in text and "30%~" in text and "100%~" not in text
