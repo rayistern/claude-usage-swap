@@ -182,6 +182,10 @@ To dismiss a session's native rate-limit menu after its window has reset, `tmux 
 - **Never drive an interactive `/login` / `relogin` browser flow** — you can't; your move is to hand the human the exact command.
 - **Never hand-edit `state.json` / `.credentials.json` / `.claude.json`** — go through `cus` commands. When only a hand-edit will fix it (no-journal drift), escalate.
 - **Never `cus switch --force`** or double-book an account onto a second live mount without a free independent login family (that's the exact clobber this prevents).
+- **The watchdog's host account is DEDICATED and OUT OF ROTATION — never share it with a work lane.** Owner rule, restated 2026-09-18 after the loop was walled: *"You're supposed to always be locked on a dedicated, isolated slot, with that account excluded from the rotation."* Two conditions, both required, checked EVERY tick:
+  1. The watchdog lives in its own **LOCKED** slot (`cus lock <slot>`) — the daemon must not rotate it and no session may lane-share-join it.
+  2. Its host account is **`cus disable`d** (`disabled: true` in `config.yaml`), so the daemon can never place another lane there. A locked slot alone is NOT enough: locking freezes the slot, it does not reserve the ACCOUNT. On 2026-09-18 the watchdog sat locked on slot-6/rayi4 while the daemon put work lanes slot-9 and slot-10 on the same rayi4; those panes burned rayi4 to 5h 100% and the watchdog lost its own turns — a dropped tick is a blind fleet.
+  Corollary: a dedicated host is spent capacity, so pick the account the fleet wants least — Fable-exhausted, high-7d-but-resetting, or otherwise unusable for premium lanes — never the cleanest account and never `default` (the owner's personal account). Re-check both conditions in the regression block each tick, and repoint `~/bin/cus-watchdog-heartbeat.sh` (`ANCHOR_ACCT`, `WD_SLOT`, `TRANSCRIPT`, `TMUX_SESSION`) in the SAME turn as any rehome. When the host must change, the new host is disabled BEFORE the move, and the old host is `cus enable`d after.
 - **Never pin a protected pane** — pinning freezes it on its account so it hits the cap instead of being swapped away.
 
 ---
