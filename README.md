@@ -132,6 +132,8 @@ cus uninstall                 # reverse install
 # Daily inspection
 cus whoami                    # which account am I on right now (+ its usage)
 cus status                    # active + per-account state + live sessions
+cus panes                     # per-pane: subagents+models, token burn, walls, headroom
+cus panes --me                # just this pane — run it BEFORE fanning out subagents
 cus sos                       # exit 1 + actions if anything needs you
 cus list                      # configured accounts with OAuth identities
 cus statusline                # one-line (for CC statusLine — usually wired automatically)
@@ -333,6 +335,91 @@ Design + the experiment that established it: `docs/plans/2026-07-02-seamless-swa
 Each account has its own `next_swap_at_pct` field. Starts at 50; climbs through `[75, 90, force]` each time we swap *out* of it. Reset to 50 when both windows drop below `reset_below_pct`.
 
 Result: account A swapped out at 50%; we drain B until 50%; back to A but it's still at ~50%, so it doesn't trip again until 75%; etc. Naturally load-balances across the pool instead of hammering A → swap → A → swap.
+
+## `cus panes` — who is actually burning (GH #230)
+
+`cus status` answers "how hot is each **account**". `cus panes` answers "which
+**pane** made it hot, on what model, how fast, and how many subagents it already
+has in flight" — the question a session needs answered *before* it fans out five
+more agents.
+
+```bash
+cus panes                  # table, 30-minute window
+cus panes --window 2h      # 30m / 2h / 90s / bare minutes
+cus panes --me             # just this pane + its account's headroom
+cus panes --json           # machine-readable (schema_version 1)
+```
+
+It is **read-only**: it makes no API call, writes nothing, and never touches
+credentials. Everything comes off disk — tmux pane states from
+`skills/pane_state.py` (the build-babysitter reader; if that reader is missing
+the command *fails* rather than guessing), Claude Code's own session registry
+and transcripts, and cus `state.json`.
+
+**The SHARE column is an attribution, not a measurement.** The usage endpoint
+reports percentages per *account*; token counts let us attribute a share of that
+account's observed window spend to each pane. The measured per-account numbers
+are printed separately, and render `unknown` — never a comfortable-looking 0% —
+whenever the last successful observation is missing or stale.
+
+Other things worth knowing about the numbers:
+
+- `TOK` includes cache reads (what the 5h window actually meters); `NEW`
+  excludes them, because on a long session cache reads are 90%+ of the total.
+- Subagent spend is included: each subagent writes its own transcript under
+  `<project>/<session-id>/subagents/`, invisible in the parent transcript.
+- Totals come from the **tail** of each transcript, so a 170MB file stays cheap.
+  A pane whose tail hit the size cap is flagged and its totals are a *floor*.
+- A 429 is only shown as a live `WALL` when it was seen recently *and* its reset
+  is still in the future; older rejections render as `(429 3h ago)`.
+- `cost_window_usd` is `null` unless the tail contains a `cost-state` snapshot
+  from *before* the window — a session-lifetime cost must never be printed as a
+  30-minute cost.
+
+### `--json` shape (schema_version 1)
+
+```jsonc
+{
+  "generated_at": "2026-09-18T14:47:00Z",
+  "window_minutes": 30,
+  "window_start": "2026-09-18T14:17:00Z",
+  "schema_version": 1,
+  "attribution_note": "...",          // the honesty caveat, verbatim
+  "panes": [{
+    "pane": "%23", "tmux_session": "cus2a", "pane_pid": 3044366,
+    "state": "working",                // from pane_state.py, not re-derived
+    "slot": "slot-14", "account": "rayi2", "pool": "standard", "locked": true,
+    "session_id": "...", "cwd": "...", "transcript": "...",
+    "transcript_status": "ok",         // | missing | unreadable: X
+                                       // | no-session-registered | unresolved
+    "window_covered": true,            // false => totals are a FLOOR
+    "subagents_live": 1,
+    "subagent_models": {"claude-opus-5[1m]": 1},
+    "subagents": [{"agent_id": "...", "model": "...", "description": "...",
+                   "started_at": "...", "idle_seconds": 4.7}],
+    "tokens_window": {"total": 19826832, "new": 913699, "subagent_total": 11594689,
+                      "by_model": {"claude-opus-5": {"input": 280, "output": 132982,
+                                                     "cache_creation": 517118,
+                                                     "cache_read": 15439667,
+                                                     "total": 16090047}}},
+    "burn_tokens_per_min": 165223.6, "burn_new_tokens_per_min": 7614.2,
+    "cost_window_usd": null, "last_activity": "...",
+    "wall": {"rate_limit_type": "five_hour", "resets_at": "...", "observed_at": "..."},
+    "attribution": {"kind": "estimate", "basis": "...",
+                    "account_window_tokens": 19826832,
+                    "pane_pct_of_account_window": 100.0}
+  }],
+  "accounts": {"rayi2": {"known": true, "reason": null,
+                         "five_hour_pct": 3.0, "seven_day_pct": 59.0,
+                         "headroom_5h_pct": 97.0, "headroom_7d_pct": 41.0,
+                         "five_hour_resets_at": "...", "last_observed_ts": "...",
+                         "age_seconds": 224.9}}
+}
+```
+
+`--me --json` returns the same envelope with a single `pane` object in place of
+`panes`. `known: false` on an account means the percentages are `null` and
+`reason` says why; treat it as "unknown capacity", not "plenty".
 
 ## SOS — when human action is needed
 
