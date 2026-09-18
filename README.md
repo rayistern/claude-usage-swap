@@ -358,6 +358,23 @@ reader it runs keeps its own small fingerprint cache under
 the command *fails* rather than guessing), Claude Code's own session registry
 and transcripts, and cus `state.json`.
 
+It has two callers, and the layout serves both:
+
+- **A pane about to spend more** runs `cus panes --me`. The first line is a
+  verdict it can act on without arithmetic — `VERDICT: ROOM TO SPEND`,
+  `TIGHT — one small batch at most`, or `DO NOT SPEND` (walled, or the hotter of
+  the account's 5h/7d windows is ≥ 90% used; `TIGHT` is ≥ 75% — the daemon's own
+  default swap steps). An unknown or stale account reading gives
+  `CAUTION — ACCOUNT READING UNKNOWN`, never a green verdict. `--me --json`
+  carries the same thing as `verdict: {level, headline, reason}` with `level` one
+  of `room | tight | stop | unknown`.
+- **The fleet watchdog deciding which pane to move, and where**, reads the full
+  table. Rows are **grouped by account**, hottest account first, and within an
+  account the pane burning the most is the **top row**. Each group's `==` header
+  carries that account's *measured* 5h/7d usage, headroom and time to reset (or
+  `headroom UNKNOWN`). Accounts with **no live pane are listed too** — those are
+  the move destinations.
+
 **The SHARE column is an attribution, not a measurement.** The usage endpoint
 reports percentages per *account*; token counts let us attribute a share of that
 account's observed window spend to each pane. The measured per-account numbers
@@ -366,8 +383,14 @@ whenever the last successful observation is missing or stale.
 
 Other things worth knowing about the numbers:
 
-- `TOK` includes cache reads (what the 5h window actually meters); `NEW`
-  excludes them, because on a long session cache reads are 90%+ of the total.
+- **`NEW` (cache reads excluded) is the headline** token figure; `NEW/MIN`,
+  `SHARE`, the sort and the per-model figures all use it. `TOK` (cache reads
+  included) is kept as a secondary column — it mostly measures context size.
+  This was measured, not assumed: over 24h on the box this was built on, fleet
+  5h-% growth correlated 0.83 with NEW vs 0.70 with TOK per half-hour bin, and
+  the partial correlations settle it (NEW given TOK 0.62; TOK given NEW −0.14).
+  Cache reads were ~94% of TOK. One sample, mixed plan sizes — treat it as
+  grounds for column order, not as a billing formula.
 - Subagent spend is included: each subagent writes its own transcript under
   `<project>/<session-id>/subagents/`, invisible in the parent transcript.
 - Totals come from the **tail** of each transcript, so a 170MB file stays cheap.
@@ -401,6 +424,11 @@ Other things worth knowing about the numbers:
   "window_start": "2026-09-18T14:17:00Z",
   "schema_version": 1,
   "attribution_note": "...",          // the honesty caveat, verbatim
+  "account_order": ["rayi3", "rayi2", null],
+                                       // group order: hottest KNOWN account first, then
+                                       // unknown/stale ones, then null (no account resolved)
+  // `panes` is a FLAT list, stably sorted: by account in `account_order`, then by
+  // burn_new_tokens_per_min descending, unmeasured last. Group on each row's `account`.
   "panes": [{
     "pane": "%23", "tmux_session": "cus2a", "pane_pid": 3044366,
     "state": "working",                // from pane_state.py, not re-derived
@@ -439,7 +467,10 @@ Other things worth knowing about the numbers:
   "accounts": {"rayi2": {"known": true, "reason": null,
                          "five_hour_pct": 3.0, "seven_day_pct": 59.0,
                          "headroom_5h_pct": 97.0, "headroom_7d_pct": 41.0,
-                         "five_hour_resets_at": "...", "last_observed_ts": "...",
+                         "five_hour_resets_at": "...", "seven_day_resets_at": "...",
+                         "live_panes": 1, "disabled": false,   // every configured account is
+                                                               // listed, even with 0 live panes
+                         "last_observed_ts": "...",
                          "age_seconds": 224.9, "unmeasured_panes": 0}}
 }
 ```

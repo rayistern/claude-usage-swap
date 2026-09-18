@@ -18155,6 +18155,18 @@ PANES_ACCOUNT_STALE_SECONDS = 900
 # to prevent (dual review of PR #232, 2026-09-18). `seven_day` rejections older
 # than this are covered by the account signal instead (see assess_wall).
 PANES_WALL_LOOKBACK_SECONDS = 5 * 3600
+# `--me` verdict thresholds, on the HIGHER of the account's 5h / 7d used-%.
+# Anchored to the daemon's own default swap steps [50, 75, 90] so the verdict
+# and the daemon agree about what "hot" means:
+#   >= 90 (the daemon's LAST step): DO NOT SPEND. On 2026-09-18 one pct-point of
+#      5h cost ~0.07M non-cache tokens fleet-wide and a busy pane burned ~33k/min
+#      (~0.5 pct/min) BEFORE any fan-out; 10% of headroom is minutes, not a task.
+#   >= 75 (the middle step): TIGHT. 25% is ~15-25 minutes of a 3-subagent
+#      fan-out — enough for one small batch, not for "start something big".
+#   otherwise: ROOM.
+# An unknown/stale reading is never ROOM: it gets its own cautious verdict.
+PANES_ME_STOP_USED_PCT = 90.0
+PANES_ME_TIGHT_USED_PCT = 75.0
 
 
 class PanesError(RuntimeError):
@@ -18255,9 +18267,15 @@ def tail_lines(path: "Path", window_start: "datetime",
 def _usage_total(usage: dict) -> dict:
     """One `message.usage` blob -> flat token counts.
 
-    Cache reads are counted: they are what the 5h window actually meters, and
-    on a long session they dwarf fresh input. Callers that want "new" tokens
-    can subtract cache_read themselves from the per-model breakdown.
+    Cache reads are counted in `total` and kept separately, because callers
+    need BOTH: `total - cache_read` ("NEW") is the headline. Measured on this
+    box 2026-09-18 over 24h / 41 half-hour bins: fleet 5h-% growth correlates
+    0.83 with NEW vs 0.70 with the cache-inclusive total, and the partial
+    correlations settle it (NEW given total 0.62; total given NEW -0.14) —
+    cache reads are ~94% of the total and mostly measure context size. The
+    first cut claimed cache reads were "what the 5h window meters"; the data
+    says otherwise. One sample, mixed plan sizes — re-measure before relying
+    on it for anything finer than column order.
     """
     def _i(k):
         v = usage.get(k)
@@ -18420,12 +18438,14 @@ def account_headroom(acct: dict | None, now: "datetime",
     """
     out = {"known": False, "reason": "no account record", "five_hour_pct": None,
            "seven_day_pct": None, "headroom_5h_pct": None, "headroom_7d_pct": None,
-           "five_hour_resets_at": None, "last_observed_ts": None, "age_seconds": None}
+           "five_hour_resets_at": None, "seven_day_resets_at": None,
+           "last_observed_ts": None, "age_seconds": None}
     if not acct:
         return out
     observed = acct.get("last_observed_ts")
     out["last_observed_ts"] = observed
     out["five_hour_resets_at"] = acct.get("five_hour_resets_at")
+    out["seven_day_resets_at"] = acct.get("seven_day_resets_at")
     t0 = _panes_parse_ts(observed)
     if t0 is None:
         out["reason"] = "never observed"
@@ -18465,9 +18485,16 @@ def attribute_account_shares(rows: list[dict]) -> None:
     are of the observed remainder. A pane whose tail hit the byte cap is a
     FLOOR, so every share on that account is marked approximate.
     """
+    def _spend(r: dict):
+        # NEW (cache reads excluded) is the measure that tracks the cap — see
+        # _usage_total. A legacy row with no `new` falls back to `total`.
+        tw = r.get("tokens_window") or {}
+        v = tw.get("new")
+        return v if isinstance(v, (int, float)) else tw.get("total")
+
     def _measured(r: dict) -> bool:
         return (not r.get("unmeasured", r.get("transcript_status", "ok") != "ok")
-                and isinstance((r.get("tokens_window") or {}).get("total"), (int, float)))
+                and isinstance(_spend(r), (int, float)))
 
     totals: dict[str, int] = {}
     unmeasured: dict[str, int] = {}
@@ -18479,7 +18506,7 @@ def attribute_account_shares(rows: list[dict]) -> None:
         if not _measured(r):
             unmeasured[acct] = unmeasured.get(acct, 0) + 1
             continue
-        totals[acct] = totals.get(acct, 0) + int(r["tokens_window"]["total"])
+        totals[acct] = totals.get(acct, 0) + int(_spend(r))
         if not r.get("window_covered", True):
             floors[acct] = floors.get(acct, 0) + 1
     for r in rows:
@@ -18488,10 +18515,11 @@ def attribute_account_shares(rows: list[dict]) -> None:
         denom = totals.get(acct, 0) if acct else 0
         share = None
         if measured and denom:
-            share = round(int(r["tokens_window"]["total"]) * 100.0 / denom, 1)
+            share = round(int(_spend(r)) * 100.0 / denom, 1)
         r["attribution"] = {
             "kind": "estimate",
-            "basis": "share of window tokens observed on this account's MEASURED panes",
+            "basis": ("share of window NEW tokens (cache reads excluded) observed on this "
+                      "account's MEASURED panes"),
             "account_window_tokens": denom,
             "pane_pct_of_account_window": share,
             "unmeasured": not measured,
@@ -18840,7 +18868,7 @@ def collect_pane_row(pane_row: dict, registry: dict, state: dict, config: dict,
     total = sum(m["total"] for m in by_model.values())
     # `new` excludes cache_read. On a long session cache reads are 90%+ of the
     # total, so the bare total makes an idle-ish pane look like a furnace; both
-    # numbers ship, and the table shows both.
+    # numbers ship, and the table shows both — NEW leads (see _usage_total).
     new_tokens = sum(m["total"] - m["cache_read"] for m in by_model.values())
     row["tokens_window"] = {"total": total, "new": new_tokens, "by_model": by_model,
                             "subagent_total": sub_total}
@@ -18862,13 +18890,22 @@ def build_panes_payload(window_minutes: float, now: "datetime | None" = None) ->
     rows = [collect_pane_row(r, registry, state, config, window_start, now)
             for r in reader_rows]
     attribute_account_shares(rows)
-    rows.sort(key=lambda r: (-(r["tokens_window"]["total"] or 0), r.get("tmux_session") or "", r["pane"]))
+    # EVERY configured account, not only those with a live pane: the watchdog
+    # reads this to pick a DESTINATION, and an empty account is the best one.
     accounts = {}
+    for a, rec in (state.get("accounts") or {}).items():
+        accounts[a] = account_headroom(rec, now)
+        accounts[a]["disabled"] = bool(isinstance(rec, dict) and rec.get("subscription_disabled"))
     for r in rows:
         a = r.get("account")
         if a and a not in accounts:
-            accounts[a] = account_headroom(state.get("accounts", {}).get(a), now)
-            accounts[a]["unmeasured_panes"] = r["attribution"]["unmeasured_panes_on_account"]
+            accounts[a] = account_headroom(None, now)
+            accounts[a]["disabled"] = False
+    for a in accounts:
+        mine = [r for r in rows if r.get("account") == a]
+        accounts[a]["live_panes"] = len(mine)
+        accounts[a]["unmeasured_panes"] = sum(1 for r in mine if r.get("unmeasured"))
+    account_order = order_panes_by_account(rows, accounts)
     return {
         "generated_at": _panes_iso(now),
         "window_minutes": window_minutes,
@@ -18883,9 +18920,74 @@ def build_panes_payload(window_minutes: float, now: "datetime | None" = None) ->
             "(accounts[].unmeasured_panes counts them), so shares are of the OBSERVED "
             "remainder. Tokens are attributed to the slot's CURRENT account: a slot moved "
             "mid-window has its pre-move spend credited to the new account."),
+        # `panes` is FLAT but ordered: grouped by account in `account_order`
+        # (hottest known account first, unknown next, no-account last), and
+        # within an account by NEW-token burn, highest first, unmeasured last.
+        # Group with the row's `account` key; the order is stable.
+        "account_order": account_order,
         "panes": rows,
         "accounts": accounts,
     }
+
+
+def order_panes_by_account(rows: list[dict], accounts: dict) -> list:
+    """Sort `rows` IN PLACE for the watchdog's question — "which pane is eating
+    this hot account" must be the top row of each group — and return the
+    account order (None = panes with no resolvable account, always last).
+
+    Accounts: known readings by hottest window first; then unknown/stale ones
+    (they might be hot — they sort ABOVE the no-account bucket, and never look
+    like a cool known account because their header says unknown). Accounts with
+    no live pane are kept: they are the move destinations.
+    """
+    def _acct_key(a):
+        h = accounts.get(a) or {}
+        if h.get("known"):
+            return (0, -max(h.get("five_hour_pct") or 0.0, h.get("seven_day_pct") or 0.0), a)
+        return (1, 0.0, a)
+    order = sorted(accounts, key=_acct_key)
+    if any(not r.get("account") for r in rows):
+        order.append(None)
+    pos = {a: i for i, a in enumerate(order)}
+
+    def _row_key(r):
+        burn = r.get("burn_new_tokens_per_min")
+        return (pos.get(r.get("account") or None, len(order)),
+                1 if burn is None else 0, -(burn or 0.0),
+                r.get("tmux_session") or "", r.get("pane") or "")
+    rows.sort(key=_row_key)
+    return order
+
+
+def me_verdict(row: dict, headroom: dict) -> dict:
+    """One actionable verdict for `--me`: {level, headline, reason}.
+
+    level: "stop" | "unknown" | "tight" | "room". Precedence is by how costly
+    a wrong "go" would be: a wall beats everything; an UNKNOWN reading can
+    never come out as "room" (a stale 0% is exactly the number that gets a
+    fleet walled); then the thresholds above.
+    """
+    if row.get("wall_active"):
+        why = ", ".join(row.get("wall_evidence") or []) or "429"
+        return {"level": "stop", "headline": "DO NOT SPEND",
+                "reason": f"this pane is walled ({why})"}
+    if not headroom.get("known"):
+        # Worded so a caller grepping the verdict line for "ROOM" cannot match
+        # it ("HEADROOM" would).
+        return {"level": "unknown", "headline": "CAUTION — ACCOUNT READING UNKNOWN",
+                "reason": f"{headroom.get('reason') or 'no reading'}; do not assume room, "
+                          f"check `cus status` first"}
+    p5, p7 = headroom["five_hour_pct"], headroom["seven_day_pct"]
+    used, which = (p5, "5h") if p5 >= p7 else (p7, "7d")
+    left = 100.0 - used
+    if used >= PANES_ME_STOP_USED_PCT:
+        return {"level": "stop", "headline": "DO NOT SPEND",
+                "reason": f"account {which} window {used:.0f}% used, {left:.0f}% left"}
+    if used >= PANES_ME_TIGHT_USED_PCT:
+        return {"level": "tight", "headline": "TIGHT — one small batch at most",
+                "reason": f"account {which} window {used:.0f}% used, {left:.0f}% left"}
+    return {"level": "room", "headline": "ROOM TO SPEND",
+            "reason": f"{100 - p5:.0f}% of 5h and {100 - p7:.0f}% of 7d left"}
 
 
 def _fmt_tokens(n: int) -> str:
@@ -19030,63 +19132,111 @@ def _wall_text(row: dict, now: "datetime") -> str:
     return f"(429 {unit} ago)"
 
 
+def _fmt_reset(value, now: "datetime") -> str:
+    """'↻1h29m' for a future reset, '?' when absent/unparseable/already past."""
+    t = _panes_parse_ts(value)
+    if t is None or t <= now:
+        return "↻?"
+    mins = int((t - now).total_seconds() // 60)
+    if mins >= 48 * 60:
+        return f"↻{mins // 1440}d{(mins % 1440) // 60}h"
+    return f"↻{mins // 60}h{mins % 60:02d}m"
+
+
+def _account_header(name, h: dict | None, now: "datetime") -> str:
+    """Group header: the account's MEASURED headroom, or a loud unknown."""
+    if name is None:
+        return "== (no account resolved) — cannot be attributed to any account"
+    h = h or {}
+    if h.get("known"):
+        body = (f"5h {h['five_hour_pct']:.0f}% used, {h['headroom_5h_pct']:.0f}% left "
+                f"{_fmt_reset(h.get('five_hour_resets_at'), now)} · "
+                f"7d {h['seven_day_pct']:.0f}% used, {h['headroom_7d_pct']:.0f}% left "
+                f"{_fmt_reset(h.get('seven_day_resets_at'), now)}")
+    else:
+        body = f"headroom UNKNOWN — {h.get('reason') or 'no reading'}"
+    tags = ""
+    if h.get("disabled"):
+        tags += "  [DISABLED]"
+    if h.get("unmeasured_panes"):
+        tags += (f"  [! {h['unmeasured_panes']} pane(s) UNMEASURED — shares are of the "
+                 f"observed remainder]")
+    return f"== {name}  {body}{tags}"
+
+
 def render_panes_table(payload: dict) -> str:
-    """Human table. Every derived number is labelled; nothing is invented."""
+    """Human table, GROUPED BY ACCOUNT. Every derived number is labelled;
+    nothing is invented.
+
+    Layout serves the watchdog's two questions from one screen: the top row of
+    each group is the pane eating that account (rows arrive sorted by NEW-token
+    burn — see order_panes_by_account), and every group header carries the
+    account's measured headroom, including accounts with no live pane, which
+    are the candidate destinations for a move.
+    """
     now = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
     out = [f"Live Claude panes — {payload['window_minutes']:g}m window "
-           f"(since {payload['window_start']})"]
-    hdr = (f"{'PANE':<5} {'TMUX SESSION':<22} {'SLOT':<8} {'ACCOUNT':<9} {'STATE':<16} "
-           f"{'SUB':>3} {'TOK':>7} {'NEW':>7} {'TOK/MIN':>8} {'SHARE*':>7} {'WALL':<22} MODELS")
+           f"(since {payload['window_start']}) — grouped by account, hottest first; "
+           f"within an account, highest NEW burn first"]
+    hdr = (f"  {'PANE':<5} {'TMUX SESSION':<22} {'SLOT':<8} {'STATE':<16} {'SUB':>3} "
+           f"{'NEW':>7} {'NEW/MIN':>8} {'SHARE*':>7} {'TOK':>7} {'WALL':<22} MODELS")
     out += [hdr, "-" * len(hdr)]
+    accounts = payload.get("accounts") or {}
+    by_acct: dict = {}
     for r in payload["panes"]:
-        share = r["attribution"]["pane_pct_of_account_window"]
-        share_s = f"{share:.0f}%" if share is not None else "-"
-        if share is not None and r["attribution"].get("approximate"):
-            share_s += "~"      # repo convention: trailing ~ = not a confirmed number
-        # Unmeasured => "-", never 0: see collect_pane_row.
-        unmeasured = r.get("unmeasured", r["transcript_status"] != "ok")
-        tok_s = "-" if unmeasured else _fmt_tokens(r["tokens_window"]["total"])
-        new_s = "-" if unmeasured else _fmt_tokens(r["tokens_window"]["new"])
-        burn_s = "-" if unmeasured else f"{r['burn_tokens_per_min']:.0f}"
-        models = ", ".join(f"{_short_model(m)}:{_fmt_tokens(c['total'])}"
-                           for m, c in sorted(r["tokens_window"]["by_model"].items(),
-                                              key=lambda kv: -kv[1]["total"]))
-        if r["transcript_status"] != "ok":
-            models = f"(usage unknown: {r['transcript_status']})"
-        elif not r["window_covered"]:
-            models += "  [tail capped — totals are a floor]"
-        subs = "-" if r["subagents_live"] is None else str(r["subagents_live"])
-        if r["subagent_models"]:
-            subs += "*"
-        out.append(
-            f"{r['pane']:<5} {(r['tmux_session'] or '?')[:22]:<22} {(r['slot'] or '-'):<8} "
-            f"{(r['account'] or '-')[:9]:<9} {(r['state'] or '?')[:16]:<16} {subs:>3} "
-            f"{tok_s:>7} {new_s:>7} {burn_s:>8} {share_s:>7} {_wall_text(r, now):<22} {models}")
-        for a in r["subagents"]:
-            desc = (a.get("description") or "")[:40]
-            out.append(f"      └─ subagent {_short_model(a['model'])}  {desc}")
+        by_acct.setdefault(r.get("account") or None, []).append(r)
+    # Payloads built by build_panes_payload carry the order; a hand-built one
+    # (tests, older callers) gets a deterministic fallback.
+    order = list(payload.get("account_order") or [])
+    for a in list(by_acct) + sorted(accounts):
+        if a not in order:
+            order.append(a)
+    for acct in order:
+        rows = by_acct.get(acct, [])
+        if acct is None and not rows:
+            continue
+        out.append(_account_header(acct, accounts.get(acct), now))
+        if not rows:
+            out.append("  (no live panes)")
+        for r in rows:
+            share = r["attribution"]["pane_pct_of_account_window"]
+            share_s = f"{share:.0f}%" if share is not None else "-"
+            if share is not None and r["attribution"].get("approximate"):
+                share_s += "~"      # repo convention: trailing ~ = not a confirmed number
+            # Unmeasured => "-", never 0: see collect_pane_row.
+            unmeasured = r.get("unmeasured", r["transcript_status"] != "ok")
+            tok_s = "-" if unmeasured else _fmt_tokens(r["tokens_window"]["total"])
+            new_s = "-" if unmeasured else _fmt_tokens(r["tokens_window"]["new"])
+            burn_s = "-" if unmeasured else f"{r['burn_new_tokens_per_min']:.0f}"
+            models = ", ".join(f"{_short_model(m)}:{_fmt_tokens(c['total'] - c.get('cache_read', 0))}"
+                               for m, c in sorted(r["tokens_window"]["by_model"].items(),
+                                                  key=lambda kv: -(kv[1]["total"] - kv[1].get("cache_read", 0))))
+            if r["transcript_status"] != "ok":
+                models = f"(usage unknown: {r['transcript_status']})"
+            elif not r["window_covered"]:
+                models += "  [tail capped — totals are a floor]"
+            subs = "-" if r["subagents_live"] is None else str(r["subagents_live"])
+            if r["subagent_models"]:
+                subs += "*"
+            out.append(
+                f"  {r['pane']:<5} {(r['tmux_session'] or '?')[:22]:<22} {(r['slot'] or '-'):<8} "
+                f"{(r['state'] or '?')[:16]:<16} {subs:>3} "
+                f"{new_s:>7} {burn_s:>8} {share_s:>7} {tok_s:>7} {_wall_text(r, now):<22} {models}")
+            for a in r["subagents"]:
+                desc = (a.get("description") or "")[:40]
+                out.append(f"        └─ subagent {_short_model(a['model'])}  {desc}")
     out.append("")
-    out.append("TOK counts cache reads (what the 5h window meters); NEW excludes them.")
-    out.append("* SHARE is an ATTRIBUTION from token counts — this pane's share of the tokens")
+    out.append("NEW excludes cache reads and is the headline: on this fleet it tracks 5h-% growth")
+    out.append("  better than TOK (which includes them and is ~94% cache reads). NEW/MIN, SHARE,")
+    out.append("  the sort and the per-model figures all use NEW; TOK is kept for context size.")
+    out.append("* SHARE is an ATTRIBUTION from token counts — this pane's share of the NEW tokens")
     out.append("  we can see its ACCOUNT spend in the window. It is NOT the account's usage")
-    out.append("  percentage; only the endpoint reports that (see the per-account lines below).")
+    out.append("  percentage; only the endpoint reports that (the == header of each group).")
     out.append("  Spend is credited to the slot's CURRENT account, even if it moved mid-window.")
     out.append("  '-' = unmeasured (not zero) and excluded from the shares; '~' = approximate,")
     out.append("  a pane on that account hit the transcript size cap so its total is a floor.")
     out.append("WALL = any of: a live 429 in the transcript, the pane at the limit menu, or its")
     out.append("  account measured at 100% with the reset still ahead.")
-    out.append("")
-    out.append("Accounts (measured, from the usage endpoint via cus state):")
-    for name, h in sorted(payload["accounts"].items()):
-        if h["known"]:
-            out.append(f"  {name:<9} 5h {h['five_hour_pct']:.0f}% used "
-                       f"({h['headroom_5h_pct']:.0f}% headroom) · 7d {h['seven_day_pct']:.0f}% used "
-                       f"({h['headroom_7d_pct']:.0f}% headroom)")
-        else:
-            out.append(f"  {name:<9} unknown — {h['reason']}")
-        if h.get("unmeasured_panes"):
-            out.append(f"  {'':<9} ! {h['unmeasured_panes']} pane(s) on {name} UNMEASURED — SHARE above is "
-                       f"of the observed remainder, not of all of {name}'s panes")
     return "\n".join(out)
 
 
@@ -19120,12 +19270,15 @@ def render_me(payload: dict, row: dict) -> str:
     """Compact pre-fanout answer. Headroom must be unmissable and honest."""
     now = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
     h = payload["accounts"].get(row.get("account") or "", account_headroom(None, now))
-    models = ", ".join(f"{_short_model(m)} {_fmt_tokens(c['total'])}"
+    models = ", ".join(f"{_short_model(m)} {_fmt_tokens(c['total'] - c.get('cache_read', 0))}"
                        for m, c in sorted(row["tokens_window"]["by_model"].items(),
-                                          key=lambda kv: -kv[1]["total"])) or "none"
+                                          key=lambda kv: -(kv[1]["total"] - kv[1].get("cache_read", 0)))) or "none"
     subs = (", ".join(f"{n}x {_short_model(m)}" for m, n in row["subagent_models"].items())
             or "none")
+    verdict = me_verdict(row, h)
     lines = [
+        # The answer first; everything below is the working.
+        f"VERDICT: {verdict['headline']} — {verdict['reason']}",
         f"pane {row['pane']} ({row.get('tmux_session') or '?'})  slot={row.get('slot') or '-'}  "
         f"account={row.get('account') or '-'}  pool={row.get('pool') or '-'}"
         f"{'  LOCKED' if row.get('locked') else ''}",
@@ -19136,9 +19289,9 @@ def render_me(payload: dict, row: dict) -> str:
         lines.append(f"last {payload['window_minutes']:g}m: tokens UNKNOWN (not zero)")
     else:
         lines.append(
-            f"last {payload['window_minutes']:g}m: {_fmt_tokens(row['tokens_window']['total'])} tokens "
-            f"({row['burn_tokens_per_min']:.0f} tok/min; "
-            f"{_fmt_tokens(row['tokens_window']['new'])} excluding cache reads)"
+            f"last {payload['window_minutes']:g}m: {_fmt_tokens(row['tokens_window']['new'])} new tokens "
+            f"({row['burn_new_tokens_per_min']:.0f}/min; "
+            f"{_fmt_tokens(row['tokens_window']['total'])} including cache reads)"
             + (f", ${row['cost_window_usd']:.2f}" if row.get("cost_window_usd") is not None else "")
             + f"  [{models}]")
     if row["transcript_status"] != "ok":
@@ -19195,8 +19348,16 @@ def panes_cmd(as_json: bool, window: str, me: bool) -> None:
     --window), the pane sitting at the limit menu, or the pane's account
     measured at 100% with its reset still ahead. It over-reports on purpose.
 
+    The table is GROUPED BY ACCOUNT (hottest first; accounts with no live pane
+    are listed too, as move destinations) with each account's measured
+    headroom on its header line; within an account, the pane burning the most
+    is on top. NEW (cache reads excluded) is the headline token figure — it
+    tracks cap consumption better than TOK, which is kept as a secondary
+    column. --me opens with one VERDICT line: ROOM TO SPEND / TIGHT /
+    DO NOT SPEND, or CAUTION when the account reading is unknown or stale.
+
     The SHARE column is an ATTRIBUTION, not a measurement: it is this pane's
-    share of the tokens we can observe its ACCOUNT spend in the window. The
+    share of the NEW tokens we can observe its ACCOUNT spend in the window. The
     usage endpoint reports percentages per ACCOUNT only, and those measured
     numbers appear on the per-account lines — as "unknown" whenever the last
     successful observation is missing or stale, never as a healthy-looking 0%.
@@ -19223,7 +19384,10 @@ def panes_cmd(as_json: bool, window: str, me: bool) -> None:
         if err:
             raise click.ClickException(err)
         if as_json:
+            now_ = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
+            head = payload["accounts"].get(row.get("account") or "", account_headroom(None, now_))
             click.echo(json.dumps({**{k: v for k, v in payload.items() if k != "panes"},
+                                   "verdict": me_verdict(row, head),
                                    "pane": row}, indent=2, default=str))
         else:
             click.echo(render_me(payload, row))

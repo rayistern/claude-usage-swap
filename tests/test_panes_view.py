@@ -531,7 +531,134 @@ def test_table_marks_stale_accounts_unknown():
         {"current_5h_pct": 0.0, "current_7d_pct": 0.0,
          "last_observed_ts": iso(NOW - timedelta(hours=9))}, NOW)})
     text = cus.render_panes_table(p)
-    assert "unknown — last observation" in text
+    # stale reading => the group header says UNKNOWN, never "0% used"
+    header = next(ln for ln in text.splitlines() if ln.startswith("== rayi2"))
+    assert "headroom UNKNOWN — last observation" in header
+    assert "0% used" not in header
+
+
+# ==========================================================================
+# Purpose follow-up (owner, 2026-09-18): "see if and where usage is being
+# spent. Prior to spending more (in a pane) and in order to move panes."
+# ==========================================================================
+
+def _burn_row(pane, account, new, total=None, slot="slot-1"):
+    r = _full_row(pane, slot, account, total=total if total is not None else new * 10)
+    r["tokens_window"]["new"] = new
+    r["burn_new_tokens_per_min"] = round(new / 30.0, 1)
+    r["burn_tokens_per_min"] = round(r["tokens_window"]["total"] / 30.0, 1)
+    return r
+
+
+def _known(p5, p7, **extra):
+    h = cus.account_headroom({"current_5h_pct": p5, "current_7d_pct": p7,
+                              "five_hour_resets_at": iso(NOW + timedelta(hours=1, minutes=29)),
+                              "seven_day_resets_at": iso(NOW + timedelta(days=2, hours=10)),
+                              "last_observed_ts": iso(NOW - timedelta(minutes=2))}, NOW)
+    h.update(extra)
+    return h
+
+
+# ---- 1. grouped by account, sorted by burn within the account
+
+def test_panes_are_grouped_by_account_hottest_first_then_by_new_burn():
+    rows = [_burn_row("%1", "cool", 900), _burn_row("%2", "hot", 100),
+            _burn_row("%3", "hot", 700), _unmeasured_row("%4", "hot"),
+            _burn_row("%5", None, 50), _burn_row("%6", "stale", 9999)]
+    accounts = {"cool": _known(10, 5), "hot": _known(88, 20),
+                "stale": cus.account_headroom({"current_5h_pct": 0.0, "current_7d_pct": 0.0,
+                                               "last_observed_ts": iso(NOW - timedelta(hours=9))}, NOW),
+                "empty": _known(3, 1)}
+    order = cus.order_panes_by_account(rows, accounts)
+    # hottest KNOWN first; unknown after every known one; no-account bucket last.
+    assert order == ["hot", "cool", "empty", "stale", None]
+    # within "hot": top row is the biggest burner; unmeasured sinks but is kept.
+    assert [r["pane"] for r in rows] == ["%3", "%2", "%4", "%1", "%6", "%5"]
+
+
+def test_group_sort_uses_new_not_cache_inclusive_total():
+    """A huge-context idle-ish pane (big TOK, small NEW) must not outrank the
+    pane that is actually consuming the cap."""
+    fat_context = _burn_row("%1", "a", new=10, total=50_000_000)
+    real_burner = _burn_row("%2", "a", new=900_000, total=1_000_000)
+    rows = [fat_context, real_burner]
+    cus.order_panes_by_account(rows, {"a": _known(50, 5)})
+    assert [r["pane"] for r in rows] == ["%2", "%1"]
+    cus.attribute_account_shares(rows)
+    assert rows[0]["attribution"]["pane_pct_of_account_window"] == 100.0   # 900000/900010
+    assert rows[1]["attribution"]["pane_pct_of_account_window"] == 0.0
+
+
+def test_table_group_header_carries_headroom_and_resets():
+    rows = [_burn_row("%3", "hot", 700), _burn_row("%2", "hot", 100)]
+    accounts = {"hot": _known(88, 20), "empty": _known(3, 1, live_panes=0)}
+    p = {"generated_at": iso(NOW), "window_minutes": 30, "window_start": iso(WINDOW_START),
+         "panes": rows, "accounts": accounts}
+    cus.attribute_account_shares(rows)
+    p["account_order"] = cus.order_panes_by_account(rows, accounts)
+    lines = cus.render_panes_table(p).splitlines()
+    hot = next(i for i, ln in enumerate(lines) if ln.startswith("== hot"))
+    assert "5h 88% used, 12% left ↻1h29m" in lines[hot]
+    assert "7d 20% used, 80% left ↻2d10h" in lines[hot]
+    assert lines[hot + 1].strip().startswith("%3")          # top row = biggest burner
+    # a destination account with no live pane is still on the screen
+    empty = next(i for i, ln in enumerate(lines) if ln.startswith("== empty"))
+    assert "97% left" in lines[empty] and "(no live panes)" in lines[empty + 1]
+
+
+def test_table_headline_column_is_new_with_tok_secondary():
+    rows = [_burn_row("%1", "a", new=1234, total=9_000_000)]
+    text = cus.render_panes_table(_payload(rows, {"a": _known(10, 5)}))
+    hdr = next(ln for ln in text.splitlines() if "PANE" in ln and "SHARE" in ln)
+    assert hdr.index(" NEW ") < hdr.index("NEW/MIN") < hdr.index("SHARE*") < hdr.index(" TOK ")
+    row = next(ln for ln in text.splitlines() if ln.strip().startswith("%1"))
+    assert f"{1234 / 30.0:.0f}" in row.split()                # NEW/MIN, not TOK/MIN
+    assert f"{9_000_000 / 30.0:.0f}" not in row.split()
+
+
+# ---- 2. --me verdict
+
+def _walled(row, evidence):
+    row.update({"wall_active": True, "wall_evidence": evidence, "wall_kind": "five_hour",
+                "wall_resets_at": iso(NOW + timedelta(minutes=30))})
+    return row
+
+
+def test_me_verdict_thresholds_follow_the_daemon_steps():
+    assert (cus.PANES_ME_TIGHT_USED_PCT, cus.PANES_ME_STOP_USED_PCT) == (75.0, 90.0)
+    row = _burn_row("%1", "a", 100)
+    for p5, p7, level in ((10, 10, "room"), (74.9, 0, "room"), (75, 0, "tight"),
+                          (0, 80, "tight"),                    # the 7d window counts too
+                          (89.9, 0, "tight"), (90, 0, "stop"), (20, 96, "stop")):
+        assert cus.me_verdict(row, _known(p5, p7))["level"] == level, (p5, p7)
+
+
+def test_me_verdict_is_never_green_on_an_unknown_or_stale_reading():
+    row = _burn_row("%1", "a", 100)
+    stale = cus.account_headroom({"current_5h_pct": 0.0, "current_7d_pct": 0.0,
+                                  "last_observed_ts": iso(NOW - timedelta(hours=9))}, NOW)
+    for h in (stale, cus.account_headroom(None, NOW),
+              cus.account_headroom({"current_5h_pct": 1.0, "current_7d_pct": 1.0}, NOW)):
+        v = cus.me_verdict(row, h)
+        assert v["level"] == "unknown" and "ROOM" not in v["headline"]   # not even as a substring
+
+
+def test_me_verdict_wall_beats_a_comfortable_account_reading():
+    v = cus.me_verdict(_walled(_burn_row("%1", "a", 100), ["pane_limit_menu"]), _known(5, 5))
+    assert v["level"] == "stop" and "pane_limit_menu" in v["reason"]
+
+
+def test_me_output_leads_with_the_verdict_line():
+    row = _burn_row("%1", "a", 100)
+    for h, expect in ((_known(10, 10), "VERDICT: ROOM TO SPEND"),
+                      (_known(80, 10), "VERDICT: TIGHT"),
+                      (_known(95, 10), "VERDICT: DO NOT SPEND"),
+                      (cus.account_headroom(None, NOW), "VERDICT: CAUTION — ACCOUNT READING UNKNOWN")):
+        first = cus.render_me(_payload([row], {"a": h}), row).splitlines()[0]
+        assert first.startswith(expect), first
+    # detail rows are still there beneath it
+    text = cus.render_me(_payload([row], {"a": _known(10, 10)}), row)
+    assert "HEADROOM (a, measured)" in text and "new tokens" in text
 
 
 if __name__ == "__main__":
@@ -870,10 +997,11 @@ def test_table_renders_unmeasured_as_dash_never_zero_percent():
     rows = [_full_row("%1", "slot-1", "rayi3", total=1000), _unmeasured_row("%3", "rayi3")]
     p = _payload(rows, {"rayi3": dict(cus.account_headroom(None, NOW), unmeasured_panes=1)})
     text = cus.render_panes_table(p)
-    line = next(ln for ln in text.splitlines() if ln.startswith("%3"))
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("%3"))
     assert "0%" not in line and " 0 " not in line
     assert "usage unknown: missing" in line
-    assert "1 pane(s) on rayi3 UNMEASURED" in text
+    header = next(ln for ln in text.splitlines() if ln.startswith("== rayi3"))
+    assert "1 pane(s) UNMEASURED" in header
 
 
 def test_me_says_tokens_unknown_not_zero_for_an_unmeasured_pane():
