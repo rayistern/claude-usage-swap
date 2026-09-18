@@ -2353,8 +2353,9 @@ def read_login_provenance(account: str, slot: str) -> dict | None:
 
 
 def login_store_identity(account: str, slot: str) -> dict:
-    """Identity facets (email/uuid/userID) recorded by `/login` in the store
-    dir's .claude.json — used to verify the login landed on the right account."""
+    """Identity facets recorded by `/login` in the store dir's .claude.json —
+    the `_identity_fields` set (accountUuid, emailAddress, organizationUuid;
+    never userID) — used to verify the login landed on the right account."""
     path = login_store_cj_path(account, slot)
     if not path.exists():
         return {}
@@ -6697,8 +6698,30 @@ def _identity_fields(cj: Any) -> dict:
     accountUuid `b9c92e39…` + email `rayi3@trisso.com` but differed on `userID`
     `93e1fc34…` vs `5d3df3e8…`). Comparing it made `_identities_match` FALSE-
     reject a correct same-account login (the independent-login-pool onboarding
-    error). The authoritative account identity is `oauthAccount.accountUuid`
-    (globally unique per account) plus `emailAddress`; those are what we compare.
+    error). The authoritative identity lives in `oauthAccount`, not at top level.
+
+    Terminology, made precise 2026-07-28: `accountUuid` is globally unique per
+    LOGIN IDENTITY (the person) — it is NOT unique per quota-bearing account, as
+    an earlier revision of this docstring claimed. The account an API call is
+    billed and rate-limited against is the (accountUuid, organizationUuid) pair.
+
+    Addition 2026-07-28: `organizationUuid` JOINS the facets. accountUuid+email
+    alone are NOT sufficient to name an account, because Anthropic's login has an
+    ACCOUNT SWITCHER — one email+password reaches several accounts, each with its
+    own billing and its own 5h/7d quota. Seen live (2026-07-28): a team/5x
+    account and a max/20x account under the same login shared accountUuid +
+    email and differed only on organizationUuid. Without this facet,
+    `login-mount --finish` green-lights a `/login` that landed on the wrong org
+    and silently seeds a 20x pool with 5x-quota families.
+
+    Why this is NOT the `userID` mistake: userID varies across `/login`s of the
+    SAME account (per-session client id), so comparing it false-rejected correct
+    logins. organizationUuid is stable per account across independent logins —
+    it varies only when the login genuinely landed on a DIFFERENT account, which
+    is exactly the case we want to reject. And because only facets present on
+    BOTH sides are compared (`_identities_match` intersects keys), a legacy store
+    that never recorded an organizationUuid still verifies on accountUuid+email
+    alone — the addition is strictly non-breaking for existing pools.
     """
     if not isinstance(cj, dict):
         return {}
@@ -6706,7 +6729,8 @@ def _identity_fields(cj: Any) -> dict:
     oa = oa if isinstance(oa, dict) else {}
     out: dict = {}
     for key, val in (("accountUuid", oa.get("accountUuid")),
-                     ("emailAddress", oa.get("emailAddress"))):
+                     ("emailAddress", oa.get("emailAddress")),
+                     ("organizationUuid", oa.get("organizationUuid"))):
         if val:
             out[key] = val
     return out
@@ -6979,7 +7003,9 @@ CRED_AUDIT_PREFIX = "CRED-AUDIT"
 def _fmt_audit_identity(ident: dict | None) -> str:
     """Render identity facets compactly for a CRED-AUDIT line as `uuid(short)/email`.
 
-    Only the account-identity facets (accountUuid + emailAddress) — never tokens.
+    Renders accountUuid (short) and emailAddress only — never tokens. The
+    organizationUuid facet is compared by `_identities_match` but not printed
+    here; two accounts under one login therefore render alike in audit lines.
     A short uuid prefix keeps the line greppable without dumping the full 36-char
     id; the email disambiguates. Empty/absent identity renders as `none` so the
     field is always present and stable to grep."""
@@ -17856,8 +17882,10 @@ def _account_for_mount_identity(mount: Path, state: dict) -> str | None:
 
     The slot dir's .claude.json oauthAccount is the authoritative account
     identity (the 2026-07-01 duplicate-identity incident proved meta.yaml can
-    lie while oauthAccount holds truth). Matches on accountUuid/emailAddress
-    against each account's canonical snapshot. Returns None when the mount has
+    lie while oauthAccount holds truth). Matches on the `_identity_fields`
+    facets (accountUuid, emailAddress, organizationUuid — the org tells two
+    accounts under one login apart) against each account's canonical snapshot.
+    Returns None when the mount has
     no readable identity or nothing matches (a login family the snapshots don't
     cover — the caller falls back to state.slots)."""
     cj = mount / ".claude.json"

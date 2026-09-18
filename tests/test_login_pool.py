@@ -881,6 +881,69 @@ def test_login_mount_finish_refuses_wrong_account():
         env.restore()
 
 
+def test_identity_fields_includes_organization_uuid():
+    """`organizationUuid` is an ACCOUNT facet, not a per-login-session one.
+
+    Anthropic's login has an account switcher: ONE email+password reaches several
+    accounts, each with its own billing and its own 5h/7d quota. accountUuid
+    identifies the PERSON; the quota-bearing account is the organization. So the
+    facet set must carry organizationUuid — unlike `userID`, which was correctly
+    removed in 2026-07-03 because it varies per /login of the SAME account."""
+    fields = cus._identity_fields(
+        {"oauthAccount": {"emailAddress": "a@x", "accountUuid": "uuid-a",
+                          "organizationUuid": "org-team"}})
+    assert fields.get("organizationUuid") == "org-team", fields
+
+
+def test_login_mount_finish_refuses_same_email_different_org():
+    """The account-switcher trap: two cus accounts can share an email AND an
+    accountUuid while being different Anthropic accounts (different org, separate
+    billing + quota — e.g. a 5x Team seat vs a 20x Max subscription under one
+    login; seen live 2026-07-28). Only organizationUuid tells them apart.
+
+    Comparing only accountUuid+email makes --finish green-light a login that landed
+    on the WRONG org, silently seeding a 20x pool with 5x-quota families."""
+    env = _Env()
+    try:
+        (env.accounts_dir / "account-alpha" / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alpha@x", "accountUuid": "uuid-alpha",
+                              "organizationUuid": "org-MAX-20x"}}))
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])  # scaffold family-1
+        env.plant_family("alpha", "family-1", "rt-a-fam1")
+        # Same person, same email — but the browser landed on the OTHER org.
+        (cus.login_family_dir("alpha", "family-1") / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alpha@x", "accountUuid": "uuid-alpha",
+                              "organizationUuid": "org-TEAM-5x"}}))
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish"])
+        assert r.exit_code != 0, r.output
+        assert "mismatch" in r.output.lower(), r.output
+        assert not cus.login_family_provenance_path("alpha", "family-1").exists(), \
+            "a wrong-org login must not be recorded as provenance"
+    finally:
+        env.restore()
+
+
+def test_login_mount_finish_accepts_when_org_absent_on_one_side():
+    """No false rejects on legacy stores. `_identity_fields` compares only facets
+    BOTH sides carry, so a family minted before organizationUuid was recorded (or a
+    snapshot that lacks it) must still verify on accountUuid + email alone."""
+    env = _Env()
+    try:
+        (env.accounts_dir / "account-alpha" / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alpha@x", "accountUuid": "uuid-alpha",
+                              "organizationUuid": "org-MAX-20x"}}))
+        CliRunner().invoke(cus.cli, ["login-mount", "alpha"])
+        env.plant_family("alpha", "family-1", "rt-a-fam1")
+        # Legacy family store: no organizationUuid recorded at all.
+        (cus.login_family_dir("alpha", "family-1") / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "alpha@x", "accountUuid": "uuid-alpha"}}))
+        r = CliRunner().invoke(cus.cli, ["login-mount", "alpha", "--finish"])
+        assert r.exit_code == 0, r.output
+        assert "mismatch" not in r.output.lower(), r.output
+    finally:
+        env.restore()
+
+
 def test_login_mount_from_existing_seeds_family_1_only():
     env = _Env()
     try:
