@@ -5493,6 +5493,12 @@ def _max_model_weekly_from_acct(acct: dict, config: dict,
     0.0), never as a hard cap. Per-model weekly is a 7-day-window concept, so it
     shares current_7d_pct's staleness fate (`_pct_is_unknown`).
 
+    Lower-bound exception: usage only climbs within a window, so a cached
+    reading taken since the last refresh (`_cached_7d_usage_valid`) is still a
+    valid lower bound. A cached >=100 is therefore returned as a hard cap; every
+    other stale case still returns 0.0. Exclusion only — the bound never feeds
+    scoring, so a cached LOW reading still cannot make an account attractive.
+
     Why this direction is the safe one: returning 0.0 for a stale account means
     a STALE per-model % neither (a) EXCLUDES the account from swap-target
     selection via pick_swap_target's `_max_model_weekly_from_acct(a) < model_cap`
@@ -5521,17 +5527,32 @@ def _max_model_weekly_from_acct(acct: dict, config: dict,
     reconfirmed. Default False keeps every pre-existing (swap-side) call site
     byte-identical, and the gate-off short-circuit above still returns 0.0
     either way, so unmodified installs see no change.
+
+    Cached-100% lower bound (per-model, 7-day window): when the 7d reading is
+    unknown but the cached window is still open (`_cached_7d_usage_valid`), a
+    cached per-model 100% stays exhausted — usage is monotonic within a window.
+    This changes the persisted-dict readers only (target selection, placement
+    fallbacks, the sessions binding label); the swap-AWAY force reads fresh
+    usage through `_max_model_weekly_from_usage` and is unchanged.
     """
     enabled, allow = _per_model_weekly_gate(config)
-    pm = acct.get("per_model_weekly_pct") or {}
-    if not enabled or not pm:
+    pm = acct.get("per_model_weekly_pct")
+    if not enabled or not isinstance(pm, dict) or not pm:
         return 0.0
     # Per-model shares the 7d window's staleness: if we can't trust current_7d
     # for this account, we can't trust its per-model weekly numbers either.
+    vals = [p for m, p in pm.items()
+            if isinstance(p, (int, float))
+            and (not allow or (isinstance(m, str) and m.lower() in allow))]
     # (Placement callers opt OUT via trust_stale — see the 2026-07-14 annotation.)
     if not trust_stale and _pct_is_unknown(acct, "current_7d_pct"):
-        return 0.0
-    vals = [p for m, p in pm.items() if not allow or m.lower() in allow]
+        # Unobservable, but usage is monotonic within a window: until a refresh
+        # lands the cached reading is still a valid lower bound, so a cached
+        # 100% is still exhausted. Below 100 stays unknown.
+        if not _cached_7d_usage_valid(acct, config):
+            return 0.0
+        capped = [p for p in vals if p >= 100]
+        return max(capped) if capped else 0.0
     return max(vals) if vals else 0.0
 
 
@@ -6292,10 +6313,11 @@ def pick_swap_target(state: dict, config: dict) -> SwapTarget | None:
     # candidates, the HOLD never fires, and a standard lane may still land on a
     # Fable-capped account by design.
     #
-    # Stale-guard preserved (2026-07-05, GH #161): a token_stale / unobservable
-    # account reads per-model 0.0 via _max_model_weekly_from_acct → stays
-    # ELIGIBLE here. Only a FRESH at/over-cap reading excludes a candidate, so we
-    # never refuse a target on a number we couldn't reconfirm.
+    # Stale-guard (2026-07-05, GH #161): a token_stale / unobservable account
+    # reads per-model 0.0 via _max_model_weekly_from_acct → stays ELIGIBLE here,
+    # so we never refuse a target on a number we couldn't reconfirm. Exception:
+    # a cached >=100 taken since the last observed refresh is still a valid lower
+    # bound and DOES exclude — see _max_model_weekly_from_acct.
     #
     # Cap used is the TARGET-side one (target_cap_pct, falling back to cap_pct,
     # falling back to hard_7d) — identical to the pre-split primary filter:
@@ -9263,7 +9285,9 @@ def decide_swap(
         # let SOS surface the all-capped condition (holding on the current capped
         # account is strictly no worse than a churning lateral move). Backward-
         # compatible: `_max_model_weekly_from_acct` is 0.0 with the per-model gate
-        # off, so that branch is inert on unmodified installs.
+        # off, so that branch is inert on unmodified installs. With the gate on it
+        # also reports a cached >=100 that no refresh has invalidated yet, so an
+        # unobservable target can register as capped here.
         target_acct = state["accounts"].get(target.name, {})
         capped_dims: list[str] = []
         if agg_tripped and target_acct.get("current_7d_pct", 0.0) >= _forcing_agg_cap:
@@ -17774,7 +17798,13 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # standard-model work). Gate must be enabled in config for this to bind.
     gate_enabled = config.get("per_model_weekly", {}).get("gate_enabled", False)
     pm = acct.get("per_model_weekly_pct") or {}
-    top_model, top_pct = (max(pm.items(), key=lambda kv: kv[1]) if pm else (None, 0.0))
+    # Same allowlist filter as _max_model_weekly_from_acct, so the named model
+    # is the one whose value drives the gate.
+    _allow = {str(m).lower() for m in (config.get("per_model_weekly", {}).get("models") or [])}
+    _tracked = {m: p for m, p in pm.items()
+                if isinstance(p, (int, float)) and not isinstance(p, bool)
+                and (not _allow or (isinstance(m, str) and m.lower() in _allow))}
+    top_model, top_pct = (max(_tracked.items(), key=lambda kv: kv[1]) if _tracked else (None, 0.0))
     model_cap = _model_weekly_cap_for_config(config)
     # A token_stale account passes the blocker-flag checks above (token_stale is
     # NOT among them — its 5h is still last-known-good), so it reaches here with
@@ -17783,12 +17813,18 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # that moved a live Fable session off an account which actually had Fable
     # headroom (2026-07-05 incident). Treat stale as unknown — skip the gate and
     # surface the number marked '~' in the headroom line below instead.
+    # Exception: a cached >=100 the picker still honors must bind here too, or
+    # the operator reads headroom on an account the picker refuses as a target.
+    # Read through _max_model_weekly_from_acct so this agrees with the daemon on
+    # allowlist filtering as well as on the bound. `model_stale` keeps its
+    # display meaning ("unconfirmed") and is used for the suffix below.
     model_stale = _model_pct_is_stale(acct)
-    if gate_enabled and not model_stale and top_model is not None and top_pct >= model_cap:
+    gate_pct = _max_model_weekly_from_acct(acct, config) if model_stale else top_pct
+    if gate_enabled and top_model is not None and gate_pct >= model_cap:
         if pool == "standard":
             # Surface the number but make clear it does NOT bind this lane.
-            return ("ok", f"ok; weekly-{top_model} {top_pct:.0f}% ignored (standard pool)")
-        return ("blocked", f"weekly-{top_model} {top_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
+            return ("ok", f"ok; weekly-{top_model} {gate_pct:.0f}% ignored (standard pool)")
+        return ("blocked", f"weekly-{top_model} {gate_pct:.0f}% >= {model_cap:.0f}% (premium gate)")
 
     # Graduated ladder pressure (swap-away, not a hard block). The highest
     # tripped step is what the daemon reacts to.
@@ -17799,7 +17835,7 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
 
     # Headroom on every enforced axis.
     txt = f"ok, headroom (5h {five:.0f}%, 7d {seven:.0f}%"
-    if pm:
+    if top_model is not None:
         # _fmt_model_pct marks the number '~' when it's stale (token_stale et
         # al.) so it never reads as an authoritative current value (2026-07-05).
         txt += f", {top_model} {_fmt_model_pct(acct, top_pct)}"
@@ -19586,6 +19622,49 @@ def _fmt_pct(acct: dict, key: str, width: int = 8, prec: int = 1, color_on: bool
     return f"{val:>{width}.{prec}f}"
 
 
+def _cached_7d_usage_valid(acct: dict, config: dict, now=None) -> bool:
+    """True while no 7d refresh has landed since the cached reading was taken.
+
+    Usage only climbs within a window, so until a refresh the cached value stays
+    a valid lower bound. The boundary is derived from the OBSERVED reset anchor
+    on its fixed cadence — the real ~72h refresh, which precedes the API's
+    ~7-day boundary. That API boundary is only consulted as an extra
+    invalidator, never to date the cadence.
+
+    Self-expiring: the anchor and the observation are written from the same
+    `u.polled_at` on the success branch, so anchor <= observation always and the
+    k=0 boundary can never invalidate a reading on its own. The first boundary
+    after the observation — at most one period later — flips this False, so an
+    account that can never be polled again stops being excluded after ~72h
+    rather than forever.
+    """
+    # last_poll_ts is a poll ATTEMPT stamp, restamped by the error branches, so
+    # only last_observed_ts dates the reading. No anchor means the 72h cadence is
+    # unknown and the API boundary cannot bound it — decline rather than guess.
+    observed = acct.get("last_observed_ts")
+    anchor = acct.get("seven_day_last_reset_ts")
+    if not observed or not anchor:
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        observed_dt = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+        t0 = datetime.fromisoformat(str(anchor).replace("Z", "+00:00"))
+        period = timedelta(hours=float(config.get("seven_day_reset_hours", 72)))
+        if period <= timedelta(0) or now < t0:
+            return False
+        if t0 + period * ((now - t0) // period) > observed_dt:
+            return False
+        api = acct.get("seven_day_resets_at")
+        if api:
+            api_dt = datetime.fromisoformat(str(api).replace("Z", "+00:00"))
+            if observed_dt < api_dt <= now:
+                return False
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def _model_pct_is_stale(acct: dict) -> bool:
     """True when an account's per-model WEEKLY numbers can't be trusted as a
     CURRENT reading (2026-07-05 incident).
@@ -19603,7 +19682,10 @@ def _model_pct_is_stale(acct: dict) -> bool:
     Bug 1 (this helper) is the DISPLAY half of the fix — mark such numbers stale
     everywhere they're shown so they can never look current. The DECISION half
     lives in `_max_model_weekly_from_acct`, which returns 0.0 under the same
-    condition so a stale reading never forces or refuses a swap.
+    condition — except for a cached >=100 taken since the last refresh, which
+    stays a valid lower bound and still refuses the account as a TARGET (the
+    swap-away force reads fresh usage and is untouched). See that function's
+    lower-bound exception.
     """
     return _pct_is_unknown(acct, "current_7d_pct")
 

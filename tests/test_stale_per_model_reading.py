@@ -161,12 +161,42 @@ def test_session_binding_does_not_hard_block_on_stale_per_model():
     must NOT read as a hard 'premium gate' block — the value is unconfirmed."""
     # 5h/7d have headroom (so no ladder/hard-wall trip preempts the gate) — the
     # ONLY thing that would block is the stale Fable=100%, which must not.
+    # No reset anchor, so the cached reading is genuinely unknown rather than a
+    # valid lower bound (see the sibling test for that case).
     acct = {"current_5h_pct": 10.0, "current_7d_pct": 5.0,
             "token_stale": True, "per_model_weekly_pct": {"Fable": 100.0}}
     sev, txt = cus._session_binding(acct, "premium", _gate_config())
     assert sev != "blocked", (sev, txt)
     assert "premium gate" not in txt, txt
     assert "~" in txt or "stale" in txt, txt
+
+
+def test_session_binding_keeps_the_stale_marker_when_the_gate_is_off():
+    """`model_stale` must keep its DISPLAY meaning. Folding the bound into it
+    would drop the '[stale — repoll to confirm]' hint whenever gate_enabled is
+    False, since the gate block that consumes the bound never runs."""
+    now = datetime.now(timezone.utc)
+    acct = {"current_5h_pct": 10.0, "current_7d_pct": 5.0, "token_stale": True,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30))}
+    sev, txt = cus._session_binding(
+        acct, "premium", _gate_config(per_model_weekly={"gate_enabled": False}))
+    assert sev == "ok", (sev, txt)
+    assert "stale" in txt, txt
+
+
+def test_session_binding_blocks_when_the_cached_100_is_still_a_valid_bound():
+    """The operator view must not report headroom on the same reading the daemon
+    is evacuating the lane on."""
+    now = datetime.now(timezone.utc)
+    acct = {"current_5h_pct": 10.0, "current_7d_pct": 5.0, "token_stale": True,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30))}
+    sev, txt = cus._session_binding(acct, "premium", _gate_config())
+    assert sev == "blocked", (sev, txt)
+    assert "premium gate" in txt, txt
 
 
 # ==========================================================================
@@ -219,7 +249,22 @@ def test_max_model_weekly_from_acct_treats_stale_as_unknown():
         assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0, flag
 
 
-def test_swap_away_force_reads_fresh_usage_not_cached_dict():
+def test_max_model_weekly_honors_cached_100_before_the_window_resets():
+    # Usage is monotonic within a window, so before seven_day_resets_at a cached
+    # 100% is still >= 100% and must exclude the account.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 100.0
+
+
+def test_swap_away_trigger1_reads_fresh_usage_not_cached_dict():
+    # Trigger 1 is the only swap-away force: it reads fresh usage, so the cached
+    # lower bound (a persisted-dict rule) never reaches it.
     """Evidence that the swap-AWAY force was already safe: a token_stale
     account's fresh AccountUsage this cycle is empty, so the swap-away signal
     (_max_model_weekly_from_usage) is 0.0 and can never force a lane off it."""
@@ -264,6 +309,172 @@ def test_pick_swap_target_not_refused_on_stale_per_model():
                    "per_model_weekly_pct": {"Fable": 100.0}}
     tgt2 = cus.pick_swap_target(_state_with_spare(fresh_spare), cfg)
     assert tgt2 is None, f"expected HOLD (fresh over-cap sole target), got {tgt2}"
+
+
+def test_max_model_weekly_ignores_cached_100_once_a_refresh_landed_since_the_reading():
+    # The real ~72h refresh precedes the API's ~7d boundary
+    # (projected_seven_day_reset). A reading taken BEFORE that refresh says
+    # nothing about the new window, even though the API boundary is still future.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            # refresh cadence anchored 8 days back → a boundary landed 2 days ago
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=192)),
+            "last_observed_ts": _iso(now - timedelta(days=3)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_a_reading_predating_the_refresh_when_api_is_nearer():
+    # projected_seven_day_reset returns min(anchor projection, raw API boundary).
+    # The API value is a ~7d oldest-tokens boundary unrelated to the 72h cadence,
+    # so "next - 72h" is only the previous refresh for the anchor branch.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=2)),   # refresh 2h ago
+            "last_observed_ts": _iso(now - timedelta(hours=50)),         # reading predates it
+            "seven_day_resets_at": _iso(now + timedelta(hours=10))}      # API nearer than projection
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_a_reading_with_no_observation_timestamp():
+    # last_poll_ts is a poll ATTEMPT stamp, restamped every cycle by the error
+    # branches, so it cannot stand in for when usage was last actually seen.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=200)),
+            "last_poll_ts": _iso(now - timedelta(seconds=30))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_cached_exclusion_self_expires_for_a_permanently_unpollable_account():
+    """Safety bound: the anchor and the observation are written from the same
+    polled_at, so the k=0 boundary never invalidates a reading on its own and the
+    exclusion lapses at the FIRST boundary after it. An account that can never be
+    polled again is sidelined for at most one period, not forever."""
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+
+    def _acct(age_hours: float) -> dict:
+        stamp = _iso(now - timedelta(hours=age_hours))
+        return {"token_stale": True, "current_7d_pct": 100.0,
+                "per_model_weekly_pct": {"Fable": 100.0},
+                "seven_day_last_reset_ts": stamp, "last_observed_ts": stamp}
+
+    assert cus._max_model_weekly_from_acct(_acct(10), cfg) == 100.0, "within the period → still excluded"
+    assert cus._max_model_weekly_from_acct(_acct(80), cfg) == 0.0, "past the first boundary → lapsed"
+
+
+def test_max_model_weekly_requires_an_observed_reset_anchor():
+    # Without seven_day_last_reset_ts the 72h cadence is unknown, and the API
+    # boundary cannot bound it. Decline rather than guess.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "last_observed_ts": _iso(now - timedelta(minutes=5)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_survives_a_naive_reset_timestamp():
+    # A stored timestamp without an offset must degrade to "unknown", not raise
+    # out of pick_swap_target/decide_swap.
+    cfg = _gate_config()
+    # Anchor present so the guard is actually entered and the naive/aware
+    # comparison inside it is what degrades.
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": "2026-08-07T00:00:00",
+            "last_observed_ts": "2026-08-07T00:00:00",
+            "seven_day_resets_at": "2026-08-09T00:00:00"}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_survives_a_malformed_per_model_dict():
+    cfg = _gate_config()
+    for pm in ([("Fable", 100.0)], {"Fable": "lots"}, {5: 100.0}, "Fable=100"):
+        acct = {"token_stale": True, "current_7d_pct": 100.0, "per_model_weekly_pct": pm}
+        assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0, pm
+
+
+def test_max_model_weekly_ignores_cached_100_when_the_api_boundary_passed():
+    # The API boundary is the extra invalidator: no cadence boundary has landed
+    # since the reading, but seven_day_resets_at fell between it and now.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30)),
+            "seven_day_resets_at": _iso(now - timedelta(minutes=15))}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_a_cached_reading_below_100():
+    # Only the ceiling is unambiguous; a cached 94 might have headroom left.
+    cfg = _gate_config()
+    now = datetime.now(timezone.utc)
+    acct = {"token_stale": True, "current_7d_pct": 94.0,
+            "per_model_weekly_pct": {"Fable": 94.0},
+            "seven_day_last_reset_ts": _iso(now - timedelta(hours=1)),
+            "last_observed_ts": _iso(now - timedelta(minutes=30)),
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+    assert cus._cached_7d_usage_valid(acct, cfg), \
+        "precondition: the reading IS valid, so only the threshold can reject it"
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_max_model_weekly_ignores_cached_100_without_a_reset_timestamp():
+    # No reset timestamp = no way to know whether the window rolled.
+    cfg = _gate_config()
+    acct = {"token_stale": True, "current_7d_pct": 100.0,
+            "per_model_weekly_pct": {"Fable": 100.0}}
+    assert cus._max_model_weekly_from_acct(acct, cfg) == 0.0
+
+
+def test_pick_swap_target_holds_on_cached_exhaustion_before_reset():
+    """The user-facing requirement: an account known to be 7d-exhausted stays out
+    of rotation while rate-limited/stale, instead of being swapped onto."""
+    cfg = _gate_config()
+
+    def _state_with_spare(spare_acct: dict) -> dict:
+        return {
+            "active": "cur",
+            "accounts": {
+                "cur": {"current_5h_pct": 95.0, "current_7d_pct": 40.0, "next_swap_at_pct": 50},
+                "spare": spare_acct,
+            },
+            "swap_history": [],
+        }
+
+    # Aggregate 7d stays LOW so the never_swap_to_pct filter can't be the reason
+    # for a HOLD, and token_stale (not rate_limited) so the rate-limited filter
+    # can't be either. The only disqualifier available is the cached per-model %.
+    now = datetime.now(timezone.utc)
+    base = {"current_5h_pct": 5.0, "current_7d_pct": 5.0, "next_swap_at_pct": 90,
+            "token_stale": True, "per_model_weekly_pct": {"Fable": 100.0},
+            "seven_day_resets_at": _iso(now + timedelta(days=2))}
+
+    # Reading taken AFTER the most recent refresh → still a valid lower bound.
+    pre_reset = dict(base,
+                     seven_day_last_reset_ts=_iso(now - timedelta(hours=1)),
+                     last_observed_ts=_iso(now - timedelta(minutes=30)))
+    assert cus.pick_swap_target(_state_with_spare(pre_reset), cfg) is None, \
+        "cached-exhausted spare must not be a target while the reading still holds"
+
+    # A refresh landed after the reading → says nothing about the new window.
+    post_reset = dict(base,
+                      seven_day_last_reset_ts=_iso(now - timedelta(hours=192)),
+                      last_observed_ts=_iso(now - timedelta(days=3)))
+    tgt = cus.pick_swap_target(_state_with_spare(post_reset), cfg)
+    assert tgt is not None and tgt.name == "spare", \
+        f"post-refresh the reading is unknown, not disqualifying, got {tgt}"
 
 
 # ==========================================================================
