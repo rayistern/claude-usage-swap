@@ -350,8 +350,10 @@ cus panes --me             # just this pane + its account's headroom
 cus panes --json           # machine-readable (schema_version 1)
 ```
 
-It is **read-only**: it makes no API call, writes nothing, and never touches
-credentials. Everything comes off disk — tmux pane states from
+It is **read-only**: it makes no API call, writes no cus state, and never
+touches credentials. (Precisely: `cus panes` itself writes nothing, but the pane
+reader it runs keeps its own small fingerprint cache under
+`~/.cache/pane_state/`, one file per pane.) Everything comes off disk — tmux pane states from
 `skills/pane_state.py` (the build-babysitter reader; if that reader is missing
 the command *fails* rather than guessing), Claude Code's own session registry
 and transcripts, and cus `state.json`.
@@ -370,8 +372,22 @@ Other things worth knowing about the numbers:
   `<project>/<session-id>/subagents/`, invisible in the parent transcript.
 - Totals come from the **tail** of each transcript, so a 170MB file stays cheap.
   A pane whose tail hit the size cap is flagged and its totals are a *floor*.
-- A 429 is only shown as a live `WALL` when it was seen recently *and* its reset
-  is still in the future; older rejections render as `(429 3h ago)`.
+- `WALL` is shown when **any** of three signals attests it: a 429 in the
+  transcript whose reset is still in the future (the transcript is scanned back
+  5h for this **regardless of `--window`**, and a 429 from before the slot
+  changed account is discounted); the pane reader reporting the pane at the
+  `limit_menu`; or the pane's account measured at 100% of its 5h/7d window with
+  the reset still ahead. It over-reports on purpose — a false "walled" costs
+  some caution, a false "clear" walls an account mid-fan-out. `wall_evidence`
+  in `--json` says which signals fired. A rejection that no signal backs renders
+  as `(429 3h ago)`.
+- A pane whose transcript could not be read is **unmeasured**: it shows `-`
+  (`null` in `--json`), never `0`, is excluded from every share's denominator,
+  and is counted on its account's line so you know the shares cover only the
+  observed remainder. A `~` after a share means a pane on that account hit the
+  size cap, so the shares are approximate.
+- Spend is credited to the slot's **current** account: a slot moved mid-window
+  has its pre-move spend credited to the new account.
 - `cost_window_usd` is `null` unless the tail contains a `cost-state` snapshot
   from *before* the window — a session-lifetime cost must never be printed as a
   30-minute cost.
@@ -392,8 +408,10 @@ Other things worth knowing about the numbers:
     "session_id": "...", "cwd": "...", "transcript": "...",
     "transcript_status": "ok",         // | missing | unreadable: X
                                        // | no-session-registered | unresolved
+    "unmeasured": false,               // true => token figures below are null
     "window_covered": true,            // false => totals are a FLOOR
-    "subagents_live": 1,
+    "wall_scan_covered": true,         // false => size cap hit before the 5h wall lookback
+    "subagents_live": 1,               // null when unmeasured (it is read from the transcript)
     "subagent_models": {"claude-opus-5[1m]": 1},
     "subagents": [{"agent_id": "...", "model": "...", "description": "...",
                    "started_at": "...", "idle_seconds": 4.7}],
@@ -405,15 +423,24 @@ Other things worth knowing about the numbers:
     "burn_tokens_per_min": 165223.6, "burn_new_tokens_per_min": 7614.2,
     "cost_window_usd": null, "last_activity": "...",
     "wall": {"rate_limit_type": "five_hour", "resets_at": "...", "observed_at": "..."},
+                                       // ^ the latest 429 seen, as a FACT; the verdict is:
+    "wall_active": true,
+    "wall_evidence": ["transcript_429", "pane_limit_menu"],
+                                       // | account_5h_exhausted | account_7d_exhausted
+    "wall_kind": "five_hour", "wall_resets_at": "...",
+    "wall_429_discounted": null,       // or why a recorded 429 was not counted
     "attribution": {"kind": "estimate", "basis": "...",
                     "account_window_tokens": 19826832,
-                    "pane_pct_of_account_window": 100.0}
+                    "pane_pct_of_account_window": 100.0,   // null when unmeasured
+                    "unmeasured": false,
+                    "unmeasured_panes_on_account": 0,
+                    "approximate": false}
   }],
   "accounts": {"rayi2": {"known": true, "reason": null,
                          "five_hour_pct": 3.0, "seven_day_pct": 59.0,
                          "headroom_5h_pct": 97.0, "headroom_7d_pct": 41.0,
                          "five_hour_resets_at": "...", "last_observed_ts": "...",
-                         "age_seconds": 224.9}}
+                         "age_seconds": 224.9, "unmeasured_panes": 0}}
 }
 ```
 
