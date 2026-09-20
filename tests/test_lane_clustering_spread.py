@@ -184,7 +184,12 @@ def test_gate_off_reverts_to_clustering():
             "mag": cus.AccountUsage(five_hour=cus.UsageWindow(28.0, _iso_in(18)), seven_day=cus.UsageWindow(10.0, None)),
         }
         exclude = {"src1", "src2", "mag"}
-        moves = cus.decide_slot_swaps(state, _cfg(spread=False), usage, exclude_accounts=exclude)
+        # 2026-09-20 (GH #238 C): same-cycle stacking now also needs the
+        # one-lane-per-account-per-cycle rule OFF — it is its own lever, on by
+        # default, and this test is about reproducing the PRE-spread pile-up.
+        moves = cus.decide_slot_swaps(
+            state, _cfg(spread=False, **{"spread_lanes": {"one_lane_per_account_per_cycle": False}}),
+            usage, exclude_accounts=exclude)
         onto_mag = [m for m in moves if m["to"] == "mag"]
         assert len(onto_mag) == 2, f"gate off must reproduce the pile-up onto the magnet: {moves}"
         assert all("pool double-book" in m["reason"] for m in onto_mag), onto_mag
@@ -223,8 +228,12 @@ def test_scarce_clean_accounts_still_stack_on_hot_ladder_move():
         cus.save_state(state)
         state = cus.load_state()
         usage = {"alpha": _usage(96.0, 30.0), "beta": _usage(5.0, 10.0), "gamma": _usage(100.0, 100.0)}
-        moves = cus.decide_slot_swaps(state, _cfg(spread=True), usage,
-                                      exclude_accounts={"alpha", "beta", "gamma"})
+        # 2026-09-20 (GH #238 C): with one_lane_per_account_per_cycle (default
+        # on) only ONE of the two would land this cycle; this test pins the
+        # family-accounting stacking path itself, so the per-cycle rule is off.
+        moves = cus.decide_slot_swaps(
+            state, _cfg(spread=True, **{"spread_lanes": {"one_lane_per_account_per_cycle": False}}),
+            usage, exclude_accounts={"alpha", "beta", "gamma"})
         onto_beta = [m for m in moves if m["to"] == "beta"]
         assert {m["slot"] for m in moves} == {s1, s2}, moves
         assert len(onto_beta) == 2, f"both hot lanes escape onto beta's two families: {moves}"
