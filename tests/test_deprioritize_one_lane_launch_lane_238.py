@@ -313,9 +313,23 @@ def test_launch_lane_accepts_a_lane_that_already_holds_its_own_claimed_family():
         env.make_slot("alpha", live=True)                                   # alpha live elsewhere
         lane = env.make_slot("alpha", live=False, family_id="family-1")      # the moved-to lane, idle
         env.plant_family("alpha", "family-1", "rt-a1")
+        # `cus slot move` installed family-1's OWN token into the lane mount; the
+        # fixture's default mount bytes are the account snapshot's (shared with
+        # the live lane), which is exactly the state the guard must refuse.
+        (cus.slot_path(lane) / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-a1", "refreshToken": "rt-a1", "expiresAt": 2_000_000_000_000}}))
         state, config = cus.load_state(), cus.load_config()
         got = cus._launch_prepare("alpha", state, config, lane=lane, dry_run=True)
         assert got == (lane, cus.slot_path(lane), "alpha"), got
+        # control 0 (PR #240 second pass): same bytes as the live lane => refused,
+        # whatever the lease says
+        (cus.slot_path(lane) / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt-alpha", "expiresAt": 2_000_000_000_000}}))
+        with pytest.raises(click.ClickException) as ei:
+            cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)
+        assert "SAME OAuth refresh-token family" in str(ei.value)
+        (cus.slot_path(lane) / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-a1", "refreshToken": "rt-a1", "expiresAt": 2_000_000_000_000}}))
         # controls: gate off => still #104; leased for ANOTHER account => still #104
         with pytest.raises(click.ClickException) as ei:
             cus._launch_prepare("alpha", state, cus.deep_merge(config, {"independent_logins": {"use_independent_logins": False}}),
@@ -347,9 +361,7 @@ def test_launch_dry_run_refuses_before_any_write_and_succeeds_without_writing():
         # auto pick: the account is decided, no slot reserved
         slot_name, _d, acct = cus._launch_prepare(None, cus.load_state(), config, dry_run=True)
         assert slot_name == "(auto)" and acct == "beta"
-        # (the auto pick's fresh-reading verification records a poll timestamp —
-        # a reading, not a lane write; what must not happen is a reservation)
-        assert cus.load_state()["slots"] == before["slots"]
+        assert cus.load_state() == before      # strict: the verify poll is skipped under dry-run
     finally:
         env.restore()
 
@@ -495,7 +507,12 @@ def test_view_keys_panes_on_socket_and_id():
     assert v["slots"] == {"slot-3"} and v["conflicts"] == {}
 
 
-def test_live_scan_visits_every_socket_recorded_in_sessions_log(monkeypatch):
+def test_live_scan_visits_every_tmux_server_exactly_once(monkeypatch):
+    """H6, second pass. sessions.log records the DEFAULT server as its socket
+    PATH (`/tmp/tmux-1000/default` on this box), never as None — the fixture
+    the first version of this test used. The requirement is every server once:
+    the default server (scanned as None) must not be scanned again under its
+    recorded path, or every default-server pane is counted twice."""
     calls = []
 
     def fake_run(argv, **kw):
@@ -507,12 +524,26 @@ def test_live_scan_visits_every_socket_recorded_in_sessions_log(monkeypatch):
         return R()
     monkeypatch.setattr(cus.subprocess, "run", fake_run)
     monkeypatch.setattr(cus, "tmux_is_available", lambda: True)
-    monkeypatch.setattr(cus, "_parse_sessions_log", lambda: [{"tmux_socket": "/tmp/tmux-1000/second"},
-                                                              {"tmux_socket": None}])
+    monkeypatch.setattr(cus, "_default_tmux_socket_path", lambda: "/tmp/tmux-1000/default")
+    monkeypatch.setattr(cus, "_parse_sessions_log", lambda: [
+        {"tmux_socket": "/tmp/tmux-1000/default"},     # the real recorded value for the default server
+        {"tmux_socket": "/tmp/tmux-1000/second"},
+        {"tmux_socket": "/tmp/tmux-1000/default"},
+        {"tmux_socket": None}])                          # a legacy 5-column row
     monkeypatch.setattr(cus, "pane_mount_name", lambda pane, sock=None: "slot-1")
     rows = cus._live_pane_slots()
+    scanned = [c for c in calls if "list-panes" in c]
+    assert len(scanned) == 2, scanned                                   # default once, second once
+    assert sum(1 for c in scanned if "-S" in c) == 1
     assert [r[3] for r in rows] == [None, "/tmp/tmux-1000/second"]
-    assert any("-S" in c and "/tmp/tmux-1000/second" in c for c in calls)
+    # ...and a conflict on the default server is counted once, not twice
+    monkeypatch.setattr(cus, "_live_pane_slots", lambda tmux_socket=None: rows + [("t", "%2", "slot-1", None)])
+    cus._deprio_view_cache_clear()
+    v = cus.deprioritized_view({"session_locks": {"deprioritized_panes": ["s"]}})
+    assert "1 normal pane(s) (t)" in v["conflicts"]["slot-1"], v["conflicts"]
+    # the recorded default path is an alias key for a default-server pane
+    assert v["panes"][("/tmp/tmux-1000/default", "%1")] == v["panes"][(None, "%1")]
+    cus._deprio_view_cache_clear()
 
 
 def test_all_digit_pane_name_is_a_pane_when_such_a_pane_is_live():
@@ -633,6 +664,138 @@ def test_panes_payload_stamps_the_flag_end_to_end(monkeypatch, tmp_path):
     assert rows["%20"]["deprioritized"] is True and rows["%10"]["deprioritized"] is False
     assert rows["%20"]["deprioritized_conflict"] and "split it out" in rows["%20"]["deprioritized_conflict"]
     assert "MIXED PRIORITY: slot-7" in cus.render_panes_table(payload)
+
+
+# ==========================================================================
+# PR #240 second pass (2026-09-20): H1 — the BYTES decide sharing. The
+# invariant worth pinning: `_launch_prepare(..., dry_run=True)` refuses on
+# exactly the inputs where `_live_family_would_collide` is True for the
+# credentials that would actually run under the lane.
+# ==========================================================================
+
+_VALID = 2_000_000_000_000
+
+
+def _creds_blob(rt: str) -> str:
+    return json.dumps({"claudeAiOauth": {"accessToken": f"at-{rt}", "refreshToken": rt, "expiresAt": _VALID}})
+
+
+def _guard_refuses(account, lane, state, config):
+    try:
+        cus._launch_prepare(account, state, config, lane=lane, dry_run=True)
+        return False, ""
+    except click.ClickException as e:
+        return True, str(e)
+
+
+def test_launch_guard_refuses_exactly_when_the_running_bytes_would_collide():
+    """The Opus seat's two counterexamples plus the shared-mount blind spot,
+    each in both directions. For every case: refused ⇔ _live_family_would_collide
+    on the credentials the lane would run — never ⇔ a lease or a legacy store."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        live_lane = env.make_slot("alpha", live=True)                    # mount carries rt-alpha
+        lane = env.make_slot("alpha", live=False)                        # holds alpha, idle
+        mount = cus.slot_path(lane) / ".credentials.json"
+        config = cus.load_config()
+
+        # (a) a LEGACY per-slot store exists — used to short-circuit the whole check
+        legacy = cus.login_store_dir("alpha", lane); legacy.mkdir(parents=True, exist_ok=True)
+        cus.login_store_creds_path("alpha", lane).write_text(_creds_blob("rt-legacy"))
+        assert cus.has_independent_login("alpha", lane)
+        for rt, expect in (("rt-alpha", True), ("rt-legacy", False)):
+            mount.write_text(_creds_blob(rt))
+            state = cus.load_state()
+            collide = cus._live_family_would_collide("alpha", mount, lane, state, config)
+            assert collide is expect
+            refused, msg = _guard_refuses("alpha", lane, state, config)
+            assert refused is collide, (rt, msg)
+            if refused:
+                assert "SAME OAuth refresh-token family" in msg
+
+        # (b) lease verified (own family, store present, no other live lease) but
+        #     the MOUNT carries the live lane's family
+        env.plant_family("alpha", "family-2", "rt-a2")
+        st = cus.load_state(); st["slots"][lane]["login_family"] = "alpha/family-2"; cus.save_state(st)
+        for rt, expect in (("rt-alpha", True), ("rt-a2", False)):
+            mount.write_text(_creds_blob(rt))
+            state = cus.load_state()
+            collide = cus._live_family_would_collide("alpha", mount, lane, state, config)
+            assert collide is expect
+            refused, msg = _guard_refuses("alpha", lane, state, config)
+            assert refused is collide, (rt, msg)
+
+        # (c) the SHARED mount as the other consumer: no live slot at all, bare
+        #     sessions ride ~/.claude on alpha (hybrid), invisible to mount_in_use
+        env.live_slots.clear(); cus._OCCUPIED_SLOTS_CACHE.clear()
+        st = cus.load_state(); st["active"] = "alpha"; cus.save_state(st)
+        env.set_config({"mode": "hybrid", "independent_logins": {"use_independent_logins": True}})
+        config = cus.load_config()
+        cus.CREDS_JSON.write_text(_creds_blob("rt-shared"))
+        for rt, expect in (("rt-shared", True), ("rt-a2", False)):
+            mount.write_text(_creds_blob(rt))
+            state = cus.load_state()
+            collide = cus._live_family_would_collide("alpha", mount, lane, state, config)
+            assert collide is expect
+            refused, msg = _guard_refuses("alpha", lane, state, config)
+            assert refused is collide, (rt, msg)
+    finally:
+        env.restore()
+
+
+def test_launch_lane_that_would_install_takes_a_free_family_or_refuses_on_exhaustion(capsys):
+    """H4. When the lane does NOT hold the account, dry-run mirrors the
+    executor's source selection: a free pooled family (distinct bytes) is
+    accepted; the same family sharing bytes with the live lane is refused; no
+    family and no legacy store is the pool-exhausted refusal the real launch
+    would raise AFTER the old dry-run said "safe"."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        env.make_slot("alpha", live=True)                                # alpha live elsewhere
+        lane = env.make_slot("beta", live=False)                         # idle lane on beta
+        config = cus.load_config()
+        refused, msg = _guard_refuses("alpha", lane, cus.load_state(), config)
+        assert refused and "no free independent login family" in msg and "GH #104" in msg
+        env.plant_family("alpha", "family-1", "rt-a1")                   # distinct family free
+        refused, msg = _guard_refuses("alpha", lane, cus.load_state(), config)
+        assert not refused, msg
+        assert "distinct family (pooled-family: family-1)" in capsys.readouterr().out
+        cus.login_family_creds_path("alpha", "family-1").write_text(_creds_blob("rt-alpha"))  # shares the live lane's bytes
+        refused, msg = _guard_refuses("alpha", lane, cus.load_state(), config)
+        assert refused and "SAME OAuth refresh-token family" in msg
+    finally:
+        env.restore()
+
+
+def test_dry_run_blank_source_refuses_and_dead_shaped_held_mount_only_warns(capsys):
+    """H4 / the new MEDIUM. A blank-shaped install source is the #141 refusal
+    the real launch raises after the old dry-run return. A lane that already
+    holds the account with a blank-shaped mount is NOT refused — the real
+    launch heals it from a claimable family — but the warning names whether
+    that heal has a family to use."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        st = cus.load_state(); st["active"] = "beta"; cus.save_state(st)   # alpha not live anywhere, shared mount included
+        lane = env.make_slot("beta", live=False)
+        (env.accounts_dir / "account-alpha" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "", "expiresAt": 0}}))   # blank snapshot
+        refused, msg = _guard_refuses("alpha", lane, cus.load_state(), cus.load_config())
+        assert refused and ("blank-shaped" in msg or "dead-shaped" in msg), msg
+        # a lane HOLDING alpha with a blank-shaped mount: accepted with a warning
+        held = env.make_slot("alpha", live=False)
+        (cus.slot_path(held) / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "", "expiresAt": 0}}))
+        got = cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=held, dry_run=True)
+        out = capsys.readouterr().out
+        assert got[0] == held and "WARNING" in out and "NO family is free" in out
+        env.plant_family("alpha", "family-1", "rt-a1")
+        cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=held, dry_run=True)
+        assert "'family-1' is free" in capsys.readouterr().out
+    finally:
+        env.restore()
 
 
 if __name__ == "__main__":

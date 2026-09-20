@@ -9693,6 +9693,29 @@ def _deprioritized_cfg(config: dict) -> tuple[set[str], set[str]]:
             {str(x) for x in (sl.get("deprioritized_panes") or [])})
 
 
+_DEFAULT_TMUX_SOCKET_CACHE: dict = {"ts": 0.0, "path": None}
+
+
+def _default_tmux_socket_path() -> str | None:
+    """The default tmux server's socket path (`tmux display-message -p
+    '#{socket_path}'`), memoized for a minute; None when no default server is
+    up. Read-only. Lets the socket scan recognise sessions.log's recorded path
+    for the default server as the server it already scans as `None`."""
+    c = _DEFAULT_TMUX_SOCKET_CACHE
+    if time.time() - c["ts"] < 60.0:
+        return c["path"]
+    path = None
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "#{socket_path}"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            path = r.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    c.update({"ts": time.time(), "path": path})
+    return path
+
+
 def _live_pane_slots(tmux_socket: str | None = None) -> list[tuple[str, str, str | None, str | None]]:
     """[(tmux session name, %pane id, slot-or-None, tmux socket)] for every
     live tmux pane on EVERY known tmux server: the default socket plus each
@@ -9707,14 +9730,24 @@ def _live_pane_slots(tmux_socket: str | None = None) -> list[tuple[str, str, str
     if tmux_socket is not None:
         sockets: list[str | None] = [tmux_socket]
     else:
+        # The default server is scanned ONCE, as `None` (legacy 5-column
+        # sessions.log rows carry tmux_socket=None, and sessions_cmd's
+        # (socket, pane) lookup needs the None-keyed row). sessions.log records
+        # `${TMUX%%,*}` for it — the socket PATH (`/tmp/tmux-1000/default`), not
+        # None — so that path is resolved once and dropped from the list, or
+        # every default-server pane would be scanned twice (PR #240 second pass:
+        # doubled conflict counts, doubled subprocess cost).
         sockets = [None]
+        default_path = _default_tmux_socket_path()
         try:
             for e in _parse_sessions_log():
                 sk = e.get("tmux_socket")
-                if sk and sk not in sockets:
+                if sk and sk != default_path and sk not in sockets:
                     sockets.append(sk)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — say so; a silent collapse to [None] is H6 again
+            click.echo(click.style(f"warning: could not read sessions.log for tmux sockets ({e}); "
+                                   f"scanning the default server only — pane-keyed deprioritization "
+                                   f"on other servers is blind this pass", fg="yellow"))
     out: list[tuple[str, str, str | None, str | None]] = []
     for sk in sockets:
         try:
@@ -9787,11 +9820,17 @@ def deprioritized_view(config: dict, live_panes: list | None = None) -> dict:
     else:
         panes = live_panes
     by_slot: dict[str, list[tuple[str, bool]]] = {}
+    # sessions.log rows for the default server carry its socket PATH while the
+    # scan keys that server as None: register both keys for those rows so a
+    # (recorded-socket, pane) lookup from sessions_cmd hits.
+    default_path = _default_tmux_socket_path() if live_panes is None else None
     for row in panes:
         name, pane_id, slot = row[0], row[1], row[2]
         sk = row[3] if len(row) > 3 else None
         dep = (name in exp_panes) or (pane_id in exp_panes) or bool(slot and slot in exp_slots)
         view["panes"][(sk, pane_id)] = (name, dep, slot)
+        if sk is None and default_path:
+            view["panes"][(default_path, pane_id)] = (name, dep, slot)
         if slot:
             by_slot.setdefault(slot, []).append((name or pane_id, dep))
     for slot, members in by_slot.items():
@@ -21183,7 +21222,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "reactive": "When `enabled: true`, the PostToolUseFailure hook detects 429s in tool error bodies and triggers immediate swap (no waiting for next poll).",
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
-    "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name. `deprioritized_slots: [slot-3, ...]` / `deprioritized_panes: [<tmux session name or %pane>, ...]` (GH #238, `cus deprioritize`/`cus reprioritize`) — lanes/panes that can WAIT for a reset: the daemon never moves them off a wall, never counts them as needing a target, and their SOS downgrades to INFO; unlike a lock they may still be joined, auto-picked and idle-gc'd. A pane deprioritized while sharing a lane with NORMAL panes is a MIXED-PRIORITY conflict: the lane is neither rescued nor silenced, and status/sessions/panes/sos tell you to split it out.",
+    "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name. `deprioritized_slots: [slot-3, ...]` / `deprioritized_panes: [<tmux session name or %pane>, ...]` (GH #238, `cus deprioritize`/`cus reprioritize`) — lanes/panes that can WAIT for a reset: the daemon never moves them off a wall (ladder / hard-cap / burn; a disabled-account eviction still applies), never counts them as needing a target, and their USAGE alarm (lane at N% with no swap target) downgrades to INFO — credential-integrity alarms (blanked mount, shared token family, stuck 'not logged in', subscription death) keep full severity, because a reset never clears those; unlike a lock they may still be joined, auto-picked and idle-gc'd. A pane deprioritized while sharing a lane with NORMAL panes is a MIXED-PRIORITY conflict: the lane is neither rescued nor silenced, and status/sessions/panes/sos tell you to split it out.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
 }
@@ -21369,10 +21408,15 @@ def deprioritize(target: str) -> None:
     GH #238 A. Owner: "a pane that can wait for a window to reset gets excluded
     from swaps ... 2good1a can run out of usage and start back up when that's
     available again, I don't really care." A deprioritized lane is never moved
-    off a wall by the daemon (ladder, hard-cap or reactive-429), never counts
-    as needing a swap target, and its SOS downgrades to INFO — the same path
-    `cus disable` uses for an account. Unlike `cus lock` it does NOT reserve
-    the lane: it may still be joined, auto-picked and idle-gc'd.
+    off a wall by the daemon (ladder, hard-cap or reactive-429; a
+    disabled-account eviction still applies), never counts as needing a swap
+    target, and its USAGE alarm — the lane-at-N%-with-no-target line — is
+    downgraded to INFO, the way `cus disable` downgrades an account's. Alarms
+    about credentials (blanked mount, shared token family, stuck 'not logged
+    in', subscription death) keep their full severity: a reset never clears
+    those, so "can wait for a reset" is not "can wait for a relogin". Unlike
+    `cus lock` it does NOT reserve the lane: it may still be joined,
+    auto-picked and idle-gc'd.
 
     Because the daemon moves SLOTS, a deprioritized pane that shares its lane
     with normal panes is a MIXED-PRIORITY conflict: the lane is neither rescued
@@ -23847,18 +23891,78 @@ def _projects_unhealable(mount: Path) -> bool:
     return _real_dir_collisions(link, target) > 0
 
 
+def _launch_install_plan(account: str, lane: str, slot_dir: Path, state: dict, config: dict) -> dict:
+    """READ-ONLY twin of `_execute_swap_locked`'s install-source selection, for
+    the launch guard and `--dry-run` (GH #238-D, PR #240 second pass).
+
+    Returns {"holds_account", "held_elsewhere", "source": Path|None,
+             "kind": "mount"|"pooled-family"|"legacy-store"|"snapshot"|None,
+             "family": str|None, "pool_exhausted": bool, "snapshot_dead_shape": bool}.
+
+    Mirrors the executor's order: a lane that already HOLDS the account gets no
+    install at all (so the mount's own bytes are what will run); otherwise, if
+    the account is live on another mount, a free pooled family is claimed first
+    (`free_login_family` is the read-only pick — the executor's
+    `claim_verified_login_family` probes and may retire a dead one and pick the
+    next, which is why the family named here is "the one it would try"), then
+    the legacy per-slot store, else the pool is exhausted; if not held
+    elsewhere, `swap_install_source` (legacy store, else the snapshot), and a
+    dead-SHAPED snapshot would be seeded from a free family or refused. Shape
+    only: the executor's refresh-grant probes are writes and are not run."""
+    holds = (state.get("slots", {}).get(lane, {}) or {}).get("account") == account
+    plan = {"holds_account": holds, "held_elsewhere": False, "source": None, "kind": None,
+            "family": None, "pool_exhausted": False, "snapshot_dead_shape": False}
+    if holds:
+        plan.update(source=mount_creds_path(slot_dir), kind="mount")
+        return plan
+    gate = independent_logins_enabled(config)
+    if gate and _account_held_by_other_live_mount(state, account, lane, config):
+        plan["held_elsewhere"] = True
+        fam = free_login_family(account, state, config)
+        if fam:
+            plan.update(source=login_family_creds_path(account, fam), kind="pooled-family", family=fam)
+        elif has_independent_login(account, lane):
+            plan.update(source=login_store_creds_path(account, lane), kind="legacy-store")
+        else:
+            plan["pool_exhausted"] = True
+        return plan
+    snapshot = ACCOUNTS_DIR / f"account-{account}" / ".credentials.json"
+    src, used = swap_install_source(account, lane, snapshot, config)
+    plan.update(source=src, kind="legacy-store" if used else "snapshot")
+    if (not used and gate
+            and _store_creds_dead(snapshot, f"snapshot:{account}", config, allow_probe=False)):
+        plan["snapshot_dead_shape"] = True
+        fam = free_login_family(account, state, config)
+        if fam:
+            plan.update(source=login_family_creds_path(account, fam), kind="pooled-family", family=fam)
+        else:
+            plan.update(source=None, kind=None, pool_exhausted=True)
+    return plan
+
+
 def _dry_run_preflight_checks(lane: str, slot_dir: Path, account: str, state: dict, config: dict) -> None:
     """The explicit-lane pre-flight's refusals, answered WITHOUT writing (GH
-    #238-D `--dry-run`; PR #240 review). Mirrors, in order, what the real
-    launch would refuse on after the point where dry-run returns:
-      1. GH #192 — projects/ that the heal could not bring onto the shared tree.
-      2. GH #190 — the lane already holds this account, so the real launch
-         skips the install and only shape-checks the mount creds; do the same.
-      3. The dead legacy per-slot login store (2026-08-30 guard) — when the
-         install WOULD use that store (lane does not hold the account, gate on,
-         legacy store present), shape/expiry-check it. A refresh-grant probe is
-         a write (it rotates the token), so it is NOT run: a store that is dead
-         only at the grant is caught by the real launch, as the output says.
+    #238-D `--dry-run`; PR #240 review, both passes). What the real launch can
+    refuse on after the point where dry-run returns, and what this does:
+      1. GH #192 projects/ the heal could not bring onto the shared tree —
+         answered by `_projects_unhealable`, a clause-by-clause read-only twin.
+      2. Lane already holds the account (install is a no-op): the #104 bytes
+         check already ran in the guard; a dead-SHAPED mount is a WARNING here,
+         not a refusal — the real launch retires the lease and force-reinstalls
+         from a claimable family, and usually succeeds. It refuses only when
+         no family is claimable, which is said in the warning.
+      3. Otherwise the install runs; from `_launch_install_plan` (read-only
+         twin of the executor's source selection): pool exhausted → refuse;
+         the chosen source blank-SHAPED (#141 install-point gate) → refuse; the
+         chosen source's token family live on another mount (#104,
+         `_live_family_would_collide`, real bytes) → refuse; a legacy store
+         that is the chosen source and dead-SHAPED (2026-08-30 guard) → refuse.
+    NOT covered — a refresh-grant PROBE rotates a token, so it is never run
+    here: a store, mount or snapshot that is well-shaped but dead only at the
+    grant is caught by the real launch; and because the executor's claim probes
+    and may retire a dead family and take the next, the family it lands on can
+    differ from the one checked here. "Shape" means the #141 blank signature /
+    no refresh token — an expired-but-shaped store does NOT refuse.
     Raises click.ClickException with the same remediation text the launch uses."""
     if slot_dir.exists() and _projects_unhealable(slot_dir):
         raise click.ClickException(
@@ -23867,22 +23971,52 @@ def _dry_run_preflight_checks(lane: str, slot_dir: Path, account: str, state: di
             f"be stranded (GH #192). Resolve the collisions under {slot_dir / 'projects'} manually "
             f"(`cus doctor --fix-dirs` to retry), or launch without --lane. [dry-run: read-only check]")
     gate_on = config.get("launch_gate", {}).get("enabled", True)
-    holds_account = (state.get("slots", {}).get(lane, {}) or {}).get("account") == account
-    if holds_account and gate_on and slot_dir.exists() and mount_creds_path(slot_dir).exists():
-        if _slot_mount_creds_dead(lane, slot_dir, account, state, config, allow_probe=False):
-            raise click.ClickException(
-                f"launch gate (GH #190): {lane}'s '{account}' mount credentials are blank/invalid/expired "
-                f"— the session would open logged out and the real launch would refuse the reinstall path "
-                f"if it is refused too. Heal first: `cus slot move {lane} {account}`. [dry-run: shape check "
-                f"only — no refresh-grant probe]")
-    if (not holds_account and independent_logins_enabled(config) and has_independent_login(account, lane)
-            and _store_creds_dead(login_store_creds_path(account, lane), f"legacy:{account}:{lane}",
-                                  config, allow_probe=False)):
+    plan = _launch_install_plan(account, lane, slot_dir, state, config)
+    if plan["holds_account"]:
+        if gate_on and slot_dir.exists() and mount_creds_path(slot_dir).exists() \
+                and _slot_mount_creds_dead(lane, slot_dir, account, state, config, allow_probe=False):
+            # Mirror the executor's verdict, not a stricter one (second pass): the
+            # real launch heals this — retire the lease, force-reinstall from a
+            # claimable family — and refuses only if none is claimable.
+            fam = free_login_family(account, state, config) if independent_logins_enabled(config) else None
+            click.echo(click.style(
+                f"launch --dry-run WARNING: {lane}'s '{account}' mount credentials are blank-shaped "
+                f"(GH #190). The real launch will retire the lane's lease and force-reinstall from a "
+                f"claimable family — "
+                + (f"'{fam}' is free, so that heal would proceed." if fam else
+                   f"NO family is free to claim, so the real launch would REFUSE; `cus login-mount "
+                   f"{account}` first.") + " [dry-run: shape check only — no refresh-grant probe]",
+                fg="yellow"))
+        return
+    if plan["pool_exhausted"]:
         raise click.ClickException(
-            f"refusing to install '{account}' onto lane {lane}: its legacy per-slot login store looks "
-            f"DEAD (blank/invalid/expired shape). Installing it would blank the mount and log the session "
-            f"out (the 2026-08-10 slot-14->03 incident). Provision a fresh family: `cus login-mount "
-            f"{account}`. [dry-run: shape check only — no refresh-grant probe]")
+            f"refusing --lane {lane}: '{account}' would need a distinct login family and none is "
+            f"claimable{' (snapshot dead-shaped, pool empty)' if plan['snapshot_dead_shape'] else ''} — "
+            f"the real launch refuses here (GH #104 pool exhausted). Provision one: `cus login-mount "
+            f"{account}`. [dry-run: read-only check]")
+    try:
+        src_creds = read_json(plan["source"])
+    except (json.JSONDecodeError, OSError):
+        src_creds = None
+    if src_creds is None or _live_mount_creds_invalid(src_creds):
+        raise click.ClickException(
+            f"refusing --lane {lane}: the credentials the launch would install ({plan['kind']}: "
+            f"{plan['source']}) are missing or blank-shaped — installing them would open the session "
+            f"logged out (GH #141 install-point gate). Provision a fresh family (`cus login-mount "
+            f"{account}`) or `cus relogin {account}`. [dry-run: read-only check]")
+    if plan["held_elsewhere"] and _live_family_would_collide(account, plan["source"], lane, state, config):
+        raise click.ClickException(
+            f"refusing --lane {lane}: the credentials the launch would install ({plan['kind']}: "
+            f"{plan['source']}) carry the SAME OAuth refresh-token family already live on another mount "
+            f"of '{account}' (GH #104). Provision a distinct family: `cus login-mount {account}`. "
+            f"[dry-run: real token bytes compared]")
+    if (plan["kind"] == "legacy-store"
+            and _store_creds_dead(plan["source"], f"legacy:{account}:{lane}", config, allow_probe=False)):
+        raise click.ClickException(
+            f"refusing to install '{account}' onto lane {lane}: its legacy per-slot login store — the "
+            f"source the launch would use — is blank-shaped / has no refresh token. Installing it would "
+            f"blank the mount and log the session out (the 2026-08-10 slot-14->03 incident). Provision a "
+            f"fresh family: `cus login-mount {account}`. [dry-run: shape check only — no refresh-grant probe]")
 
 
 def _launch_heal_mount(slot_name: str, mount: Path) -> None:
@@ -24213,6 +24347,12 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
     live_mount_accts = _live_slot_accounts(state)
     if state.get("active") and mount_in_use(CLAUDE_DIR):
         live_mount_accts.add(state["active"])
+    # PR #240 second pass (c): `mount_in_use(CLAUDE_DIR)` reads False with dozens
+    # of live BARE sessions (they set no CLAUDE_CONFIG_DIR — issue #141), so the
+    # shared mount's account escaped this guard. Count it the way the swap-time
+    # clobber guard does: unconditionally in global/hybrid via _shared_mount_holds.
+    if _shared_mount_holds(account, state, config):
+        live_mount_accts.add(account)
     if account in live_mount_accts and not force:
         # Phase 3b (#109) escape hatch: a SECOND live mount on one account is
         # safe only if it uses its OWN independent login family. Allow it when
@@ -24233,7 +24373,7 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # the LEGACY per-(slot, account) store and refused — after the caller
         # had already killed the pane's old claude. Recognise the lease.
         lane_lease = slot_leased_family(state, lane) if lane is not None else None
-        if (not independent_ok and lane is not None and independent_logins_enabled(config)
+        if (lane is not None and independent_logins_enabled(config)
                 and lane_lease is not None and lane_lease[0] == account
                 and (state.get("slots", {}).get(lane, {}) or {}).get("account") == account):
             # The lease string alone proves nothing (PR #240 review, both seats):
@@ -24245,9 +24385,14 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # lane that already holds the account, so nothing downstream would
             # catch it. Prove what the message claims, and REFUSE loudly on
             # either failure rather than fall through to the generic #104 text.
+            # This is a cheap PRE-FILTER only; the decision is the BYTES check
+            # below, which runs whatever this or the legacy store says (second
+            # pass: a legacy store used to short-circuit everything here).
             fam = lane_lease[1]
             others_live = {}
-            for s_other in occupied_slot_accounts(state).get(account, []):
+            # max_age_seconds=0: a credential-safety check must not read a stale
+            # occupancy cache (same convention as _live_family_would_collide).
+            for s_other in occupied_slot_accounts(state, max_age_seconds=0.0).get(account, []):
                 if s_other == lane:
                     continue
                 other = slot_leased_family(state, s_other)
@@ -24274,8 +24419,46 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                     f"`cus login-mount {account}` to mint one.")
             independent_ok = True
             click.echo(f"launch: {lane} holds its own claimed login family for '{account}' ({fam}) — "
-                       f"verified not leased by any other live lane and present on disk, so a 2nd lane "
-                       f"is safe (GH #109/#238-D)")
+                       f"lease verified (not leased by another live lane, store present); the token "
+                       f"bytes are checked next (GH #109/#238-D)")
+        if lane is not None:
+            # THE decision (PR #240 second pass, H1): whether two live mounts
+            # would share a refresh-token family is a property of the BYTES that
+            # will actually run under the lane, never of a lease string or of
+            # `has_independent_login` (the 2026-07-07 chats1a store passed that
+            # and was a stale copy of the shared family). `_launch_install_plan`
+            # is the read-only twin of the executor's source selection — the
+            # mount itself when the lane already holds the account (the install
+            # no-ops, so nothing downstream would look), else the pooled family
+            # / legacy store / snapshot the executor would install — and
+            # `_live_family_would_collide` reads that file's token against every
+            # other live mount of the account, the shared mount included. This
+            # runs UNCONDITIONALLY of `independent_ok`: a legacy store never buys
+            # a pass on a bytes-level collision.
+            plan = _launch_install_plan(account, lane, slot_path(lane), state, config)
+            if plan["pool_exhausted"]:
+                raise click.ClickException(
+                    f"refusing --lane {lane}: '{account}' is live on another mount and has no free "
+                    f"independent login family to claim{' (its snapshot is dead-shaped too)' if plan['snapshot_dead_shape'] else ''} "
+                    f"— a copy would clobber the live one (GH #104). Provision another: "
+                    f"`cus login-mount {account}`, then retry.")
+            if plan["source"] is not None and _live_family_would_collide(account, plan["source"], lane, state, config):
+                raise click.ClickException(
+                    f"refusing --lane {lane}: the credentials that would run under it ({plan['kind']}: "
+                    f"{plan['source']}) carry the SAME OAuth refresh-token family already live on the "
+                    f"shared mount or another lane of '{account}'. Two live mounts on one token family "
+                    f"log one of them out on the next rotation (GH #104 — the 2026-07-07 chats1a "
+                    f"logout). Re-home the lane to claim a distinct family (`cus slot move {lane} "
+                    f"<other-acct>` then `cus slot move {lane} {account}`, dry-run first) or "
+                    f"`cus login-mount {account}` to mint one.")
+            if plan["kind"] in ("pooled-family", "legacy-store") and not independent_ok:
+                # The executor would claim/install a DISTINCT family for this lane
+                # (verified above not to collide), which is the supported GH #109
+                # second-lane path — let it.
+                independent_ok = True
+                click.echo(f"launch: '{account}' is live elsewhere, but {lane} would run on a distinct "
+                           f"family ({plan['kind']}{': ' + plan['family'] if plan['family'] else ''}) — "
+                           f"token bytes verified not shared with any live mount (GH #109/#238-D)")
         if not independent_ok:
             # Issue #219 / PR #220 dual review: when lane_sharing is ON and the
             # account's ONLY live lane(s) are LOCKED, the auto-join above skipped
@@ -24550,7 +24733,7 @@ def _prefer_as_oom_victim() -> None:
               help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
 @click.option("--force", is_flag=True, help="Launch even onto an account already live on another mount (GH #104: normally refused — two live mounts on one account sign one out).")
 @click.option("--lane", default=None, help="Launch into a specific slot (e.g. slot-8) instead of auto-picking. With independent_logins on and the lane holding its OWN login family for the account — provisioned by `cus login-mount <lane> <account>`, or already claimed for it by `cus slot move <lane> <account>` (GH #238-D) — this is how you give one account a 2nd independently-swappable lane (GH #109).")
-@click.option("--dry-run", "dry_run", is_flag=True, help="Pre-flight only (GH #238-D): run every refusal check that can be answered without writing (#104 incl. leased-family verification, lock, lane/account mismatch, subscription, GH #192 projects/, GH #190 mount creds shape, dead legacy store shape) and print the slot/account the launch would use. Writes NOTHING: no poll (auto picks from cached readings), no scaffold, reservation, heal, sync, install or state entry. Not covered: a refresh-grant probe. Run this BEFORE killing a pane's old claude when splitting it into its own lane.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="Pre-flight only (GH #238-D): run every refusal check that can be answered without writing — #104 on REAL token bytes (the family that would run under the lane vs every live mount, shared mount included), lock, lane/account mismatch, subscription, GH #192 projects/, pool exhaustion, the #141 blank-source gate, dead legacy store shape — and print the slot/account the launch would use. Writes NOTHING: no poll (auto picks from cached readings), no scaffold, reservation, heal, sync, install or state entry. Not covered: a refresh-grant probe (a store/mount/snapshot dead only at the grant), and the executor may claim a different family than the one checked if its probe retires one. Run this BEFORE killing a pane's old claude when splitting it into its own lane.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | None, claude_args: tuple[str, ...], dry_run: bool = False) -> None:
     """Launch claude in its own slot, pinned to an account (per_session).
