@@ -661,6 +661,178 @@ def test_me_output_leads_with_the_verdict_line():
     assert "HEADROOM (a, measured)" in text and "new tokens" in text
 
 
+# ==========================================================================
+# Per-model WEEKLY axis (GH #236, folded into PR #232 on 2026-09-18).
+# Live hazard that prompted it: a pane ~72% fable-5-1 on an account with
+# per_model_weekly_pct.Fable = 100 was told "ROOM TO SPEND — 88% of 5h left",
+# and Fable-exhausted accounts were listed as "100% left" destinations.
+# ==========================================================================
+
+def test_model_id_to_state_key_mapping():
+    keys = ["Fable", "Sonnet", "Opus"]
+    assert cus.model_weekly_key("claude-fable-5-1", keys) == "Fable"
+    assert cus.model_weekly_key("claude-opus-5[1m]", keys) == "Opus"      # [1m] suffix stripped
+    assert cus.model_weekly_key("claude-sonnet-5", keys) == "Sonnet"
+    assert cus.model_weekly_key("CLAUDE-FABLE-5-1", ["fable"]) == "fable"  # case-insensitive
+    # no key for this family on the account => axis does not apply; never borrow
+    assert cus.model_weekly_key("claude-opus-5", ["Fable"]) is None
+    # whole TOKENS only: a key must not match inside another word
+    assert cus.model_weekly_key("claude-fabled-1", ["Fable"]) is None
+    assert cus.model_weekly_key("claude-unfable-1", ["Fable"]) is None
+    for bad in (None, "", "unknown"):
+        assert cus.model_weekly_key(bad, keys) is None
+    assert cus.model_weekly_key("claude-fable-5-1", []) is None
+
+
+def test_dominant_model_is_by_new_tokens_not_cache_inclusive_total():
+    by_model = {"claude-opus-5": {"total": 50_000_000, "cache_read": 49_990_000},   # 10k new
+                "claude-fable-5-1": {"total": 800_000, "cache_read": 100_000}}      # 700k new
+    assert cus.dominant_model_key(by_model, ["Fable"]) == ("Fable", "claude-fable-5-1")
+    assert cus.dominant_model_key({}, ["Fable"]) == (None, None)                    # unknown
+    assert cus.dominant_model_key({"claude-opus-5": {"total": 5, "cache_read": 0}},
+                                  ["Fable"]) == (None, "claude-opus-5")             # no such axis
+
+
+def _pm_state(fable, *, observed_minutes_ago=2, p5=12.0, p7=61.0):
+    return {"slots": STATE["slots"], "accounts": {"rayi5": {
+        "current_5h_pct": p5, "current_7d_pct": p7,
+        "five_hour_resets_at": iso(NOW + timedelta(hours=3)),
+        "seven_day_resets_at": iso(NOW + timedelta(days=4)),
+        "last_observed_ts": iso(NOW - timedelta(minutes=observed_minutes_ago)),
+        "per_model_weekly_pct": {"Fable": fable}}}}
+
+
+def _pane_on(monkeypatch, tmp_path, sid, lines, state, pane_state="working"):
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, sid, lines)
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": pane_state},
+                               _reg(sid), state, CONFIG, WINDOW_START, NOW)
+    head = cus.account_headroom(state["accounts"]["rayi5"], NOW)
+    return row, head
+
+
+FABLE_HEAVY = [usage_line(NOW - timedelta(minutes=5), "claude-fable-5-1", "f", inp=7200, out=0),
+               usage_line(NOW - timedelta(minutes=4), "claude-opus-5", "o", inp=2800, out=0)]
+OPUS_HEAVY = [usage_line(NOW - timedelta(minutes=5), "claude-opus-5", "o", inp=7200, out=0),
+              usage_line(NOW - timedelta(minutes=4), "claude-fable-5-1", "f", inp=2800, out=0)]
+
+
+def test_fable_pane_on_a_fable_exhausted_account_reads_do_not_spend(monkeypatch, tmp_path):
+    """THE regression: 5h 12% / 7d 61% looked like room; Fable weekly is 100%."""
+    row, head = _pane_on(monkeypatch, tmp_path, "s-fable", FABLE_HEAVY, _pm_state(100.0))
+    assert row["dominant_model_key"] == "Fable"
+    assert row["wall_active"] is True and row["wall_evidence"] == ["account_model_exhausted"]
+    v = cus.me_verdict(row, head)
+    assert v["level"] == "stop" and v["headline"] == "DO NOT SPEND"
+    text = cus.render_me(_payload([row], {"rayi5": head}), row)
+    assert text.splitlines()[0].startswith("VERDICT: DO NOT SPEND")
+    assert "ROOM TO SPEND" not in text
+    assert "Fable 100% used" in text and "this pane's model" in text
+    # account-level evidence only: must not claim the PANE was refused
+    assert "this pane is rate-limited" not in text
+
+
+def test_opus_pane_on_the_same_account_is_not_walled_by_the_fable_axis(monkeypatch, tmp_path):
+    row, head = _pane_on(monkeypatch, tmp_path, "s-opus", OPUS_HEAVY, _pm_state(100.0))
+    assert row["dominant_model"] == "claude-opus-5" and row["dominant_model_key"] is None
+    assert row["wall_active"] is False and "account_model_exhausted" not in row["wall_evidence"]
+    assert cus.me_verdict(row, head)["level"] == "room"
+    # ...but it DOES use some fable, and a fan-out would hit that: say so, as a note.
+    text = cus.render_me(_payload([row], {"rayi5": head}), row)
+    assert "NOTE: Fable weekly is 100% used" in text
+
+
+def test_model_axis_reuses_the_75_90_thresholds_and_names_the_binding_axis(monkeypatch, tmp_path):
+    for fable, level in ((74.0, "room"), (75.0, "tight"), (89.0, "tight"), (90.0, "stop")):
+        row, head = _pane_on(monkeypatch, tmp_path / str(fable), f"s{fable}", FABLE_HEAVY,
+                             _pm_state(fable))
+        v = cus.me_verdict(row, head)
+        assert v["level"] == level, fable
+        if level != "room":
+            assert v["binding_axis"] == "Fable_weekly" and "Fable weekly" in v["reason"]
+    # when 5h is the hotter axis, THAT is named instead
+    row, head = _pane_on(monkeypatch, tmp_path / "x", "sx", FABLE_HEAVY, _pm_state(80.0, p5=95.0))
+    v = cus.me_verdict(row, head)
+    assert v["level"] == "stop" and v["binding_axis"] == "5h"
+
+
+def test_unknown_per_model_reading_is_never_green(monkeypatch, tmp_path):
+    # stale + LOW: unknown, not room
+    row, head = _pane_on(monkeypatch, tmp_path / "a", "sa", FABLE_HEAVY,
+                         _pm_state(10.0, observed_minutes_ago=9 * 60))
+    assert head["per_model_weekly_stale"] is True
+    assert cus.me_verdict(row, head)["level"] == "unknown"
+    # stale + HIGH: blocks until reconfirmed (placement precedent), and says it is stale
+    row, head = _pane_on(monkeypatch, tmp_path / "b", "sb", FABLE_HEAVY,
+                         _pm_state(100.0, observed_minutes_ago=9 * 60))
+    v = cus.me_verdict(row, head)
+    assert v["level"] == "stop" and "stale" in v["reason"]
+    assert any("LAST-KNOWN" in n for n in row["wall_notes"])
+    # fresh reading, hot model axis, but the pane has NO window spend => model unknown
+    idle = [usage_line(NOW - timedelta(hours=3), "claude-fable-5-1", "old", inp=5, out=0)]
+    row, head = _pane_on(monkeypatch, tmp_path / "c", "sc", idle, _pm_state(100.0))
+    assert row["dominant_model"] is None
+    v = cus.me_verdict(row, head)
+    assert v["level"] == "unknown" and "ROOM" not in v["headline"]
+    # unmeasured pane, same account: also never green
+    un = _unmeasured_row("%3", "rayi5")
+    assert cus.me_verdict(un, head)["level"] == "unknown"
+
+
+def test_rehome_discounted_429_is_backed_up_by_the_model_axis(monkeypatch, tmp_path):
+    """A per-model rejection seen before the slot moved is discounted; if the
+    NEW account is also Fable-exhausted the row must still be walled."""
+    lines = [wall_line(NOW - timedelta(minutes=40), NOW + timedelta(days=2), kind="seven_day_fable")] + FABLE_HEAVY
+    moved = dict(_pm_state(100.0), swap_history=[
+        {"slot": "slot-7", "from": "rayi9", "to": "rayi5", "ts": iso(NOW - timedelta(minutes=35))}])
+    row, _ = _pane_on(monkeypatch, tmp_path, "s-moved", lines, moved)
+    assert row["wall_429_discounted"]
+    assert row["wall_active"] is True and row["wall_evidence"] == ["account_model_exhausted"]
+
+
+def test_header_marks_a_model_exhausted_account_as_not_a_destination():
+    accounts = {
+        "idle-full": dict(cus.account_headroom(_pm_state(100.0, p5=0.0, p7=30.0)["accounts"]["rayi5"], NOW),
+                          live_panes=0),
+        "idle-ok": dict(cus.account_headroom(_pm_state(28.0, p5=0.0, p7=30.0)["accounts"]["rayi5"], NOW),
+                        live_panes=0),
+        "stale-full": dict(cus.account_headroom(
+            _pm_state(100.0, observed_minutes_ago=600)["accounts"]["rayi5"], NOW), live_panes=0),
+        "stale-low": dict(cus.account_headroom(
+            _pm_state(5.0, observed_minutes_ago=600)["accounts"]["rayi5"], NOW), live_panes=0)}
+    p = {"generated_at": iso(NOW), "window_minutes": 30, "window_start": iso(WINDOW_START),
+         "panes": [], "accounts": accounts}
+    lines = {ln.split()[1]: ln for ln in cus.render_panes_table(p).splitlines() if ln.startswith("== ")}
+    # the hazard: "5h 0% used, 100% left" with no marker
+    assert "100% left" in lines["idle-full"]
+    assert "Fable wk 100% ✗ NOT a destination for Fable panes" in lines["idle-full"]
+    assert "Fable wk 28%" in lines["idle-ok"] and "✗" not in lines["idle-ok"]
+    assert "Fable wk 100%~ ✗" in lines["stale-full"]            # stale-high still warns, marked ~
+    assert "Fable wk ?" in lines["stale-low"] and "5%" not in lines["stale-low"]
+
+
+def test_per_model_weekly_is_in_the_json_payload():
+    h = cus.account_headroom(_pm_state(100.0)["accounts"]["rayi5"], NOW)
+    assert h["per_model_weekly_pct"] == {"Fable": 100.0} and h["per_model_weekly_stale"] is False
+    none = cus.account_headroom(None, NOW)
+    assert none["per_model_weekly_pct"] == {} and none["per_model_weekly_stale"] is True
+    json.dumps(h)                                              # serialisable as shipped
+
+
+def test_exhausted_account_with_no_recorded_reset_says_so(monkeypatch, tmp_path):
+    """100% with NO reset timestamp fires (safe direction) — but explicitly."""
+    st = {"slots": STATE["slots"], "accounts": {"rayi5": {
+        "current_5h_pct": 100.0, "current_7d_pct": 10.0}}}     # no five_hour_resets_at
+    claude = _fake_env(monkeypatch, tmp_path)
+    _write_session(claude, "s-noreset", OPUS_HEAVY)
+    row = cus.collect_pane_row({"pane": "%9", "session": "d", "state": "idle"},
+                               _reg("s-noreset"), st, CONFIG, WINDOW_START, NOW)
+    assert row["wall_active"] is True and row["wall_evidence"] == ["account_5h_exhausted"]
+    assert any("no reset time recorded" in n for n in row["wall_notes"])
+    assert cus._wall_text(row, NOW) == "WALL five_hour ↻?"
+    assert "no reset time recorded" in cus.render_me(_payload([row]), row)
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

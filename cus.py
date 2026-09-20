@@ -18427,6 +18427,45 @@ def _panes_between(text: str, open_tag: str, close_tag: str) -> str | None:
     return text[i + len(open_tag):j].strip() or None
 
 
+def model_weekly_key(model_id: str | None, keys) -> str | None:
+    """Map a transcript model id to a `per_model_weekly_pct` key, or None.
+
+    UNDOCUMENTED-SURFACE ASSUMPTION (verified 2026-09-18, Claude Code 2.1.x):
+    state keys are the usage API's `scope.model.display_name` — a bare family
+    word ("Fable"; legacy "Sonnet"/"Opus", see _parse_per_model_weekly) —
+    while transcripts carry API model ids ("claude-fable-5-1",
+    "claude-opus-5[1m]"). The family word appears in the id as a whole
+    hyphen-separated token, so we match on TOKENS, case-insensitively, against
+    the keys the account ACTUALLY has. Deliberately not a hardcoded table (a
+    new family needs no code change) and deliberately not a substring match
+    (a key must never match inside some other word). No match => None: that
+    model has no model-scoped weekly limit on this account, so the axis does
+    not apply — it must not borrow another model's number.
+    """
+    if not model_id or not keys:
+        return None
+    tokens = set(str(model_id).lower().split("[", 1)[0].replace("_", "-").split("-"))
+    for k in keys:
+        if str(k).lower() in tokens:
+            return k
+    return None
+
+
+def dominant_model_key(by_model: dict | None, keys) -> tuple[str | None, str | None]:
+    """(state_key, model_id) for the model carrying the most NEW tokens in the
+    window. A pane whose window spend is mostly fable-5-1 is a Fable pane.
+    (None, None) when the window holds no spend — unknown, not "no model".
+    (None, model_id) when the dominant model has no model-scoped key."""
+    best, best_new = None, 0
+    for m, c in (by_model or {}).items():
+        new = int(c.get("total", 0)) - int(c.get("cache_read", 0))
+        if new > best_new:
+            best, best_new = m, new
+    if best is None:
+        return None, None
+    return model_weekly_key(best, keys), best
+
+
 def account_headroom(acct: dict | None, now: "datetime",
                      stale_seconds: int = PANES_ACCOUNT_STALE_SECONDS) -> dict:
     """Per-ACCOUNT 5h/7d headroom from state.json — or `unknown`.
@@ -18439,9 +18478,20 @@ def account_headroom(acct: dict | None, now: "datetime",
     out = {"known": False, "reason": "no account record", "five_hour_pct": None,
            "seven_day_pct": None, "headroom_5h_pct": None, "headroom_7d_pct": None,
            "five_hour_resets_at": None, "seven_day_resets_at": None,
-           "last_observed_ts": None, "age_seconds": None}
+           "last_observed_ts": None, "age_seconds": None,
+           # Per-model WEEKLY axis (e.g. {"Fable": 100.0}). LAST-KNOWN values:
+           # always shipped, with `per_model_weekly_stale` saying whether they
+           # are a current reading. An account at 5h 0% / Fable 100% used to
+           # render as "100% left" with no marker — a wrong destination for a
+           # Fable lane and a wrong ROOM for a Fable pane (PR #232 re-review,
+           # 2026-09-18). No per-model reset time is persisted by the daemon.
+           "per_model_weekly_pct": {}, "per_model_weekly_stale": True}
     if not acct:
         return out
+    pm = acct.get("per_model_weekly_pct")
+    if isinstance(pm, dict):
+        out["per_model_weekly_pct"] = {str(k): float(v) for k, v in pm.items()
+                                       if isinstance(v, (int, float))}
     observed = acct.get("last_observed_ts")
     out["last_observed_ts"] = observed
     out["five_hour_resets_at"] = acct.get("five_hour_resets_at")
@@ -18460,6 +18510,7 @@ def account_headroom(acct: dict | None, now: "datetime",
     if not isinstance(p5, (int, float)) or not isinstance(p7, (int, float)):
         out["reason"] = "no percentage recorded"
         return out
+    out["per_model_weekly_stale"] = False
     out.update({"known": True, "reason": None, "five_hour_pct": float(p5),
                 "seven_day_pct": float(p7),
                 "headroom_5h_pct": round(max(0.0, 100.0 - float(p5)), 1),
@@ -18763,9 +18814,13 @@ def collect_pane_row(pane_row: dict, registry: dict, state: dict, config: dict,
         # EVERY return path gets a wall verdict: a pane whose transcript we
         # cannot read can still be sitting at the limit menu, or on an
         # exhausted account, and must not render as clear.
-        r.update(assess_wall(r.get("wall"), r.get("state"),
-                             state.get("accounts", {}).get(account) if account else None,
-                             slot, state, now))
+        acct_rec = state.get("accounts", {}).get(account) if account else None
+        pm_keys = list((acct_rec or {}).get("per_model_weekly_pct") or {})
+        key, model_id = dominant_model_key((r.get("tokens_window") or {}).get("by_model"), pm_keys)
+        r["dominant_model"] = model_id          # None = no window spend: unknown
+        r["dominant_model_key"] = key           # key into accounts[].per_model_weekly_pct
+        r.update(assess_wall(r.get("wall"), r.get("state"), acct_rec,
+                             slot, state, now, model_key=key))
         return r
 
     if not reg:
@@ -18969,25 +19024,63 @@ def me_verdict(row: dict, headroom: dict) -> dict:
     """
     if row.get("wall_active"):
         why = ", ".join(row.get("wall_evidence") or []) or "429"
-        return {"level": "stop", "headline": "DO NOT SPEND",
-                "reason": f"this pane is walled ({why})"}
+        # Carry assess_wall's caveats into the verdict itself: a wall attested
+        # only by a LAST-KNOWN per-model reading, or by a 100% with no recorded
+        # reset, is still a stop (safe direction) but the reader must be able
+        # to see it is unconfirmed without reading the rest of --me.
+        notes = "; ".join(row.get("wall_notes") or [])
+        return {"level": "stop", "headline": "DO NOT SPEND", "binding_axis": "wall",
+                "reason": f"this pane is walled ({why})" + (f" — {notes}" if notes else "")}
+
+    # Per-model WEEKLY axis for THIS pane's dominant model (owner rule,
+    # 2026-09-18: an account maxed on ANY axis — 5h, 7d, or the per-model weekly
+    # for lanes using that model — is not a valid place to spend). Checked
+    # BEFORE the unknown-reading exit: a stale-HIGH per-model number still
+    # blocks (placement precedent, 2026-07-14), a stale-LOW one is just unknown.
+    pm = headroom.get("per_model_weekly_pct") or {}
+    stale = bool(headroom.get("per_model_weekly_stale", True))
+    key = row.get("dominant_model_key")
+    model_pct = pm.get(key) if key else None
+    tag = " (last-known, stale)" if stale else ""
+    if isinstance(model_pct, (int, float)) and model_pct >= PANES_ME_STOP_USED_PCT:
+        return {"level": "stop", "headline": "DO NOT SPEND", "binding_axis": f"{key}_weekly",
+                "reason": f"{key} weekly allowance {model_pct:.0f}% used{tag} on this account — "
+                          f"binding axis; this pane runs mostly {_short_model(row.get('dominant_model'))}"}
+
     if not headroom.get("known"):
-        # Worded so a caller grepping the verdict line for "ROOM" cannot match
-        # it ("HEADROOM" would).
         return {"level": "unknown", "headline": "CAUTION — ACCOUNT READING UNKNOWN",
+                "binding_axis": None,
                 "reason": f"{headroom.get('reason') or 'no reading'}; do not assume room, "
                           f"check `cus status` first"}
+
+    # Which model this pane spends on is unknown (no window spend / unmeasured)
+    # while SOME model axis on the account is hot: cannot be green.
+    hot = {k: v for k, v in pm.items() if v >= PANES_ME_TIGHT_USED_PCT}
+    if hot and row.get("dominant_model") is None:
+        worst = max(hot, key=hot.get)
+        return {"level": "unknown", "headline": "CAUTION — MODEL AXIS HOT, PANE MODEL UNKNOWN",
+                "binding_axis": f"{worst}_weekly",
+                "reason": f"{worst} weekly {hot[worst]:.0f}% used on this account and no window "
+                          f"spend shows which model this pane uses — do not spend on {worst}"}
+
     p5, p7 = headroom["five_hour_pct"], headroom["seven_day_pct"]
-    used, which = (p5, "5h") if p5 >= p7 else (p7, "7d")
+    axes = [("5h", p5), ("7d", p7)]
+    if isinstance(model_pct, (int, float)):
+        axes.append((f"{key} weekly", model_pct))
+    which, used = max(axes, key=lambda kv: kv[1])
     left = 100.0 - used
+    axis_id = which.replace(" ", "_")
     if used >= PANES_ME_STOP_USED_PCT:
-        return {"level": "stop", "headline": "DO NOT SPEND",
-                "reason": f"account {which} window {used:.0f}% used, {left:.0f}% left"}
+        return {"level": "stop", "headline": "DO NOT SPEND", "binding_axis": axis_id,
+                "reason": f"account {which} {used:.0f}% used, {left:.0f}% left — binding axis"}
     if used >= PANES_ME_TIGHT_USED_PCT:
         return {"level": "tight", "headline": "TIGHT — one small batch at most",
-                "reason": f"account {which} window {used:.0f}% used, {left:.0f}% left"}
-    return {"level": "room", "headline": "ROOM TO SPEND",
-            "reason": f"{100 - p5:.0f}% of 5h and {100 - p7:.0f}% of 7d left"}
+                "binding_axis": axis_id,
+                "reason": f"account {which} {used:.0f}% used, {left:.0f}% left — binding axis"}
+    reason = f"{100 - p5:.0f}% of 5h and {100 - p7:.0f}% of 7d left"
+    if isinstance(model_pct, (int, float)):
+        reason += f", {100 - model_pct:.0f}% of {key} weekly left"
+    return {"level": "room", "headline": "ROOM TO SPEND", "binding_axis": None, "reason": reason}
 
 
 def _fmt_tokens(n: int) -> str:
@@ -19039,8 +19132,9 @@ def _slot_rehomed_since(state: dict, slot: str | None, since: "datetime | None")
 
 
 def assess_wall(wall: dict | None, pane_state: str | None, acct: dict | None,
-                slot: str | None, state: dict, now: "datetime") -> dict:
-    """Row-level wall verdict from THREE independent signals; ANY one is enough.
+                slot: str | None, state: dict, now: "datetime",
+                model_key: str | None = None) -> dict:
+    """Row-level wall verdict from independent signals; ANY one is enough.
 
       transcript_429        a 429 in the transcript, reset still ahead, and the
                             slot has not changed account since it was seen
@@ -19048,6 +19142,19 @@ def assess_wall(wall: dict | None, pane_state: str | None, acct: dict | None,
                             Claude Code's limit menu right now
       account_5h_exhausted  state.json has the pane's account at >=100% of its
       account_7d_exhausted  5h / 7d window with the reset still ahead
+      account_model_exhausted  the account's per-model WEEKLY allowance is at
+                            >=100% for THIS pane's dominant model (`model_key`).
+                            Only that model's axis: an Opus pane on a
+                            Fable-exhausted account is not walled by Fable.
+                            Without this, a re-home-discounted 429 that was a
+                            per-model rejection had NO backup signal, because
+                            the account signals only read 5h/7d.
+
+    `wall_notes` makes the over-reporting EXPLICIT instead of silent: a 100%
+    reading with NO recorded reset fires (safe direction — nothing proves it
+    cleared) and would otherwise be a permanent, unexplained WALL; and the
+    per-model axis has no persisted reset at all and may be a last-known value
+    (placement precedent, 2026-07-14: stale-high blocks until reconfirmed).
 
     WHY three: the first cut trusted the transcript alone, gated on a 1h age
     cutoff, and on 2026-09-18 rendered a pane that was AT the limit menu, on
@@ -19060,6 +19167,7 @@ def assess_wall(wall: dict | None, pane_state: str | None, acct: dict | None,
     true however old the reading is. The reset time is the gate.
     """
     evidence: list[str] = []
+    notes: list[str] = []
     resets_candidates: list["datetime"] = []
     kind = None
     rehomed = False
@@ -19089,6 +19197,19 @@ def assess_wall(wall: dict | None, pane_state: str | None, acct: dict | None,
             kind = kind or label
             if resets is not None:
                 resets_candidates.append(resets)
+            else:
+                notes.append(f"{tag}: no reset time recorded — treated as walled until a "
+                             f"fresh reading clears it")
+        pm = acct.get("per_model_weekly_pct")
+        pct = pm.get(model_key) if isinstance(pm, dict) and model_key else None
+        if isinstance(pct, (int, float)) and pct >= 100:
+            evidence.append("account_model_exhausted")
+            kind = kind or f"{model_key}_weekly"
+            t0 = _panes_parse_ts(acct.get("last_observed_ts"))
+            stale = t0 is None or (now - t0).total_seconds() > PANES_ACCOUNT_STALE_SECONDS
+            notes.append(f"account_model_exhausted: {model_key} weekly {pct:.0f}% — no per-model "
+                         f"reset time is recorded"
+                         + ("; LAST-KNOWN reading (stale), blocks until reconfirmed" if stale else ""))
 
     future = [r for r in resets_candidates if r is not None and r > now]
     return {
@@ -19098,6 +19219,7 @@ def assess_wall(wall: dict | None, pane_state: str | None, acct: dict | None,
         # Latest reset among the attesting signals: the pane is clear only
         # once ALL of them have reset.
         "wall_resets_at": _panes_iso(max(future)) if future else None,
+        "wall_notes": notes,
         "wall_429_discounted": "slot changed account after the 429" if rehomed else None,
     }
 
@@ -19120,7 +19242,9 @@ def _wall_text(row: dict, now: "datetime") -> str:
         if resets and resets > now:
             mins = int((resets - now).total_seconds() // 60)
             return f"WALL {label} ↻{mins // 60}h{mins % 60:02d}m"
-        return f"WALL {label}"
+        # No reset known (limit menu only, a per-model axis, or a 100% reading
+        # with no recorded reset): say so rather than implying it is imminent.
+        return f"WALL {label} ↻?"
     w = row.get("wall")
     if not w:
         return "-"
@@ -19155,6 +19279,18 @@ def _account_header(name, h: dict | None, now: "datetime") -> str:
                 f"{_fmt_reset(h.get('seven_day_resets_at'), now)}")
     else:
         body = f"headroom UNKNOWN — {h.get('reason') or 'no reading'}"
+    # Per-model weekly axis. >= the stop threshold => this account is NOT a
+    # destination for panes of that model, and the header says so. A stale
+    # reading keeps the repo's trailing "~"; stale-HIGH still warns (placement
+    # precedent), stale-low prints "?" rather than a number that looks like room.
+    stale = bool(h.get("per_model_weekly_stale", True))
+    for k, v in sorted((h.get("per_model_weekly_pct") or {}).items()):
+        if v >= PANES_ME_STOP_USED_PCT:
+            body += f" · {k} wk {v:.0f}%{'~' if stale else ''} ✗ NOT a destination for {k} panes"
+        elif stale:
+            body += f" · {k} wk ?"
+        else:
+            body += f" · {k} wk {v:.0f}%"
     tags = ""
     if h.get("disabled"):
         tags += "  [DISABLED]"
@@ -19235,8 +19371,11 @@ def render_panes_table(payload: dict) -> str:
     out.append("  Spend is credited to the slot's CURRENT account, even if it moved mid-window.")
     out.append("  '-' = unmeasured (not zero) and excluded from the shares; '~' = approximate,")
     out.append("  a pane on that account hit the transcript size cap so its total is a floor.")
-    out.append("WALL = any of: a live 429 in the transcript, the pane at the limit menu, or its")
-    out.append("  account measured at 100% with the reset still ahead.")
+    out.append("WALL = any of: a live 429 in the transcript, the pane at the limit menu, its account")
+    out.append("  at 100% of 5h/7d with the reset still ahead, or its account's per-model WEEKLY")
+    out.append("  allowance at 100% for the model this pane mostly uses. '↻?' = no reset time known.")
+    out.append("'<Model> wk N%' on a header is that account's per-model weekly allowance; '✗' marks an")
+    out.append("  account that is NOT a valid destination for panes of that model, whatever its 5h says.")
     return "\n".join(out)
 
 
@@ -19301,8 +19440,17 @@ def render_me(payload: dict, row: dict) -> str:
         lines.append("NOTE: transcript tail hit the size cap — token totals are a FLOOR.")
     if row.get("wall_active", _wall_active(row.get("wall"), now)):
         why = ", ".join(row.get("wall_evidence") or ["transcript_429"])
-        lines.append(f"{_wall_text(row, now)} — this pane is rate-limited; do NOT fan out here. "
+        # Say what is KNOWN. Only a 429 or the limit menu shows the PANE being
+        # refused; an account-level signal means the allowance reads exhausted,
+        # which is a reason not to spend but not proof of a rejection (seen
+        # 2026-09-18: a pane still served on Fable at a 100% weekly reading).
+        ev = set(row.get("wall_evidence") or ["transcript_429"])
+        what = ("this pane is rate-limited" if ev & {"transcript_429", "pane_limit_menu"}
+                else "this pane's account reads exhausted on that axis")
+        lines.append(f"{_wall_text(row, now)} — {what}; do NOT fan out here. "
                      f"(attested by: {why})")
+        for n in row.get("wall_notes") or []:
+            lines.append(f"  note: {n}")
     elif row.get("wall"):
         note = f"; {row['wall_429_discounted']}" if row.get("wall_429_discounted") else ""
         lines.append(f"Last 429 on this pane: {_wall_text(row, now)} (not current{note}).")
@@ -19317,6 +19465,21 @@ def render_me(payload: dict, row: dict) -> str:
     else:
         lines.append(f"HEADROOM ({row.get('account') or '?'}): UNKNOWN — {h['reason']}. "
                      f"Do not treat this as free capacity; check `cus status` before fanning out.")
+    pm = h.get("per_model_weekly_pct") or {}
+    if pm:
+        st = "~ (last-known, stale)" if h.get("per_model_weekly_stale", True) else ""
+        dom = row.get("dominant_model_key")
+        lines.append("PER-MODEL WEEKLY: " + ", ".join(
+            f"{k} {v:.0f}% used{st}" + (" ← this pane's model" if k == dom else "")
+            for k, v in sorted(pm.items())))
+        # A non-dominant model this pane ALSO uses (e.g. fable subagents under
+        # an opus parent) being exhausted is not a verdict, but it is exactly
+        # what a fan-out would hit.
+        for m in row["tokens_window"]["by_model"]:
+            k = model_weekly_key(m, pm)
+            if k and k != dom and pm[k] >= PANES_ME_STOP_USED_PCT:
+                lines.append(f"NOTE: {k} weekly is {pm[k]:.0f}% used on this account — "
+                             f"{_short_model(m)} requests/subagents from this pane will hit that wall.")
     share = row["attribution"]["pane_pct_of_account_window"]
     if share is not None:
         approx = "~" if row["attribution"].get("approximate") else ""
@@ -19343,10 +19506,13 @@ def panes_cmd(as_json: bool, window: str, me: bool) -> None:
     credentials. (The pane reader it runs keeps its own small fingerprint
     cache under ~/.cache/pane_state/ — that is the only write, and not cus's.)
 
-    WALL is reported when ANY of three signals attests it: a 429 in the
-    transcript whose reset is still ahead (scanned back 5h regardless of
-    --window), the pane sitting at the limit menu, or the pane's account
-    measured at 100% with its reset still ahead. It over-reports on purpose.
+    WALL is reported when ANY signal attests it: a 429 in the transcript whose
+    reset is still ahead (scanned back 5h regardless of --window), the pane
+    sitting at the limit menu, the pane's account at 100% of 5h/7d with the
+    reset still ahead, or the account's per-model WEEKLY allowance (e.g.
+    Fable) at 100% for the model this pane mostly uses. It over-reports on
+    purpose. An account maxed on ANY axis is not a place to spend or to move
+    a lane of that model: headers mark it, and --me will not say ROOM.
 
     The table is GROUPED BY ACCOUNT (hottest first; accounts with no live pane
     are listed too, as move destinations) with each account's measured
