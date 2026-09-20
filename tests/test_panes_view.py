@@ -739,7 +739,8 @@ def test_opus_pane_on_the_same_account_is_not_walled_by_the_fable_axis(monkeypat
     assert cus.me_verdict(row, head)["level"] == "room"
     # ...but it DOES use some fable, and a fan-out would hit that: say so, as a note.
     text = cus.render_me(_payload([row], {"rayi5": head}), row)
-    assert "NOTE: Fable weekly is 100% used" in text
+    assert "NOTE: this account's Fable weekly is 100% used" in text
+    assert "already used it in the window" in text
 
 
 def test_model_axis_reuses_the_75_90_thresholds_and_names_the_binding_axis(monkeypatch, tmp_path):
@@ -831,6 +832,78 @@ def test_exhausted_account_with_no_recorded_reset_says_so(monkeypatch, tmp_path)
     assert any("no reset time recorded" in n for n in row["wall_notes"])
     assert cus._wall_text(row, NOW) == "WALL five_hour ↻?"
     assert "no reset time recorded" in cus.render_me(_payload([row]), row)
+
+
+# ==========================================================================
+# Review disposition on aedf627 (2026-09-20): three MEDIUMs of one shape —
+# "the caveat exists in the data but never reaches the reader".
+# ==========================================================================
+
+def test_mixed_wall_flags_a_partial_horizon_and_the_table_prints_the_note(monkeypatch, tmp_path):
+    """Opus seat: a 429 that lifts in 2h masked an open-ended Fable weekly.
+    `wall_resets_at` is max() over the signals that HAVE a reset; the per-model
+    axis has none, so the 2h is a floor — and the table must say so."""
+    lines = [wall_line(NOW - timedelta(minutes=10), NOW + timedelta(hours=2))] + FABLE_HEAVY
+    row, head = _pane_on(monkeypatch, tmp_path, "s-mixed", lines, _pm_state(100.0))
+    assert set(row["wall_evidence"]) == {"transcript_429", "account_model_exhausted"}
+    assert row["wall_reset_partial"] is True
+    assert row["wall_open_ended"] == ["account_model_exhausted"]
+    assert cus._wall_text(row, NOW).endswith("+?")
+    assert any("PARTIAL" in n for n in row["wall_notes"])
+    text = cus.render_panes_table(_payload([row], {"rayi5": head}))
+    assert "└─ wall note:" in text and "PARTIAL" in text
+    assert "'↻2h00m+?'" in text                             # the legend explains the marker
+    # a 429 alone: not partial, no '+?'
+    row1, _ = _pane_on(monkeypatch, tmp_path / "one", "s-one", lines, _pm_state(10.0))
+    assert row1["wall_reset_partial"] is False and not cus._wall_text(row1, NOW).endswith("+?")
+    # a per-model wall alone: nothing to be partial against; renders '↻?'
+    row2, _ = _pane_on(monkeypatch, tmp_path / "two", "s-two", FABLE_HEAVY, _pm_state(100.0))
+    assert row2["wall_reset_partial"] is False and cus._wall_text(row2, NOW).endswith("↻?")
+
+
+def test_me_warns_about_a_hot_model_axis_the_pane_has_not_used_yet(monkeypatch, tmp_path):
+    """Opus seat, live proof: cus2a (opus only) on rayi2 (Fable 100%) read
+    ROOM with no Fable mention. The pane that needs the warning is the one
+    about to fan Fable out for the FIRST time, so the note keys on the
+    account's hot axes, not on the models already in the pane's window."""
+    opus_only = [usage_line(NOW - timedelta(minutes=5), "claude-opus-5", "o", inp=7200, out=0)]
+    row, head = _pane_on(monkeypatch, tmp_path, "s-opus-only", opus_only, _pm_state(100.0))
+    assert row["dominant_model_key"] is None and "claude-fable-5-1" not in row["tokens_window"]["by_model"]
+    v = cus.me_verdict(row, head)
+    assert v["level"] == "room"                                # the verdict itself is unchanged
+    text = cus.render_me(_payload([row], {"rayi5": head}), row)
+    assert "NOTE: this account's Fable weekly is 100% used" in text
+    assert "fan-out from here will fail" in text
+    assert "already used it" not in text
+    # near the cap (75-90): a sizing caution, not a "will fail"
+    row, head = _pane_on(monkeypatch, tmp_path / "near", "s-near", opus_only, _pm_state(80.0))
+    text = cus.render_me(_payload([row], {"rayi5": head}), row)
+    assert "near its cap" in text and "will fail" not in text
+    # below 75: no note at all
+    row, head = _pane_on(monkeypatch, tmp_path / "ok", "s-ok", opus_only, _pm_state(20.0))
+    assert "NOTE:" not in cus.render_me(_payload([row], {"rayi5": head}), row)
+
+
+def test_table_says_when_no_account_reports_a_per_model_axis():
+    """LOW (a): {} on every account is indistinguishable from 'nothing capped'."""
+    bare = {"current_5h_pct": 5.0, "current_7d_pct": 10.0,
+            "five_hour_resets_at": iso(NOW + timedelta(hours=3)),
+            "seven_day_resets_at": iso(NOW + timedelta(days=4)),
+            "last_observed_ts": iso(NOW - timedelta(minutes=1))}
+    p = {"generated_at": iso(NOW), "window_minutes": 30, "window_start": iso(WINDOW_START),
+         "panes": [], "accounts": {"a": dict(cus.account_headroom(bare, NOW), live_panes=0)}}
+    assert "the axis is UNREAD" in cus.render_panes_table(p)
+    p["accounts"]["b"] = dict(cus.account_headroom(_pm_state(5.0)["accounts"]["rayi5"], NOW), live_panes=0)
+    assert "the axis is UNREAD" not in cus.render_panes_table(p)
+
+
+def test_per_model_stale_tracks_known_by_construction():
+    """LOW (b): the two flags share one freshness gate; lock that in."""
+    for acct in (_pm_state(50.0)["accounts"]["rayi5"],
+                 _pm_state(50.0, observed_minutes_ago=600)["accounts"]["rayi5"],
+                 {"per_model_weekly_pct": {"Fable": 50.0}}, None):
+        h = cus.account_headroom(acct, NOW)
+        assert h["per_model_weekly_stale"] == (not h["known"])
 
 
 if __name__ == "__main__":
