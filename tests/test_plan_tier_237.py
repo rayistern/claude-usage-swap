@@ -268,26 +268,35 @@ def test_panes_header_names_the_tier_with_its_source_and_age():
     json.dumps(h)                                                             # serialisable as shipped
 
 
-def test_panes_rows_carry_pts_per_min_only_when_the_tier_can_size(monkeypatch, tmp_path):
-    from test_panes_view import _fake_env, _write_session, usage_line  # noqa: E402
+def test_panes_measured_row_gets_a_numeric_pts_per_min_on_a_known_tier_and_a_question_mark_otherwise(monkeypatch, tmp_path):
+    """PR #242 review M3: the previous version of this test asserted `is None`
+    in both branches because every fixture row was unmeasured — a test that
+    passed whatever the wiring did. This one writes a transcript with 3M new
+    tokens in the last 5 minutes (100k/min over the 30-min window), so the
+    row is MEASURED, and pins the number end to end through
+    build_panes_payload and the rendered table."""
+    from test_panes_view import _fake_env, _write_session, usage_line, _reg  # noqa: E402
     claude = _fake_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(cus, "read_peer_registry", lambda: {})
+    sid = "s-measured"
+    _write_session(claude, sid, [usage_line(datetime.now(timezone.utc) - timedelta(minutes=5),
+                                            "claude-fable-5-1", "m1", inp=3_000_000, out=0)])
+    monkeypatch.setattr(cus, "read_peer_registry", lambda: _reg(sid))
     monkeypatch.setattr(cus, "read_panes_from_reader", lambda include_all=True: [
-        {"pane": "%20", "session": "x", "state": "working", "pane_pid": 11, "profile": "claude-code"}])
+        {"pane": "%9", "session": "x", "state": "working", "pane_pid": 11, "profile": "claude-code"}])
     monkeypatch.setattr(cus, "load_config", lambda: dict(cus.DEFAULT_CONFIG))
-    for raw, expect_numeric in (("default_claude_max_20x", True), (None, False)):
-        rec = _acct(plan_tier_profile={"raw": raw, "observed_ts": _iso(datetime.now(timezone.utc))}) if raw else _acct()
-        monkeypatch.setattr(cus, "load_state", lambda rec=rec: {"slots": {"slot-7": {"account": "rayi5"}}, "accounts": {"rayi5": rec}})
-        payload = cus.build_panes_payload(30)
-        row = payload["panes"][0]
-        assert row["unmeasured"] is True                                     # no transcript in this fixture
-        assert row["burn_pts_per_min_est"] is None
-        text = cus.render_panes_table(payload)
-        assert "PTS/MIN~" in text and ("plan 20x" in text if raw else "plan unknown" in text)
-    # a measured row: the estimate is NEW/MIN over the tier's tokens-per-point
-    row = {"pane": "%1", "unmeasured": False, "burn_new_tokens_per_min": 50_000.0, "account": "a"}
-    tier = cus.resolve_plan_tier({"plan_tier_profile": {"raw": "default_claude_max_5x", "observed_ts": _iso(NOW)}}, NOW, _cfg())
-    assert cus.projected_pts_per_min(row["burn_new_tokens_per_min"], tier, _cfg()) == 2.0
+    fresh = _acct(plan_tier_profile={"raw": "default_claude_max_20x", "observed_ts": _iso(datetime.now(timezone.utc))})
+    monkeypatch.setattr(cus, "load_state", lambda: {"slots": {"slot-7": {"account": "rayi5"}}, "accounts": {"rayi5": fresh}})
+    payload = cus.build_panes_payload(30)
+    row = payload["panes"][0]
+    assert row["unmeasured"] is False and row["burn_new_tokens_per_min"] == pytest.approx(100_000.0)
+    assert row["burn_pts_per_min_est"] == pytest.approx(1.0)            # 100k/min over 20x's 100k tokens/pt
+    text = cus.render_panes_table(payload)
+    assert "    1.00" in text and "plan 20x (profile 0m)" in text
+    # same row, no tier: the column is '?', never a default multiplier
+    monkeypatch.setattr(cus, "load_state", lambda: {"slots": {"slot-7": {"account": "rayi5"}}, "accounts": {"rayi5": _acct()}})
+    payload = cus.build_panes_payload(30)
+    assert payload["panes"][0]["burn_pts_per_min_est"] is None
+    assert "       ?" in cus.render_panes_table(payload) and "plan unknown" in cus.render_panes_table(payload)
 
 
 def test_me_prints_plan_burn_both_ways_sizing_and_placement(monkeypatch, tmp_path):
@@ -308,12 +317,21 @@ def test_me_prints_plan_burn_both_ways_sizing_and_placement(monkeypatch, tmp_pat
     assert "PLAN: 20x (profile 0m)" in text
     assert "BURN:" in text and "new tokens/min measured (comparable across plans)" in text
     assert "5h-pts/min on this 20x account (estimate)" in text and "account measured 0.40 pts/min" in text
-    assert "SIZING: at this burn the 5h headroom" in text and "on 20x" in text
+    assert "SIZING: the 5h headroom" in text and "on 20x (account measured 0.40 pts/min, all panes" in text
     assert "PLACEMENT" in text and "small 5x 60% left ≈" in text and "mystery" in text   # unknown named, not estimated
+    assert "(target burn unmeasured — assumes idle)" in text                                # PR #242 H2: said, not silent
     sz = cus.sizing_estimate(payload, row, head, _cfg())
     assert sz["pts_per_min_est"] == sz["new_tokens_per_min"] / 100_000
-    assert sz["minutes_to_wall_est"] == pytest.approx(head["headroom_5h_pct"] / sz["pts_per_min_est"])
+    # own account: the account's measured burn (all panes, includes this one) is
+    # the rate — and the answer is capped at the window's reset (H2), which the
+    # fixture puts 3h out
+    own = sz["own_wall"]
+    uncapped = head["headroom_5h_pct"] / max(0.4, sz["pts_per_min_est"])
+    assert own["minutes_to_reset"] == pytest.approx(180.0, abs=1.0)
+    assert sz["minutes_to_wall_est"] == pytest.approx(min(uncapped, own["minutes_to_reset"]))
+    assert own["capped_by_reset"] is (uncapped > own["minutes_to_reset"])
     small = next(t for t in sz["targets"] if t["account"] == "small")
+    assert small["target_burn_measured"] is False
     assert small["minutes_to_wall_est"] == pytest.approx(60.0 / (sz["new_tokens_per_min"] / 25_000))
     assert next(t for t in sz["targets"] if t["account"] == "mystery")["minutes_to_wall_est"] is None
     json.dumps(sz)
@@ -340,6 +358,144 @@ def test_status_shows_the_tier_with_source_or_unknown():
         assert "plan=unknown" in r.output
     finally:
         env.restore()
+
+
+# ==========================================================================
+# PR #242 blind review (2026-09-20): the kill switch, the target's own burn,
+# a null tier, a failing endpoint.
+# ==========================================================================
+
+def test_kill_switch_stops_every_read_and_every_render_including_the_429_path(monkeypatch):
+    """H1 (both seats, both reproduced): with plan_tiers.enabled false a 429
+    poll still persisted a sizing-capable tier and opened the credential file.
+    Requirement: no GET, no file read, nothing persisted, 'plan unknown'."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({"plan_tiers": {"enabled": False}})
+        calls: list[str] = []
+        monkeypatch.setattr(cus.urllib.request, "urlopen", _serve(calls, usage_status=429, tier="default_claude_max_20x"))
+        monkeypatch.setattr(cus, "_read_plan_metadata_from_creds",
+                            lambda path: (_ for _ in ()).throw(AssertionError("credential file read while disabled")))
+        cus._PLAN_TIER_PROBE_CACHE.clear(); cus._SUBSCRIPTION_PROBE_CACHE.clear()
+        u = cus.poll_account_usage("alpha")                        # the subscription probe still runs its own GET
+        assert u.raw.get("rate_limited") and u.plan_tier_profile is None and u.plan_tier_file is None
+        state = cus.load_state()
+        state["accounts"]["alpha"]["plan_tier_profile"] = {"raw": "default_claude_max_20x", "observed_ts": _iso(datetime.now(timezone.utc))}
+        cus.update_state_with_usage(state, {"alpha": u})
+        # whatever state still holds, nothing renders and nothing sizes
+        t = cus.resolve_plan_tier(state["accounts"]["alpha"], datetime.now(timezone.utc), cus.load_config())
+        assert t["label"] is None and t["sizing_ok"] is False and t["reason"] == "plan_tiers disabled"
+        h = cus.account_headroom(state["accounts"]["alpha"], datetime.now(timezone.utc))
+        assert "plan unknown" in cus._account_header("alpha", h, datetime.now(timezone.utc))
+        assert cus.projected_pts_per_min(100_000, t, cus.load_config()) is None
+        # 200 path, same switch: no profile GET at all
+        calls.clear()
+        monkeypatch.setattr(cus.urllib.request, "urlopen", _serve(calls))
+        cus.poll_account_usage("alpha")
+        assert cus.PROFILE_API_URL not in calls
+    finally:
+        cus._PLAN_TIER_PROBE_CACHE.clear(); cus._SUBSCRIPTION_PROBE_CACHE.clear()
+        env.restore()
+
+
+def test_wall_estimate_counts_the_targets_own_burn_and_its_reset():
+    """H2. 60% headroom, target burning 1.5 pts/min, payload 2.0 pts/min on
+    5x (50k tokens/min) => ~17 min, not 30. A reset in 4 min caps the answer.
+    Own account: the measured figure already includes this pane, so max()."""
+    cfg = _cfg()
+    five = _tier("default_claude_max_5x")
+    w = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=1.5)
+    assert w["payload_pts_per_min"] == 2.0 and w["target_burn_measured"] is True
+    assert w["minutes"] == pytest.approx(60.0 / 3.5)
+    idle = cus.wall_estimate(60.0, 50_000, five, cfg)                           # unmeasured: assumes idle, SAYS so
+    assert idle["minutes"] == 30.0 and idle["target_burn_measured"] is False
+    capped = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=1.5,
+                               resets_at=_iso(NOW + timedelta(minutes=4)), now=NOW)
+    assert capped["minutes"] == pytest.approx(4.0) and capped["capped_by_reset"] is True
+    past = cus.wall_estimate(60.0, 50_000, five, cfg, resets_at=_iso(NOW - timedelta(minutes=4)), now=NOW)
+    assert past["capped_by_reset"] is False and past["minutes"] == 30.0        # a past reset is no cap
+    own = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=3.0, own_account=True)
+    assert own["minutes"] == pytest.approx(60.0 / 3.0)                          # max(3.0, 2.0), not the sum
+    own2 = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=0.5, own_account=True)
+    assert own2["minutes"] == pytest.approx(60.0 / 2.0)
+    assert cus.minutes_until_wall(60.0, 50_000, five, cfg, target_burn_pts_per_min=1.5) == pytest.approx(60.0 / 3.5)
+
+
+def test_placement_line_shows_the_targets_burn_and_a_reset_cap(monkeypatch, tmp_path):
+    from test_panes_view import _pane_on, _pm_state, FABLE_HEAVY, _payload, NOW as PV_NOW  # noqa: E402
+    state = _pm_state(10.0)
+    state["accounts"]["rayi5"]["plan_tier_profile"] = {"raw": "default_claude_max_20x", "observed_ts": _iso(PV_NOW)}
+    row, head = _pane_on(monkeypatch, tmp_path, "s-place", FABLE_HEAVY, state)
+    busy = cus.account_headroom({"current_5h_pct": 40.0, "current_7d_pct": 10.0, "last_observed_ts": _iso(PV_NOW),
+                                 "five_hour_resets_at": _iso(PV_NOW + timedelta(hours=3)),
+                                 "burn_rate_5h_pct_per_min": 1.5,
+                                 "plan_tier_profile": {"raw": "default_claude_max_5x", "observed_ts": _iso(PV_NOW)}}, PV_NOW)
+    soon = cus.account_headroom({"current_5h_pct": 40.0, "current_7d_pct": 10.0, "last_observed_ts": _iso(PV_NOW),
+                                 "five_hour_resets_at": _iso(PV_NOW + timedelta(minutes=4)),
+                                 "plan_tier_profile": {"raw": "default_claude_max_5x", "observed_ts": _iso(PV_NOW)}}, PV_NOW)
+    payload = _payload([row], {"rayi5": head, "busy": busy, "soon": soon})
+    text = cus.render_me(payload, row)
+    assert "busy 5x 60% left ≈" in text and "(+1.50 pts/min already burning there)" in text
+    assert "soon 5x 60% left ≈ 4 min" in text and "[resets first, 4 min]" in text
+    sz = cus.sizing_estimate(payload, row, head, _cfg())
+    b = next(t for t in sz["targets"] if t["account"] == "busy")
+    assert b["minutes_to_wall_est"] == pytest.approx(60.0 / (1.5 + sz["new_tokens_per_min"] / 25_000))
+    assert next(t for t in sz["targets"] if t["account"] == "soon")["capped_by_reset"] is True
+
+
+def test_a_profile_without_the_tier_field_keeps_the_last_good_reading(monkeypatch):
+    """M1 (both seats): a 200 that omits organization.rate_limit_tier used to
+    overwrite a good tier with null on the success path (the 429 path guarded)."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({})
+        calls: list[str] = []
+        monkeypatch.setattr(cus.urllib.request, "urlopen", _serve(calls, tier=None))
+        cus._PLAN_TIER_PROBE_CACHE.clear()
+        u = cus.poll_account_usage("alpha")
+        assert calls.count(cus.PROFILE_API_URL) == 1 and u.plan_tier_profile is None
+        state = cus.load_state()
+        state["accounts"]["alpha"]["plan_tier_profile"] = {"raw": "default_claude_max_20x", "observed_ts": _iso(datetime.now(timezone.utc))}
+        cus.update_state_with_usage(state, {"alpha": u})
+        assert state["accounts"]["alpha"]["plan_tier_profile"]["raw"] == "default_claude_max_20x"   # kept
+        # and a record with a null raw never persists even if handed over
+        u.plan_tier_profile = {"raw": None, "observed_ts": _iso(datetime.now(timezone.utc))}
+        cus.update_state_with_usage(state, {"alpha": u})
+        assert state["accounts"]["alpha"]["plan_tier_profile"]["raw"] == "default_claude_max_20x"
+    finally:
+        cus._PLAN_TIER_PROBE_CACHE.clear()
+        env.restore()
+
+
+def test_a_failing_profile_endpoint_is_tried_once_per_window_not_once_per_poll(monkeypatch):
+    """M2: five polls against a failing endpoint used to cost five GETs. The
+    cadence stamp is written on every attempt, like _subscription_probe_verdict."""
+    env = _Env(accounts=("alpha", "beta"))
+    try:
+        env.set_config({})
+        calls: list[str] = []
+        def fake(req, timeout=None):
+            calls.append(req.full_url)
+            if req.full_url == cus.PROFILE_API_URL:
+                raise urllib.error.URLError("profile down")
+            return _Resp({"five_hour": {"utilization": 8.0, "resets_at": None},
+                          "seven_day": {"utilization": 20.0, "resets_at": None}})
+        monkeypatch.setattr(cus.urllib.request, "urlopen", fake)
+        cus._PLAN_TIER_PROBE_CACHE.clear()
+        for _ in range(5):
+            u = cus.poll_account_usage("alpha")
+            assert u.five_hour is not None and u.plan_tier_profile is None     # the usage reading stands
+        assert calls.count(cus.PROFILE_API_URL) == 1 and calls.count(cus.USAGE_API_URL) == 5
+    finally:
+        cus._PLAN_TIER_PROBE_CACHE.clear()
+        env.restore()
+
+
+def test_age_formatting_floors_and_never_goes_negative():
+    assert cus._fmt_age_short(23 * 3600 + 40 * 60) == "23h"
+    assert cus._fmt_age_short(-180) == "0m"
+    assert cus._fmt_age_short(95 * 60) == "1h"
+    assert cus._fmt_age_short(3 * 86400) == "3d"
 
 
 if __name__ == "__main__":

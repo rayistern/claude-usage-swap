@@ -653,11 +653,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # comparable across plan sizes and placement can be sized to the payload.
     # Source of truth is the OAuth profile endpoint's organization.rate_limit_tier
     # (live). The credential file's claudeAiOauth.rateLimitTier is written at
-    # LOGIN and carried through refreshes unchanged, so it goes stale after a
-    # plan change: on 2026-09-20 rayi2's file said 5x while the profile said
-    # 20x, and rayi3's said 20x while the profile said 5x. The file value is
-    # therefore display-only ("5x? credential file, unverified") and never
-    # drives sizing arithmetic.
+    # LOGIN and carried through refreshes unchanged (`_refresh_account_token`
+    # rewrites four keys and copies the rest of claudeAiOauth back verbatim),
+    # so it goes stale after a plan change: on 2026-09-20 rayi2's file said 5x
+    # while the profile said 20x, and rayi3's said 20x while the profile said
+    # 5x — the decisive evidence. The file value is therefore display-only
+    # ("5x? (credential file 3h, unverified)") and never drives sizing.
     "plan_tiers": {
         "enabled": True,
         # One profile GET per account per this many minutes, piggybacking on the
@@ -5278,8 +5279,7 @@ def _subscription_probe_verdict(account_name: str, token: str,
 
 
 # GH #237 — plan tier. -----------------------------------------------------
-_PLAN_TIER_PROBE_CACHE: dict[str, float] = {}   # account -> monotonic ts of the last profile tier read
-_PLAN_META_KEYS = ("subscriptionType", "rateLimitTier")
+_PLAN_TIER_PROBE_CACHE: dict[str, float] = {}   # account -> monotonic ts of the last profile tier ATTEMPT
 
 
 def _plan_tier_multiplier(raw: str | None) -> int | None:
@@ -5319,29 +5319,56 @@ def _read_plan_metadata_from_creds(path: Path) -> dict | None:
             "file_mtime_ts": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")}
 
 
-def _attach_plan_tier(u: "AccountUsage", account_name: str, token: str | None,
-                      config: dict | None = None) -> None:
-    """Fill u.plan_tier_file (always, cheap) and u.plan_tier_profile (one GET
-    per account per plan_tiers.profile_refresh_minutes, with the poll's own
-    token — no extra credential is read or rotated). Failures leave the last
-    persisted reading in place; nothing here ever writes a credential file."""
+def _plan_tiers_enabled(config: dict | None = None) -> bool:
+    """THE kill switch (PR #242 review H1): every read, every persistence site
+    and the resolver consult this one predicate, so `plan_tiers.enabled: false`
+    means no profile GET, no credential-file read, nothing persisted, and
+    'plan unknown' everywhere — on the 429 path as much as the 200 path."""
     cfg = config if config is not None else load_config()
-    pt = cfg.get("plan_tiers", {}) or {}
-    if not pt.get("enabled", True):
+    return bool((cfg.get("plan_tiers", {}) or {}).get("enabled", True))
+
+
+def _attach_plan_tier(u: "AccountUsage", account_name: str, token: str | None,
+                      config: dict | None = None, detail: dict | None = None) -> None:
+    """Fill u.plan_tier_file (cheap) and u.plan_tier_profile, behind the one
+    plan_tiers.enabled gate.
+
+    `detail` given ⇒ the caller (the 429 branch) already read the profile via
+    the subscription probe; use it, no second GET. Otherwise one GET per
+    account per plan_tiers.profile_refresh_minutes with the poll's own token —
+    and the cadence stamp is written on EVERY attempt, so a failing endpoint
+    costs one GET per window, not one per poll (mirrors
+    _subscription_probe_verdict, PR #242 review M2). A response without
+    `organization.rate_limit_tier` — a rename, a non-max org — leaves the last
+    persisted reading in place (M1) rather than clobbering it with null.
+    Nothing here ever writes a credential file or rotates a token.
+    Note on observed_ts for the 429 path: the probe's detail may come from its
+    own cooldown cache (up to subscription_guard.probe_cooldown_minutes old),
+    so observed_ts is when cus LOOKED, bounded well inside the 24h bar."""
+    cfg = config if config is not None else load_config()
+    if not _plan_tiers_enabled(cfg):
         return
+    pt = cfg.get("plan_tiers", {}) or {}
     meta = _read_plan_metadata_from_creds(account_creds_path(account_name))
     if meta:
         u.plan_tier_file = meta
+    if detail is not None:
+        if detail.get("rate_limit_tier"):
+            u.plan_tier_profile = {"raw": detail.get("rate_limit_tier"), "observed_ts": now_iso(),
+                                   "organization_type": detail.get("organization_type"),
+                                   "subscription_status": detail.get("subscription_status")}
+            _PLAN_TIER_PROBE_CACHE[account_name] = time.monotonic()
+        return
     if not token:
         return
     refresh_s = float(pt.get("profile_refresh_minutes", 60)) * 60.0
     last = _PLAN_TIER_PROBE_CACHE.get(account_name)
     if last is not None and (time.monotonic() - last) < refresh_s:
         return
+    _PLAN_TIER_PROBE_CACHE[account_name] = time.monotonic()   # every attempt, success or not
     verdict, detail = _probe_subscription_profile(token)
-    if verdict == "unknown":
-        return
-    _PLAN_TIER_PROBE_CACHE[account_name] = time.monotonic()
+    if verdict == "unknown" or not detail.get("rate_limit_tier"):
+        return                                                 # last persisted reading stands
     u.plan_tier_profile = {"raw": detail.get("rate_limit_tier"), "observed_ts": now_iso(),
                            "organization_type": detail.get("organization_type"),
                            "subscription_status": detail.get("subscription_status")}
@@ -5371,6 +5398,12 @@ def resolve_plan_tier(acct: dict | None, now: "datetime | None" = None,
     cfg = config if config is not None else load_config()
     max_age_s = float((cfg.get("plan_tiers", {}) or {}).get("profile_max_age_hours", 24)) * 3600.0
     acct = acct or {}
+    if not _plan_tiers_enabled(cfg):
+        # The kill switch is read-time too (PR #242 review H1): whatever state
+        # still holds, nothing renders and nothing sizes.
+        return {"label": None, "multiplier": None, "source": None, "observed_ts": None,
+                "age_seconds": None, "stale": False, "mismatch": False, "file_label": None,
+                "sizing_ok": False, "reason": "plan_tiers disabled"}
     prof = acct.get("plan_tier_profile") if isinstance(acct.get("plan_tier_profile"), dict) else None
     fil = acct.get("plan_tier_file") if isinstance(acct.get("plan_tier_file"), dict) else None
     out = {"label": None, "multiplier": None, "source": None, "observed_ts": None,
@@ -5400,13 +5433,16 @@ def resolve_plan_tier(acct: dict | None, now: "datetime | None" = None,
 
 
 def _fmt_age_short(seconds: float | None) -> str:
+    """'12m', '3h', '2d'. Floors (23h40m is '23h', never '24h' beside a fresh
+    label); a clock skew that makes the age negative reads '0m', not '-3m'."""
     if seconds is None:
         return "?"
+    seconds = max(0.0, float(seconds))
     if seconds < 3600:
         return f"{int(seconds // 60)}m"
     if seconds < 172800:
-        return f"{seconds / 3600:.0f}h"
-    return f"{seconds / 86400:.0f}d"
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
 
 
 def plan_tier_text(t: dict) -> str:
@@ -5446,15 +5482,54 @@ def projected_pts_per_min(new_tokens_per_min: float | None, tier: dict, config: 
     return float(new_tokens_per_min) / tpp
 
 
-def minutes_until_wall(headroom_pct: float | None, new_tokens_per_min: float | None,
-                       tier: dict, config: dict | None = None) -> float | None:
+def wall_estimate(headroom_pct: float | None, new_tokens_per_min: float | None, tier: dict,
+                  config: dict | None = None, *, target_burn_pts_per_min: float | None = None,
+                  resets_at: str | None = None, now: "datetime | None" = None,
+                  own_account: bool = False) -> dict:
     """Tier-aware 'minutes until this target walls under this payload' (GH #237;
-    skills/watch.md "size the target to the payload"). None when the tier
-    cannot size, the headroom is unknown, or the payload burns nothing."""
-    rate = projected_pts_per_min(new_tokens_per_min, tier, config)
-    if rate is None or headroom_pct is None or rate <= 0:
-        return None
-    return float(headroom_pct) / rate
+    skills/watch.md "size the target to the payload"), with what the target is
+    ALREADY burning and when its window resets (PR #242 review H2: a target at
+    60% headroom burning 1.5 pts/min plus a 2.0 payload is ~17 min, not 30 —
+    the old formula assumed an idle target, and erred in the direction that
+    walls a lane mid-job).
+
+    Returns {"minutes", "payload_pts_per_min", "target_burn_pts_per_min",
+             "target_burn_measured", "minutes_to_reset", "capped_by_reset"}.
+      * rate = payload + target's measured burn (another account), or
+        max(account's measured burn, payload) for the pane's OWN account —
+        the account figure already includes this pane, so adding would double
+        count. An unmeasured target burn is treated as 0 and SAID so
+        (target_burn_measured=False): "assumes idle", never silently.
+      * the answer is capped at the minutes left to `resets_at`: headroom that
+        expires in ten minutes is not headroom (watch.md: points AND time).
+      * None when the tier cannot size, the headroom is unknown, or nothing
+        burns."""
+    now = now or datetime.now(timezone.utc)
+    payload = projected_pts_per_min(new_tokens_per_min, tier, config)
+    measured = isinstance(target_burn_pts_per_min, (int, float))
+    tb = float(target_burn_pts_per_min) if measured else 0.0
+    out = {"minutes": None, "payload_pts_per_min": payload,
+           "target_burn_pts_per_min": tb if measured else None, "target_burn_measured": measured,
+           "minutes_to_reset": None, "capped_by_reset": False}
+    t_reset = _panes_parse_ts(resets_at)
+    if t_reset is not None and t_reset > now:
+        out["minutes_to_reset"] = (t_reset - now).total_seconds() / 60.0
+    if payload is None or headroom_pct is None:
+        return out
+    rate = max(tb, payload) if own_account else (payload + tb)
+    if rate <= 0:
+        return out
+    mins = float(headroom_pct) / rate
+    if out["minutes_to_reset"] is not None and out["minutes_to_reset"] < mins:
+        mins, out["capped_by_reset"] = out["minutes_to_reset"], True
+    out["minutes"] = mins
+    return out
+
+
+def minutes_until_wall(headroom_pct: float | None, new_tokens_per_min: float | None,
+                       tier: dict, config: dict | None = None, **kw) -> float | None:
+    """The `minutes` of wall_estimate (kept as the simple entry point)."""
+    return wall_estimate(headroom_pct, new_tokens_per_min, tier, config, **kw)["minutes"]
 
 
 def poll_account_usage(account_name: str) -> AccountUsage:
@@ -5607,13 +5682,14 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             # branch byte-identical to its pre-guard behavior (fail open).
             verdict, sub_detail = _subscription_probe_verdict(account_name, token)
             u.raw["subscription_probe"] = verdict
-            # GH #237: the probe just read the profile — keep its tier, no extra GET.
-            if verdict in ("active", "disabled") and sub_detail.get("rate_limit_tier"):
-                u.plan_tier_profile = {"raw": sub_detail.get("rate_limit_tier"), "observed_ts": now_iso(),
-                                       "organization_type": sub_detail.get("organization_type"),
-                                       "subscription_status": sub_detail.get("subscription_status")}
-                _PLAN_TIER_PROBE_CACHE[account_name] = time.monotonic()
-            u.plan_tier_file = _read_plan_metadata_from_creds(account_creds_path(account_name))
+            # GH #237: the probe just read the profile — hand its detail to the
+            # ONE gated attach path (PR #242 review H1: this branch used to
+            # persist both records with no plan_tiers.enabled check).
+            try:
+                _attach_plan_tier(u, account_name, None,
+                                  detail=sub_detail if verdict in ("active", "disabled") else None)
+            except Exception as _e:  # noqa: BLE001 — never lose the usage reading over metadata
+                click.echo(f"warning: plan-tier read failed for '{account_name}' ({type(_e).__name__}); usage reading kept")
             if verdict == "disabled":
                 u.subscription_disabled = True
                 u.raw["subscription"] = sub_detail
@@ -5644,7 +5720,10 @@ def poll_account_usage(account_name: str) -> AccountUsage:
         polled_at=now_iso(),
         raw=data,
     )
-    _attach_plan_tier(u, account_name, token)   # GH #237, rate-limited to one GET/hour
+    try:
+        _attach_plan_tier(u, account_name, token)   # GH #237, rate-limited to one GET/hour
+    except Exception as _e:  # noqa: BLE001 — PR #242 review L3: metadata must never discard a good usage reading
+        click.echo(f"warning: plan-tier read failed for '{account_name}' ({type(_e).__name__}); usage reading kept")
     return u
 
 
@@ -10979,10 +11058,11 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             continue
         # GH #237: tier records are persisted raw whatever branch follows (a
         # 429 poll still read the profile). Interpretation is resolve_plan_tier.
-        if getattr(u, "plan_tier_profile", None):
-            acct["plan_tier_profile"] = dict(u.plan_tier_profile)
-        if getattr(u, "plan_tier_file", None):
-            acct["plan_tier_file"] = dict(u.plan_tier_file)
+        if _plan_tiers_enabled(config):
+            if getattr(u, "plan_tier_profile", None) and u.plan_tier_profile.get("raw"):
+                acct["plan_tier_profile"] = dict(u.plan_tier_profile)
+            if getattr(u, "plan_tier_file", None):
+                acct["plan_tier_file"] = dict(u.plan_tier_file)
 
         # Branch 0: token stale (stored access token expired but refresh
         # token still valid — recoverable on next swap, NOT an SOS condition).
@@ -19078,7 +19158,7 @@ def account_headroom(acct: dict | None, now: "datetime",
            # Fable lane and a wrong ROOM for a Fable pane (PR #232 re-review,
            # 2026-09-18). No per-model reset time is persisted by the daemon.
            "per_model_weekly_pct": {}, "per_model_weekly_stale": True,
-           "plan_tier": resolve_plan_tier(None, now), "burn_5h_pct_per_min_measured": None}
+           "plan_tier": None, "burn_5h_pct_per_min_measured": None}
     # GH #237: the account's plan tier (resolved, with source/age/staleness) and
     # its MEASURED 5h burn from the daemon's last two polls — the ground truth
     # for %/min, next to the per-pane token burn the rows carry.
@@ -19710,22 +19790,31 @@ def sizing_estimate(payload: dict, row: dict, head: dict, config: dict | None = 
      payload", the arithmetic skills/watch.md's size-to-the-payload rule needs.}
     Every estimate is None when its inputs are unknown; nothing is defaulted."""
     cfg = config if config is not None else load_config()
+    now_ = _panes_parse_ts(payload.get("generated_at")) or datetime.now(timezone.utc)
     tier = head.get("plan_tier") or resolve_plan_tier(None)
     tpm = None if row.get("unmeasured") else row.get("burn_new_tokens_per_min")
     ppm = projected_pts_per_min(tpm, tier, cfg)
-    mins = minutes_until_wall(head.get("headroom_5h_pct") if head.get("known") else None, tpm, tier, cfg)
+    own = wall_estimate(head.get("headroom_5h_pct") if head.get("known") else None, tpm, tier, cfg,
+                        target_burn_pts_per_min=head.get("burn_5h_pct_per_min_measured"),
+                        resets_at=head.get("five_hour_resets_at"), now=now_, own_account=True)
     targets = []
     for name, ah in sorted((payload.get("accounts") or {}).items()):
         if name == row.get("account") or ah.get("disabled"):
             continue
         t = ah.get("plan_tier") or {}
-        m = minutes_until_wall(ah.get("headroom_5h_pct") if ah.get("known") else None, tpm, t, cfg)
+        w = wall_estimate(ah.get("headroom_5h_pct") if ah.get("known") else None, tpm, t, cfg,
+                          target_burn_pts_per_min=ah.get("burn_5h_pct_per_min_measured"),
+                          resets_at=ah.get("five_hour_resets_at"), now=now_)
         targets.append({"account": name, "plan": plan_tier_text(t),
                         "headroom_5h_pct": ah.get("headroom_5h_pct") if ah.get("known") else None,
-                        "minutes_to_wall_est": m})
+                        "minutes_to_wall_est": w["minutes"],
+                        "target_burn_pts_per_min": w["target_burn_pts_per_min"],
+                        "target_burn_measured": w["target_burn_measured"],
+                        "minutes_to_reset": w["minutes_to_reset"],
+                        "capped_by_reset": w["capped_by_reset"]})
     return {"plan_tier": tier, "new_tokens_per_min": tpm, "pts_per_min_est": ppm,
             "account_pts_per_min_measured": head.get("burn_5h_pct_per_min_measured"),
-            "minutes_to_wall_est": mins,
+            "minutes_to_wall_est": own["minutes"], "own_wall": own,
             "calibration_tokens_per_5h_point_per_x": float((cfg.get("plan_tiers", {}) or {}).get("tokens_per_5h_point_per_x", 5000)),
             "targets": targets}
 
@@ -19748,17 +19837,27 @@ def sizing_lines(payload: dict, row: dict, head: dict) -> list[str]:
     if meas is not None:
         burn += f" · account measured {meas:.2f} pts/min over its last two polls (all panes)"
     out.append(burn)
+    own = sz["own_wall"]
     if sz["minutes_to_wall_est"] is not None:
-        out.append(f"SIZING: at this burn the 5h headroom ({head['headroom_5h_pct']:.0f}%) lasts ~"
-                   f"{sz['minutes_to_wall_est']:.0f} min on {t['label']} "
-                   f"(calibration {sz['calibration_tokens_per_5h_point_per_x']:.0f} tok/pt/x — estimate)")
+        basis = (f"account measured {own['target_burn_pts_per_min']:.2f} pts/min, all panes"
+                 if own["target_burn_measured"] else "this pane's burn only — account burn unmeasured")
+        cap = f"; the 5h window resets first, in {own['minutes_to_reset']:.0f} min" if own["capped_by_reset"] else ""
+        out.append(f"SIZING: the 5h headroom ({head['headroom_5h_pct']:.0f}%) lasts ~"
+                   f"{sz['minutes_to_wall_est']:.0f} min on {t['label']} ({basis}{cap}; "
+                   f"calibration {sz['calibration_tokens_per_5h_point_per_x']:.0f} tok/pt/x — estimate)")
     else:
         out.append("SIZING: unknown — needs a fresh profile tier reading and a measured headroom")
     known = [x for x in sz["targets"] if x["minutes_to_wall_est"] is not None]
     if known:
+        def _one(x):
+            s = f"{x['account']} {x['plan'].split(' ')[0]} {x['headroom_5h_pct']:.0f}% left ≈ {x['minutes_to_wall_est']:.0f} min"
+            s += (f" (+{x['target_burn_pts_per_min']:.2f} pts/min already burning there)"
+                  if x["target_burn_measured"] else " (target burn unmeasured — assumes idle)")
+            if x["capped_by_reset"]:
+                s += f" [resets first, {x['minutes_to_reset']:.0f} min]"
+            return s
         out.append("PLACEMENT (this payload on another account, 5h axis only, estimates): "
-                   + "; ".join(f"{x['account']} {x['plan'].split(' ')[0]} {x['headroom_5h_pct']:.0f}% left ≈ "
-                               f"{x['minutes_to_wall_est']:.0f} min" for x in known))
+                   + "; ".join(_one(x) for x in known))
     unknown = [x["account"] for x in sz["targets"] if x["minutes_to_wall_est"] is None]
     if unknown:
         out.append("  (no estimate — tier or headroom unknown: " + ", ".join(unknown) + ")")
@@ -21547,7 +21646,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name. `deprioritized_slots: [slot-3, ...]` / `deprioritized_panes: [<tmux session name or %pane>, ...]` (GH #238, `cus deprioritize`/`cus reprioritize`) — lanes/panes that can WAIT for a reset: the daemon never moves them off a wall (ladder / hard-cap / burn; a disabled-account eviction still applies), never counts them as needing a target, and their USAGE alarm (lane at N% with no swap target) downgrades to INFO — credential-integrity alarms (blanked mount, shared token family, stuck 'not logged in', subscription death) keep full severity, because a reset never clears those; unlike a lock they may still be joined, auto-picked and idle-gc'd. A pane deprioritized while sharing a lane with NORMAL panes is a MIXED-PRIORITY conflict: the lane is neither rescued nor silenced, and status/sessions/panes/sos tell you to split it out.",
-    "plan_tiers": "Per-account PLAN TIER (5x / 20x) tracking, GH #237. Read on each usage poll: `organization.rate_limit_tier` from the OAuth profile endpoint (authoritative, live; one GET per account per `profile_refresh_minutes`, reusing the poll's token) plus the credential file's `claudeAiOauth.rateLimitTier` as a labelled fallback. The file field is written at LOGIN and never updated by token refreshes, so it goes stale after a plan change (2026-09-20: rayi2 file 5x / live 20x; rayi3 file 20x / live 5x) — it renders as '5x? (credential file, unverified)' and NEVER drives sizing. A profile reading older than `profile_max_age_hours` is shown with its age and not used for sizing either. Shown in `cus status` (plan=…), on `cus panes` account headers and in `--me` / `--json`. `tokens_per_5h_point_per_x` calibrates 'minutes until this target walls under this payload' (new tokens per 5h-point per plan 'x'; estimate from the 2026-09-18/19 log, model-mix dependent). `enabled: false` stops the profile GETs; everything renders 'plan unknown'.",
+    "plan_tiers": "Per-account PLAN TIER (5x / 20x) tracking, GH #237. Read on each usage poll: `organization.rate_limit_tier` from the OAuth profile endpoint (authoritative, live; one GET per account per `profile_refresh_minutes`, reusing the poll's token) plus the credential file's `claudeAiOauth.rateLimitTier` as a labelled fallback. The file field is written at LOGIN and never updated by token refreshes, so it goes stale after a plan change (2026-09-20: rayi2 file 5x / live 20x; rayi3 file 20x / live 5x) — it renders as '5x? (credential file 3h, unverified)' — the age is the file's mtime — and NEVER drives sizing. A profile reading older than `profile_max_age_hours` is shown with its age and not used for sizing either. Shown in `cus status` (plan=…), on `cus panes` account headers and in `--me` / `--json`. `tokens_per_5h_point_per_x` calibrates 'minutes until this target walls under this payload' (new tokens per 5h-point per plan 'x'; estimate from the 2026-09-18/19 log, model-mix dependent); the estimate adds the target's own measured burn and is capped at its 5h reset. `enabled: false` is the kill switch on every path — no profile GET (200 or 429 poll), no credential-file read, nothing persisted, and everything renders 'plan unknown' and nothing sizes.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
 }
