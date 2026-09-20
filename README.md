@@ -132,6 +132,8 @@ cus uninstall                 # reverse install
 # Daily inspection
 cus whoami                    # which account am I on right now (+ its usage)
 cus status                    # active + per-account state + live sessions
+cus panes                     # per-pane: subagents+models, token burn, walls, headroom
+cus panes --me                # just this pane — run it BEFORE fanning out subagents
 cus sos                       # exit 1 + actions if anything needs you
 cus list                      # configured accounts with OAuth identities
 cus statusline                # one-line (for CC statusLine — usually wired automatically)
@@ -333,6 +335,186 @@ Design + the experiment that established it: `docs/plans/2026-07-02-seamless-swa
 Each account has its own `next_swap_at_pct` field. Starts at 50; climbs through `[75, 90, force]` each time we swap *out* of it. Reset to 50 when both windows drop below `reset_below_pct`.
 
 Result: account A swapped out at 50%; we drain B until 50%; back to A but it's still at ~50%, so it doesn't trip again until 75%; etc. Naturally load-balances across the pool instead of hammering A → swap → A → swap.
+
+## `cus panes` — who is actually burning (GH #230)
+
+`cus status` answers "how hot is each **account**". `cus panes` answers "which
+**pane** made it hot, on what model, how fast, and how many subagents it already
+has in flight" — the question a session needs answered *before* it fans out five
+more agents.
+
+```bash
+cus panes                  # table, 30-minute window
+cus panes --window 2h      # 30m / 2h / 90s / bare minutes
+cus panes --me             # just this pane + its account's headroom
+cus panes --json           # machine-readable (schema_version 1)
+```
+
+It is **read-only**: it makes no API call, writes no cus state, and never
+touches credentials. (Precisely: `cus panes` itself writes nothing, but the pane
+reader it runs keeps its own small fingerprint cache under
+`~/.cache/pane_state/`, one file per pane.) Everything comes off disk — tmux pane states from
+`skills/pane_state.py` (the build-babysitter reader; if that reader is missing
+the command *fails* rather than guessing), Claude Code's own session registry
+and transcripts, and cus `state.json`.
+
+It has two callers, and the layout serves both:
+
+- **A pane about to spend more** runs `cus panes --me`. The first line is a
+  verdict it can act on without arithmetic — `VERDICT: ROOM TO SPEND`,
+  `TIGHT — one small batch at most`, or `DO NOT SPEND` (walled, or the hottest
+  of the account's 5h window, 7d window and the **per-model weekly** allowance
+  for the model this pane mostly uses is ≥ 90% used; `TIGHT` is ≥ 75% — the
+  daemon's own default swap steps). The per-model axis matters because it does
+  not come back for days: a pane ~72% on fable-5-1, on an account whose Fable
+  week read 100%, used to be told "ROOM — 88% of 5h left". An unknown or stale
+  account reading gives `CAUTION — ACCOUNT READING UNKNOWN`, never a green
+  verdict; a stale per-model reading is never green either (stale-high still
+  blocks, stale-low is unknown). `--me --json` carries the same thing as
+  `verdict: {level, headline, reason, binding_axis}` with `level` one of
+  `room | tight | stop | unknown` and `binding_axis` naming the axis that set
+  the level (`5h`, `7d`, `Fable_weekly`, `wall`, or `null` for room). Below the
+  verdict, `--me` lists every per-model weekly on the account and adds a
+  pre-spend `NOTE:` for any model axis that is hot there — driven off the
+  account, not off what the pane has already used, because the pane that needs
+  the warning is the one about to fan that model out for the first time.
+- **The fleet watchdog deciding which pane to move, and where**, reads the full
+  table. Rows are **grouped by account**, hottest account first, and within an
+  account the pane burning the most is the **top row**. Each group's `==` header
+  carries that account's *measured* 5h/7d usage, headroom and time to reset (or
+  `headroom UNKNOWN`), plus each per-model weekly (`Fable wk 100% ✗ NOT a
+  destination for Fable panes` at ≥ 90%; `Fable wk ?` when the reading is stale
+  and low — a stale *high* reading keeps warning, marked `~`). Accounts with
+  **no live pane are listed too** — those are the move destinations, and the
+  `✗` is what stops an account at "5h 0% used, 100% left" from looking like one
+  for a Fable lane.
+
+**The SHARE column is an attribution, not a measurement.** The usage endpoint
+reports percentages per *account*; token counts let us attribute a share of that
+account's observed window spend to each pane. The measured per-account numbers
+are printed separately, and render `unknown` — never a comfortable-looking 0% —
+whenever the last successful observation is missing or stale.
+
+Other things worth knowing about the numbers:
+
+- **`NEW` (cache reads excluded) is the headline** token figure; `NEW/MIN`,
+  `SHARE`, the sort and the per-model figures all use it. `TOK` (cache reads
+  included) is kept as a secondary column — it mostly measures context size.
+  This was measured, not assumed: over 24h on the box this was built on, fleet
+  5h-% growth correlated 0.83 with NEW vs 0.70 with TOK per half-hour bin, and
+  the partial correlations settle it (NEW given TOK 0.62; TOK given NEW −0.14).
+  Cache reads were ~94% of TOK. One sample, mixed plan sizes — treat it as
+  grounds for column order, not as a billing formula.
+- Subagent spend is included: each subagent writes its own transcript under
+  `<project>/<session-id>/subagents/`, invisible in the parent transcript.
+- Totals come from the **tail** of each transcript, so a 170MB file stays cheap.
+  A pane whose tail hit the size cap is flagged and its totals are a *floor*.
+- `WALL` is shown when **any** of four signals attests it: a 429 in the
+  transcript whose reset is still in the future (the transcript is scanned back
+  5h for this **regardless of `--window`**, and a 429 from before the slot
+  changed account is discounted); the pane reader reporting the pane at the
+  `limit_menu`; the pane's account measured at 100% of its 5h/7d window with
+  the reset still ahead; or the account's **per-model weekly** allowance at 100%
+  for the model this pane mostly uses (`account_model_exhausted` — only that
+  model's axis, so an Opus pane on a Fable-exhausted account is not walled by
+  Fable). It over-reports on purpose — a false "walled" costs some caution, a
+  false "clear" walls an account mid-fan-out. `wall_evidence` in `--json` says
+  which signals fired; `wall_notes` carries the caveats (no reset recorded;
+  last-known reading; partial horizon) and the table prints them as
+  `└─ wall note:` sub-lines. `↻2h00m` is the latest reset among the signals
+  that have one; `↻?` means none has one; `↻2h00m+?` (`wall_reset_partial`)
+  means another attesting signal has no known reset — a per-model weekly has
+  none — and may outlast the time shown. A rejection that no signal backs
+  renders as `(429 3h ago)`.
+- A pane whose transcript could not be read is **unmeasured**: it shows `-`
+  (`null` in `--json`), never `0`, is excluded from every share's denominator,
+  and is counted on its account's line so you know the shares cover only the
+  observed remainder. A `~` after a share means a pane on that account hit the
+  size cap, so the shares are approximate.
+- Spend is credited to the slot's **current** account: a slot moved mid-window
+  has its pre-move spend credited to the new account.
+- `cost_window_usd` is `null` unless the tail contains a `cost-state` snapshot
+  from *before* the window — a session-lifetime cost must never be printed as a
+  30-minute cost.
+
+### `--json` shape (schema_version 1)
+
+```jsonc
+{
+  "generated_at": "2026-09-18T14:47:00Z",
+  "window_minutes": 30,
+  "window_start": "2026-09-18T14:17:00Z",
+  "schema_version": 1,
+  "attribution_note": "...",          // the honesty caveat, verbatim
+  "account_order": ["rayi3", "rayi2", null],
+                                       // group order: hottest KNOWN account first, then
+                                       // unknown/stale ones, then null (no account resolved)
+  // `panes` is a FLAT list, stably sorted: by account in `account_order`, then by
+  // burn_new_tokens_per_min descending, unmeasured last. Group on each row's `account`.
+  "panes": [{
+    "pane": "%23", "tmux_session": "cus2a", "pane_pid": 3044366,
+    "state": "working",                // from pane_state.py, not re-derived
+    "slot": "slot-14", "account": "rayi2", "pool": "standard", "locked": true,
+    "session_id": "...", "cwd": "...", "transcript": "...",
+    "transcript_status": "ok",         // | missing | unreadable: X
+                                       // | no-session-registered | unresolved
+    "unmeasured": false,               // true => token figures below are null
+    "window_covered": true,            // false => totals are a FLOOR
+    "wall_scan_covered": true,         // false => size cap hit before the 5h wall lookback
+    "subagents_live": 1,               // null when unmeasured (it is read from the transcript)
+    "subagent_models": {"claude-opus-5[1m]": 1},
+    "subagents": [{"agent_id": "...", "model": "...", "description": "...",
+                   "started_at": "...", "idle_seconds": 4.7}],
+    "tokens_window": {"total": 19826832, "new": 913699, "subagent_total": 11594689,
+                      "by_model": {"claude-opus-5": {"input": 280, "output": 132982,
+                                                     "cache_creation": 517118,
+                                                     "cache_read": 15439667,
+                                                     "total": 16090047}}},
+    "burn_tokens_per_min": 165223.6, "burn_new_tokens_per_min": 7614.2,
+    "cost_window_usd": null, "last_activity": "...",
+    "wall": {"rate_limit_type": "five_hour", "resets_at": "...", "observed_at": "..."},
+                                       // ^ the latest 429 seen, as a FACT; the verdict is:
+    "wall_active": true,
+    "wall_evidence": ["transcript_429", "pane_limit_menu"],
+                                       // | account_5h_exhausted | account_7d_exhausted
+                                       // | account_model_exhausted (per-model weekly, for
+                                       //   dominant_model_key only)
+    "wall_kind": "five_hour", "wall_resets_at": "...",
+                                       // ^ latest reset among the signals that HAVE one
+    "wall_reset_partial": false,       // true => some attesting signal has no reset at all,
+                                       //   so wall_resets_at is a floor, not the end
+    "wall_open_ended": [],             // those signals, e.g. ["account_model_exhausted"]
+    "wall_notes": [],                  // human-readable caveats behind the verdict
+    "wall_429_discounted": null,       // or why a recorded 429 was not counted
+    "dominant_model": "claude-opus-5", // model carrying the most NEW tokens in the window;
+                                       //   null when the window holds no spend
+    "dominant_model_key": null,        // its key into accounts[].per_model_weekly_pct, or
+                                       //   null when that model has no per-model cap here
+    "attribution": {"kind": "estimate", "basis": "...",
+                    "account_window_tokens": 19826832,
+                    "pane_pct_of_account_window": 100.0,   // null when unmeasured
+                    "unmeasured": false,
+                    "unmeasured_panes_on_account": 0,
+                    "approximate": false}
+  }],
+  "accounts": {"rayi2": {"known": true, "reason": null,
+                         "five_hour_pct": 3.0, "seven_day_pct": 59.0,
+                         "headroom_5h_pct": 97.0, "headroom_7d_pct": 41.0,
+                         "five_hour_resets_at": "...", "seven_day_resets_at": "...",
+                         "live_panes": 1, "disabled": false,   // every configured account is
+                                                               // listed, even with 0 live panes
+                         "last_observed_ts": "...",
+                         "age_seconds": 224.9, "unmeasured_panes": 0,
+                         "per_model_weekly_pct": {"Fable": 100.0},
+                                                               // last-known per-model weekly
+                                                               // usage; {} when never polled
+                         "per_model_weekly_stale": false}}     // true whenever known is false
+}
+```
+
+`--me --json` returns the same envelope with a single `pane` object in place of
+`panes`. `known: false` on an account means the percentages are `null` and
+`reason` says why; treat it as "unknown capacity", not "plenty".
 
 ## SOS — when human action is needed
 
