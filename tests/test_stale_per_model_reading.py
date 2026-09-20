@@ -330,6 +330,13 @@ def test_normal_poll_of_stale_account_refreshes_and_clears():
                     "refresh_token": "fresh-refresh-token",
                     "expires_in": 3600,
                 }).encode())
+            if req.full_url == cus.PROFILE_API_URL:
+                # GH #237 (2026-09-20): a successful poll also reads the plan
+                # tier from the profile endpoint once an hour, with the SAME
+                # fresh token. This test's requirement is the usage poll below;
+                # the tier read is served, not forbidden.
+                assert req.headers.get("Authorization") == "Bearer fresh-access-token"
+                return _FakeResponse(json.dumps({"organization": {"rate_limit_tier": "default_claude_max_5x"}}).encode())
             assert req.full_url == cus.USAGE_API_URL
             assert req.headers.get("Authorization") == "Bearer fresh-access-token"
             return _FakeResponse(json.dumps({
@@ -338,6 +345,7 @@ def test_normal_poll_of_stale_account_refreshes_and_clears():
             }).encode())
 
         unstub = _stub_urlopen(fake_urlopen)
+        cus._PLAN_TIER_PROBE_CACHE.clear()
         try:
             usage = cus.poll_account_usage("spare")
         finally:
