@@ -330,14 +330,15 @@ def test_launch_lane_accepts_a_lane_that_already_holds_its_own_claimed_family():
         assert "SAME OAuth refresh-token family" in str(ei.value)
         (cus.slot_path(lane) / ".credentials.json").write_text(json.dumps(
             {"claudeAiOauth": {"accessToken": "at-a1", "refreshToken": "rt-a1", "expiresAt": 2_000_000_000_000}}))
-        # controls: gate off => still #104; leased for ANOTHER account => still #104
-        with pytest.raises(click.ClickException) as ei:
-            cus._launch_prepare("alpha", state, cus.deep_merge(config, {"independent_logins": {"use_independent_logins": False}}),
-                                lane=lane, dry_run=True)
-        assert "GH #104" in str(ei.value)
+        # PR #240 third pass: a lane that HOLDS the account is a restart — no
+        # install runs, so neither the gate nor the lease can refuse it; only the
+        # bytes can. Gate off => still accepted; lease for ANOTHER account => the
+        # bytes are still distinct => accepted (the lease is bookkeeping).
+        got = cus._launch_prepare("alpha", state, cus.deep_merge(config, {"independent_logins": {"use_independent_logins": False}}),
+                                  lane=lane, dry_run=True)
+        assert got[0] == lane
         st2 = cus.load_state(); st2["slots"][lane]["login_family"] = "beta/family-1"; cus.save_state(st2)
-        with pytest.raises(click.ClickException):
-            cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)
+        assert cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)[0] == lane
     finally:
         env.restore()
 
@@ -370,11 +371,13 @@ def test_launch_dry_run_refuses_before_any_write_and_succeeds_without_writing():
 # PR #240 blind review (2026-09-20): six HIGHs, each with the test it asked for.
 # ==========================================================================
 
-def test_launch_lane_refuses_an_aliased_lease_and_a_missing_store():
-    """H1. The lease string proves nothing: a family reclaimed while this lane
-    was idle is LIVE elsewhere (aliasing) => refuse; a lease naming a family
-    with no store => refuse. Both were accepted before, with a message that
-    claimed the opposite."""
+def test_aliased_or_missing_lease_is_a_note_and_only_shared_bytes_refuse(capsys):
+    """H1 across three passes. Pass 2: an aliased lease (family reclaimed while
+    this lane was idle) or a lease naming a missing store must not be trusted.
+    Pass 3: neither may REFUSE a lane that holds the account either — no install
+    runs, so the lease is bookkeeping; the bytes are the decision. So: with the
+    lane's mount carrying the live lane's bytes => refused FOR THE BYTES; with
+    distinct bytes => accepted, and the stale lease is a printed note."""
     env = _Env(accounts=("alpha", "beta"))
     try:
         env.set_config({"independent_logins": {"use_independent_logins": True}})
@@ -383,13 +386,19 @@ def test_launch_lane_refuses_an_aliased_lease_and_a_missing_store():
         live_lane = env.make_slot("alpha", live=True, family_id="family-1")   # reclaimed it
         state, config = cus.load_state(), cus.load_config()
         assert cus.leased_families("alpha", state) == {"family-1"}
+        mount = cus.slot_path(lane) / ".credentials.json"                      # fixture: rt-alpha, same as live_lane
         with pytest.raises(click.ClickException) as ei:
             cus._launch_prepare("alpha", state, config, lane=lane, dry_run=True)
-        assert ("LIVE on " + live_lane) in str(ei.value) and "stale" in str(ei.value)
+        assert "SAME OAuth refresh-token family" in str(ei.value)             # the bytes, not the lease
+        mount.write_text(_creds_blob("rt-mine"))                                # distinct bytes
+        capsys.readouterr()
+        assert cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)[0] == lane
+        out = capsys.readouterr().out
+        assert "note —" in out and ("LIVE on " + live_lane) in out and "stale bookkeeping" in out
         st = cus.load_state(); st["slots"][lane]["login_family"] = "alpha/family-9"; cus.save_state(st)
-        with pytest.raises(click.ClickException) as ei:
-            cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)
-        assert "family-9" in str(ei.value) and "missing" in str(ei.value)
+        assert cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)[0] == lane
+        out = capsys.readouterr().out
+        assert "note —" in out and "family-9" in out and "missing" in out
     finally:
         env.restore()
 
@@ -800,3 +809,104 @@ def test_dry_run_blank_source_refuses_and_dead_shaped_held_mount_only_warns(caps
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ==========================================================================
+# PR #240 third pass (2026-09-20): a restart of a lane that already holds the
+# account must proceed on clean bytes (dry-run AND real), and the two
+# tracebacks after "Safe to proceed" are refusals / click errors.
+# ==========================================================================
+
+def _isolate_claude_json(env):
+    """The real launch's .claude.json sync reads cus.CLAUDE_JSON; keep it in the
+    throwaway tree (absent => the sync is skipped) rather than the operator's."""
+    saved = cus.CLAUDE_JSON
+    cus.CLAUDE_JSON = env.accounts_dir / "claude.json"
+    return saved
+
+
+def test_restart_of_a_lane_that_holds_the_account_proceeds_on_clean_bytes_dry_and_real(capsys):
+    """Item 1, both seats. The lane holds alpha with DISTINCT bytes; its lease is
+    dangling (store retired while idle), then aliased (a live lane leases the
+    same family), then absent with the gate off and the lane itself LIVE
+    (Sonnet's repro). All four: accepted, dry-run and real; the mount is untouched."""
+    env = _Env(accounts=("alpha", "beta"))
+    saved_cj = _isolate_claude_json(env)
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        live_lane = env.make_slot("alpha", live=True, family_id="family-2")
+        env.plant_family("alpha", "family-2", "rt-a2")
+        lane = env.make_slot("alpha", live=False, family_id="family-7")       # dangling: no family-7 store
+        mount = cus.slot_path(lane) / ".credentials.json"
+        mount.write_text(_creds_blob("rt-mine"))                              # distinct from rt-alpha / rt-a2
+        for label, lease in (("dangling", "alpha/family-7"), ("aliased", "alpha/family-2")):
+            st = cus.load_state(); st["slots"][lane]["login_family"] = lease; cus.save_state(st)
+            assert cus._live_family_would_collide("alpha", mount, lane, cus.load_state(), cus.load_config()) is False
+            for dry in (True, False):
+                before = mount.read_bytes()
+                got = cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=dry)
+                assert got[0] == lane, (label, dry, got)
+                assert mount.read_bytes() == before, (label, dry)             # restart: no install
+                out = capsys.readouterr().out
+                assert "restart, no install" in out and "note —" in out, (label, dry, out)
+        # Sonnet's repro: gate OFF, the lane itself is the live mount, no lease
+        env.set_config({})
+        st = cus.load_state(); st["slots"][lane].pop("login_family", None); cus.save_state(st)
+        env.live_slots.add(lane); cus._OCCUPIED_SLOTS_CACHE.clear()
+        for dry in (True, False):
+            got = cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=dry)
+            assert got[0] == lane, (dry, got)
+        # ...and the same restart with SHARED bytes is still refused, dry and real
+        mount.write_text(_creds_blob("rt-alpha"))
+        for dry in (True, False):
+            with pytest.raises(click.ClickException) as ei:
+                cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=dry)
+            assert "SAME OAuth refresh-token family" in str(ei.value)
+    finally:
+        cus.CLAUDE_JSON = saved_cj
+        env.restore()
+
+
+def test_missing_mount_creds_is_a_refusal_in_dry_run_and_a_click_error_for_real():
+    """Item 2 (H4-1). State says the lane holds an account, the mount's
+    .credentials.json is gone: the old dry-run said "Safe to proceed" and the
+    real launch died with a raw FileNotFoundError."""
+    env = _Env(accounts=("alpha", "beta"))
+    saved_cj = _isolate_claude_json(env)
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        st = cus.load_state(); st["active"] = "beta"; cus.save_state(st)
+        lane = env.make_slot("alpha", live=False)
+        (cus.slot_path(lane) / ".credentials.json").unlink()
+        with pytest.raises(click.ClickException) as ei:
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=True)
+        assert ".credentials.json" in str(ei.value) and "FileNotFoundError" in str(ei.value)
+        with pytest.raises(click.ClickException) as ei:                        # not FileNotFoundError
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=False)
+        assert "missing" in str(ei.value)
+    finally:
+        cus.CLAUDE_JSON = saved_cj
+        env.restore()
+
+
+def test_pool_exhaustion_at_the_claim_probe_is_a_click_error_not_a_traceback():
+    """Item 2 (H4-2). Dry-run sees a free family and passes (the grant probe is
+    declared not covered); the executor's probe retires it and raises a plain
+    RuntimeError, which used to escape `cus launch --lane` as a stack trace."""
+    env = _Env(accounts=("alpha", "beta"))
+    saved_cj = _isolate_claude_json(env)
+    saved_claim = cus.claim_verified_login_family
+    try:
+        env.set_config({"independent_logins": {"use_independent_logins": True}})
+        env.make_slot("alpha", live=True)                                     # alpha live elsewhere
+        lane = env.make_slot("beta", live=False)
+        env.plant_family("alpha", "family-1", "rt-a1")
+        assert cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=True)[0] == lane
+        cus.claim_verified_login_family = lambda *a, **k: None                # the probe retired the pool
+        with pytest.raises(click.ClickException) as ei:
+            cus._launch_prepare("alpha", cus.load_state(), cus.load_config(), lane=lane, dry_run=False)
+        assert "pool exhausted" in str(ei.value) and "login-mount alpha" in str(ei.value)
+    finally:
+        cus.claim_verified_login_family = saved_claim
+        cus.CLAUDE_JSON = saved_cj
+        env.restore()

@@ -23899,6 +23899,12 @@ def _launch_install_plan(account: str, lane: str, slot_dir: Path, state: dict, c
              "kind": "mount"|"pooled-family"|"legacy-store"|"snapshot"|None,
              "family": str|None, "pool_exhausted": bool, "snapshot_dead_shape": bool}.
 
+    Mode caveat (PR #240 third pass): "held elsewhere" counts the shared
+    ~/.claude mount unconditionally only in `global` / `hybrid`. In
+    `per_session`, `_shared_mount_holds` / `_account_held_by_other_live_mount`
+    fall back to `mount_in_use(CLAUDE_DIR)`, which cannot see bare sessions
+    (#141), so a snapshot install beside them is not detected — GH #241.
+
     Mirrors the executor's order: a lane that already HOLDS the account gets no
     install at all (so the mount's own bytes are what will run); otherwise, if
     the account is live on another mount, a free pooled family is claimed first
@@ -23970,6 +23976,19 @@ def _dry_run_preflight_checks(lane: str, slot_dir: Path, account: str, state: di
             f"the shared tree — claude --resume would not find shared transcripts and new ones would "
             f"be stranded (GH #192). Resolve the collisions under {slot_dir / 'projects'} manually "
             f"(`cus doctor --fix-dirs` to retry), or launch without --lane. [dry-run: read-only check]")
+    # PR #240 third pass (H4-1): state records an account on this lane but the
+    # mount's .credentials.json is gone. Every real path then dies in the swap
+    # executor's save-back with a FileNotFoundError (`cus slot move` too) —
+    # AFTER "Safe to proceed". Answer it here, read-only.
+    cur = (state.get("slots", {}).get(lane, {}) or {}).get("account")
+    if cur and not mount_creds_path(slot_dir).exists():
+        raise click.ClickException(
+            f"refusing --lane {lane}: state records '{cur}' on it but its mount has no "
+            f".credentials.json ({mount_creds_path(slot_dir)}) — the launch's save-back of that "
+            f"account would fail (FileNotFoundError; `cus slot move {lane} ...` stops on the same "
+            f"thing). Restore the file from account-{cur}'s snapshot "
+            f"(`cp {ACCOUNTS_DIR / f'account-{cur}' / '.credentials.json'} {mount_creds_path(slot_dir)}`) "
+            f"or run `cus doctor`, then retry. [dry-run: read-only check]")
     gate_on = config.get("launch_gate", {}).get("enabled", True)
     plan = _launch_install_plan(account, lane, slot_dir, state, config)
     if plan["holds_account"]:
@@ -24373,6 +24392,7 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
         # the LEGACY per-(slot, account) store and refused — after the caller
         # had already killed the pane's old claude. Recognise the lease.
         lane_lease = slot_leased_family(state, lane) if lane is not None else None
+        lease_notes: list[str] = []
         if (lane is not None and independent_logins_enabled(config)
                 and lane_lease is not None and lane_lease[0] == account
                 and (state.get("slots", {}).get(lane, {}) or {}).get("account") == account):
@@ -24403,24 +24423,27 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                 store_ok = store.exists() and _credential_refresh_token(read_json(store)) is not None
             except (json.JSONDecodeError, OSError):
                 store_ok = False
+            # PR #240 third pass (both seats): these two used to REFUSE here,
+            # ahead of the bytes decision — on exactly the restart-after-
+            # `cus slot move` case #238-D exists for. A lane that holds the
+            # account gets NO install (the executor no-ops), so its lease is
+            # bookkeeping about a store that will not be read; a dangling or
+            # aliased lease with clean mount bytes is stale bookkeeping, not a
+            # hazard. Say so; the bytes check below decides.
             if fam in others_live:
-                raise click.ClickException(
-                    f"refusing --lane {lane}: its lease names '{account}/{fam}', but that family is LIVE "
-                    f"on {others_live[fam]} — the lease is stale (the family was reclaimed while {lane} was "
-                    f"idle) and launching on it would put two live mounts on one refresh-token family "
-                    f"(GH #104). Re-home the lane to claim a fresh family: `cus slot move {lane} "
-                    f"<other-acct>` then `cus slot move {lane} {account}` (dry-run first), or "
-                    f"`cus login-mount {account}` to mint one.")
-            if not store_ok:
-                raise click.ClickException(
-                    f"refusing --lane {lane}: its lease names '{account}/{fam}' but that family's store "
-                    f"({store}) is missing or carries no refresh token — nothing to run on. Re-home the "
-                    f"lane (`cus slot move {lane} {account}`, dry-run first) to claim a usable family, or "
-                    f"`cus login-mount {account}` to mint one.")
-            independent_ok = True
-            click.echo(f"launch: {lane} holds its own claimed login family for '{account}' ({fam}) — "
-                       f"lease verified (not leased by another live lane, store present); the token "
-                       f"bytes are checked next (GH #109/#238-D)")
+                lease_notes.append(
+                    f"{lane}'s lease names '{account}/{fam}' but that family is LIVE on "
+                    f"{others_live[fam]} — stale bookkeeping from an idle-time reclaim; the lane's own "
+                    f"mount bytes decide (a `cus slot move` will re-lease it cleanly)")
+            elif not store_ok:
+                lease_notes.append(
+                    f"{lane}'s lease names '{account}/{fam}' but that family's store ({store}) is "
+                    f"missing or has no refresh token — irrelevant to a restart (no install runs); the "
+                    f"lane's own mount bytes decide")
+            else:
+                click.echo(f"launch: {lane} holds its own claimed login family for '{account}' ({fam}) — "
+                           f"lease verified (not leased by another live lane, store present); the token "
+                           f"bytes are checked next (GH #109/#238-D)")
         if lane is not None:
             # THE decision (PR #240 second pass, H1): whether two live mounts
             # would share a refresh-token family is a property of the BYTES that
@@ -24451,7 +24474,20 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
                     f"logout). Re-home the lane to claim a distinct family (`cus slot move {lane} "
                     f"<other-acct>` then `cus slot move {lane} {account}`, dry-run first) or "
                     f"`cus login-mount {account}` to mint one.")
-            if plan["kind"] in ("pooled-family", "legacy-store") and not independent_ok:
+            if plan["kind"] == "mount":
+                # THE #238-D case: the lane already holds the account and is simply
+                # being (re)started — the executor installs nothing, and the bytes
+                # that will run were just verified not to be shared with any other
+                # live mount of the account (the "other live mount" the trigger saw
+                # may even be this very lane). Proceed; a lease that disagreed with
+                # clean bytes is reported as a note, never a refusal (PR #240 third
+                # pass, both seats — this refused with a misleading #104 message).
+                independent_ok = True
+                for note in lease_notes:
+                    click.echo(click.style(f"launch: note — {note}", fg="yellow"))
+                click.echo(f"launch: {lane} already holds '{account}' — restart, no install; its mount's "
+                           f"token bytes are not shared with any other live mount of '{account}' (GH #238-D)")
+            elif plan["kind"] in ("pooled-family", "legacy-store") and not independent_ok:
                 # The executor would claim/install a DISTINCT family for this lane
                 # (verified above not to collide), which is the supported GH #109
                 # second-lane path — let it.
@@ -24624,6 +24660,26 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             # `auto` re-picks. Surface the guard's remediation cleanly rather
             # than crashing with a raw traceback. (2026-08-30 follow-up.)
             raise click.ClickException(str(e)) from e
+        except FileNotFoundError as e:
+            # PR #240 third pass (H4-1): the executor's save-back raises this when
+            # the lane's recorded account has no creds file on the mount. An
+            # operator gets the remediation, not a stack trace.
+            raise click.ClickException(
+                f"launch --lane {slot_name}: could not install '{account}' — {e}. The lane's state "
+                f"records an account whose mount credentials file is missing; restore that file from "
+                f"the account's snapshot (or `cus doctor`) and retry. Lane left as it was, no creds "
+                f"written.") from e
+        except RuntimeError as e:
+            # PR #240 third pass (H4-2): the same F-O-5 handler the auto path has.
+            # Pool exhaustion after the claim probe retires a family, the #141
+            # blank gate, the #104 collision guard and the dead-canonical guards
+            # all surface as RuntimeError from the executor; on --lane they used
+            # to escape as a traceback after a green --dry-run.
+            raise click.ClickException(
+                f"launch --lane {slot_name}: could not install '{account}' onto {slot_name} — {e} "
+                f"Provision a fresh family (`cus login-mount {account}`), re-home the lane "
+                f"(`cus slot move {slot_name} {account}`), or retry. Lane left on its prior account "
+                f"(no creds written).") from e
     else:
         # ---- Auto-pick: bounded re-pick past an unusable slot ----
         # GH #192 root cause: launch exec'd claude onto a slot whose projects/
@@ -24733,7 +24789,7 @@ def _prefer_as_oom_victim() -> None:
               help="Rotation-set for this slot (GH #99). premium: honor the per-model weekly gate (swap off model-exhausted accounts). standard: ignore it (keep using their aggregate headroom). Default: per_session.default_pool.")
 @click.option("--force", is_flag=True, help="Launch even onto an account already live on another mount (GH #104: normally refused — two live mounts on one account sign one out).")
 @click.option("--lane", default=None, help="Launch into a specific slot (e.g. slot-8) instead of auto-picking. With independent_logins on and the lane holding its OWN login family for the account — provisioned by `cus login-mount <lane> <account>`, or already claimed for it by `cus slot move <lane> <account>` (GH #238-D) — this is how you give one account a 2nd independently-swappable lane (GH #109).")
-@click.option("--dry-run", "dry_run", is_flag=True, help="Pre-flight only (GH #238-D): run every refusal check that can be answered without writing — #104 on REAL token bytes (the family that would run under the lane vs every live mount, shared mount included), lock, lane/account mismatch, subscription, GH #192 projects/, pool exhaustion, the #141 blank-source gate, dead legacy store shape — and print the slot/account the launch would use. Writes NOTHING: no poll (auto picks from cached readings), no scaffold, reservation, heal, sync, install or state entry. Not covered: a refresh-grant probe (a store/mount/snapshot dead only at the grant), and the executor may claim a different family than the one checked if its probe retires one. Run this BEFORE killing a pane's old claude when splitting it into its own lane.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="Pre-flight only (GH #238-D): run every refusal check that can be answered without writing — #104 on REAL token bytes (the family that would run under the lane vs every live mount — the shared mount included in global/hybrid; in per_session only when it is detectable, bare sessions there are GH #241), lock, lane/account mismatch, subscription, GH #192 projects/, pool exhaustion, the #141 blank-source gate, dead legacy store shape — and print the slot/account the launch would use. Writes NOTHING: no poll (auto picks from cached readings), no scaffold, reservation, heal, sync, install or state entry. Not covered: a refresh-grant probe (a store/mount/snapshot dead only at the grant), the executor may claim a different family than the one checked if its probe retires one, and bare sessions on the shared mount in per_session (GH #241). Run this BEFORE killing a pane's old claude when splitting it into its own lane.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def launch_cmd(account: str | None, pool: str | None, force: bool, lane: str | None, claude_args: tuple[str, ...], dry_run: bool = False) -> None:
     """Launch claude in its own slot, pinned to an account (per_session).
