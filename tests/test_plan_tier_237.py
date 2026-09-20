@@ -251,7 +251,8 @@ def test_a_429_poll_keeps_the_tier_the_subscription_probe_already_read(monkeypat
 
 def _acct(pct5=20.0, **extra):
     a = {"current_5h_pct": pct5, "current_7d_pct": 5.0, "last_observed_ts": _iso(NOW - timedelta(minutes=2)),
-         "five_hour_resets_at": _iso(NOW + timedelta(hours=3)), "burn_rate_5h_pct_per_min": 0.5}
+         "five_hour_resets_at": _iso(NOW + timedelta(hours=3)), "burn_rate_5h_pct_per_min": 0.5,
+         "burn_rate_5h_measured": True}
     a.update(extra)
     return a
 
@@ -305,6 +306,7 @@ def test_me_prints_plan_burn_both_ways_sizing_and_placement(monkeypatch, tmp_pat
     # the panes fixture evaluates at its own fixed NOW; stamp the reading there
     state["accounts"]["rayi5"]["plan_tier_profile"] = {"raw": "default_claude_max_20x", "observed_ts": _iso(PV_NOW)}
     state["accounts"]["rayi5"]["burn_rate_5h_pct_per_min"] = 0.4
+    state["accounts"]["rayi5"]["burn_rate_5h_measured"] = True
     row, head = _pane_on(monkeypatch, tmp_path, "s-tier", FABLE_HEAVY, state)
     other = cus.account_headroom({"current_5h_pct": 40.0, "current_7d_pct": 10.0,
                                   "last_observed_ts": _iso(datetime.now(timezone.utc)),
@@ -321,18 +323,23 @@ def test_me_prints_plan_burn_both_ways_sizing_and_placement(monkeypatch, tmp_pat
     assert "PLACEMENT" in text and "small 5x 60% left ≈" in text and "mystery" in text   # unknown named, not estimated
     assert "(target burn unmeasured — assumes idle)" in text                                # PR #242 H2: said, not silent
     sz = cus.sizing_estimate(payload, row, head, _cfg())
-    assert sz["pts_per_min_est"] == sz["new_tokens_per_min"] / 100_000
-    # own account: the account's measured burn (all panes, includes this one) is
-    # the rate — and the answer is capped at the window's reset (H2), which the
-    # fixture puts 3h out
+    # Hard-coded expectations (focused pass: the old assertions re-derived the
+    # rule from the code's own outputs). FABLE_HEAVY = 10,000 new tokens in a
+    # 30-min window = 333.3 tokens/min; on 20x (100k tokens/pt) = 0.003333 pts/min.
+    assert sz["new_tokens_per_min"] == pytest.approx(333.33, abs=0.1)
+    assert sz["pts_per_min_est"] == pytest.approx(0.003333, abs=1e-5)
+    # own account: the account's measured 0.40 pts/min (all panes) beats this
+    # pane's 0.0033, so 88% headroom lasts 220 min; the window resets in 180 min
+    # and REFILLS — reported, not used as a cap
     own = sz["own_wall"]
-    uncapped = head["headroom_5h_pct"] / max(0.4, sz["pts_per_min_est"])
-    assert own["minutes_to_reset"] == pytest.approx(180.0, abs=1.0)
-    assert sz["minutes_to_wall_est"] == pytest.approx(min(uncapped, own["minutes_to_reset"]))
-    assert own["capped_by_reset"] is (uncapped > own["minutes_to_reset"])
+    assert own["rate_basis"] == "account"
+    assert sz["minutes_to_wall_est"] == pytest.approx(220.0, abs=0.5)
+    assert own["minutes_to_reset"] == pytest.approx(180.0, abs=1.0) and own["reset_before_wall"] is True
+    assert "resets first, in 180 min, and refills" in text
+    # 'small' (5x, 25k tokens/pt): 60% / (333.3/25000 = 0.01333 pts/min) = 4500 min, idle assumed
     small = next(t for t in sz["targets"] if t["account"] == "small")
     assert small["target_burn_measured"] is False
-    assert small["minutes_to_wall_est"] == pytest.approx(60.0 / (sz["new_tokens_per_min"] / 25_000))
+    assert small["minutes_to_wall_est"] == pytest.approx(4500.0, abs=2.0)
     assert next(t for t in sz["targets"] if t["account"] == "mystery")["minutes_to_wall_est"] is None
     json.dumps(sz)
     # no tier anywhere: every estimate is None and the text says so
@@ -409,15 +416,20 @@ def test_wall_estimate_counts_the_targets_own_burn_and_its_reset():
     assert w["minutes"] == pytest.approx(60.0 / 3.5)
     idle = cus.wall_estimate(60.0, 50_000, five, cfg)                           # unmeasured: assumes idle, SAYS so
     assert idle["minutes"] == 30.0 and idle["target_burn_measured"] is False
-    capped = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=1.5,
-                               resets_at=_iso(NOW + timedelta(minutes=4)), now=NOW)
-    assert capped["minutes"] == pytest.approx(4.0) and capped["capped_by_reset"] is True
+    soon = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=1.5,
+                             resets_at=_iso(NOW + timedelta(minutes=4)), now=NOW)
+    assert soon["minutes"] == pytest.approx(60.0 / 3.5)                          # UNCAPPED: the reset refills
+    assert soon["reset_before_wall"] is True and soon["minutes_to_reset"] == pytest.approx(4.0)
     past = cus.wall_estimate(60.0, 50_000, five, cfg, resets_at=_iso(NOW - timedelta(minutes=4)), now=NOW)
-    assert past["capped_by_reset"] is False and past["minutes"] == 30.0        # a past reset is no cap
+    assert past["reset_before_wall"] is False and past["minutes"] == 30.0       # a past reset is nothing
     own = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=3.0, own_account=True)
-    assert own["minutes"] == pytest.approx(60.0 / 3.0)                          # max(3.0, 2.0), not the sum
+    assert own["minutes"] == pytest.approx(60.0 / 3.0) and own["rate_basis"] == "account"   # max(3.0, 2.0)
     own2 = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=0.5, own_account=True)
-    assert own2["minutes"] == pytest.approx(60.0 / 2.0)
+    assert own2["minutes"] == pytest.approx(60.0 / 2.0) and own2["rate_basis"] == "payload"
+    # HIGH 1 (focused pass): a measured 0.0 is a real idle reading; None is not a measurement
+    zero = cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=0.0)
+    assert zero["target_burn_measured"] is True and zero["minutes"] == 30.0
+    assert cus.wall_estimate(60.0, 50_000, five, cfg, target_burn_pts_per_min=True)["target_burn_measured"] is False
     assert cus.minutes_until_wall(60.0, 50_000, five, cfg, target_burn_pts_per_min=1.5) == pytest.approx(60.0 / 3.5)
 
 
@@ -428,7 +440,7 @@ def test_placement_line_shows_the_targets_burn_and_a_reset_cap(monkeypatch, tmp_
     row, head = _pane_on(monkeypatch, tmp_path, "s-place", FABLE_HEAVY, state)
     busy = cus.account_headroom({"current_5h_pct": 40.0, "current_7d_pct": 10.0, "last_observed_ts": _iso(PV_NOW),
                                  "five_hour_resets_at": _iso(PV_NOW + timedelta(hours=3)),
-                                 "burn_rate_5h_pct_per_min": 1.5,
+                                 "burn_rate_5h_pct_per_min": 1.5, "burn_rate_5h_measured": True,
                                  "plan_tier_profile": {"raw": "default_claude_max_5x", "observed_ts": _iso(PV_NOW)}}, PV_NOW)
     soon = cus.account_headroom({"current_5h_pct": 40.0, "current_7d_pct": 10.0, "last_observed_ts": _iso(PV_NOW),
                                  "five_hour_resets_at": _iso(PV_NOW + timedelta(minutes=4)),
@@ -436,11 +448,12 @@ def test_placement_line_shows_the_targets_burn_and_a_reset_cap(monkeypatch, tmp_
     payload = _payload([row], {"rayi5": head, "busy": busy, "soon": soon})
     text = cus.render_me(payload, row)
     assert "busy 5x 60% left ≈" in text and "(+1.50 pts/min already burning there)" in text
-    assert "soon 5x 60% left ≈ 4 min" in text and "[resets first, 4 min]" in text
+    assert "soon 5x 60% left ≈ 4500 min" in text and "[window resets in 4 min and refills]" in text
+    assert text.index("soon 5x") < text.index("busy 5x")        # ranked longest first; a refill is not a demotion
     sz = cus.sizing_estimate(payload, row, head, _cfg())
     b = next(t for t in sz["targets"] if t["account"] == "busy")
-    assert b["minutes_to_wall_est"] == pytest.approx(60.0 / (1.5 + sz["new_tokens_per_min"] / 25_000))
-    assert next(t for t in sz["targets"] if t["account"] == "soon")["capped_by_reset"] is True
+    assert b["minutes_to_wall_est"] == pytest.approx(60.0 / (1.5 + 0.013333), abs=0.5)   # 60 / (1.5 + 333.3/25000)
+    assert next(t for t in sz["targets"] if t["account"] == "soon")["reset_before_wall"] is True
 
 
 def test_a_profile_without_the_tier_field_keeps_the_last_good_reading(monkeypatch):
@@ -496,6 +509,40 @@ def test_age_formatting_floors_and_never_goes_negative():
     assert cus._fmt_age_short(-180) == "0m"
     assert cus._fmt_age_short(95 * 60) == "1h"
     assert cus._fmt_age_short(3 * 86400) == "3d"
+
+
+def test_a_stored_zero_burn_is_not_a_measurement_unless_the_daemon_says_so():
+    """Focused pass HIGH 1: `_compute_burn_rate` returns 0.0 for every not-
+    computable case and a window rollover stores a literal 0.0; that used to
+    render as "+0.00 pts/min already burning there" — a confident false
+    measurement. Ground truth is the daemon's own flag from two readings of
+    the same window."""
+    base = {"current_5h_pct": 40.0, "current_7d_pct": 10.0, "last_observed_ts": _iso(NOW),
+            "five_hour_resets_at": _iso(NOW + timedelta(hours=3)),
+            "plan_tier_profile": {"raw": "default_claude_max_5x", "observed_ts": _iso(NOW)}}
+    sentinel = cus.account_headroom(dict(base, burn_rate_5h_pct_per_min=0.0), NOW)          # older state / rollover
+    rollover = cus.account_headroom(dict(base, burn_rate_5h_pct_per_min=0.0, burn_rate_5h_measured=False), NOW)
+    idle = cus.account_headroom(dict(base, burn_rate_5h_pct_per_min=0.0, burn_rate_5h_measured=True), NOW)
+    boolish = cus.account_headroom(dict(base, burn_rate_5h_pct_per_min=True, burn_rate_5h_measured=True), NOW)
+    assert sentinel["burn_5h_pct_per_min_measured"] is None
+    assert rollover["burn_5h_pct_per_min_measured"] is None
+    assert idle["burn_5h_pct_per_min_measured"] == 0.0
+    assert boolish["burn_5h_pct_per_min_measured"] is None
+    five = _tier("default_claude_max_5x")
+    for h, expect_measured in ((sentinel, False), (rollover, False), (idle, True)):
+        w = cus.wall_estimate(60.0, 50_000, five, _cfg(), target_burn_pts_per_min=h["burn_5h_pct_per_min_measured"])
+        assert w["target_burn_measured"] is expect_measured
+    # and the daemon sets the flag: two readings of one window => measured; a rollover => not
+    st = {"active": "a", "accounts": {"a": {"current_5h_pct": 10.0, "five_hour_resets_at": _iso(NOW + timedelta(hours=1)),
+                                             "last_observed_ts": _iso(NOW - timedelta(minutes=5))}}, "slots": {}}
+    u = cus.AccountUsage(five_hour=cus.UsageWindow(20.0, _iso(NOW + timedelta(hours=1))),
+                         seven_day=cus.UsageWindow(5.0, None), polled_at=_iso(NOW))
+    cus.update_state_with_usage(st, {"a": u})
+    assert st["accounts"]["a"]["burn_rate_5h_measured"] is True and st["accounts"]["a"]["burn_rate_5h_pct_per_min"] == pytest.approx(2.0)
+    u2 = cus.AccountUsage(five_hour=cus.UsageWindow(1.0, _iso(NOW + timedelta(hours=6))),
+                          seven_day=cus.UsageWindow(5.0, None), polled_at=_iso(NOW + timedelta(minutes=5)))
+    cus.update_state_with_usage(st, {"a": u2})
+    assert st["accounts"]["a"]["burn_rate_5h_measured"] is False and st["accounts"]["a"]["burn_rate_5h_pct_per_min"] == 0.0
 
 
 if __name__ == "__main__":

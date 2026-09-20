@@ -5494,35 +5494,50 @@ def wall_estimate(headroom_pct: float | None, new_tokens_per_min: float | None, 
     walls a lane mid-job).
 
     Returns {"minutes", "payload_pts_per_min", "target_burn_pts_per_min",
-             "target_burn_measured", "minutes_to_reset", "capped_by_reset"}.
+             "target_burn_measured", "minutes_to_reset", "reset_before_wall",
+             "rate_basis"}.
       * rate = payload + target's measured burn (another account), or
         max(account's measured burn, payload) for the pane's OWN account —
         the account figure already includes this pane, so adding would double
-        count. An unmeasured target burn is treated as 0 and SAID so
-        (target_burn_measured=False): "assumes idle", never silently.
-      * the answer is capped at the minutes left to `resets_at`: headroom that
-        expires in ten minutes is not headroom (watch.md: points AND time).
+        count; `rate_basis` names which arm won. An unmeasured target burn is
+        treated as 0 and SAID so (target_burn_measured=False): "assumes idle",
+        never silently. A measured 0.0 is a real idle reading.
+      * `minutes` is how long the current headroom lasts, UNCAPPED;
+        `reset_before_wall` says the 5h window refills before that — good
+        news for a target, reported next to it, never used to rank it down.
       * None when the tier cannot size, the headroom is unknown, or nothing
         burns."""
     now = now or datetime.now(timezone.utc)
     payload = projected_pts_per_min(new_tokens_per_min, tier, config)
-    measured = isinstance(target_burn_pts_per_min, (int, float))
+    # None means "no measurement" (account_headroom passes None for a rollover
+    # sentinel or an older state.json); a float — 0.0 included — is a real
+    # two-reading measurement. bool is never a rate.
+    measured = isinstance(target_burn_pts_per_min, (int, float)) and not isinstance(target_burn_pts_per_min, bool)
     tb = float(target_burn_pts_per_min) if measured else 0.0
     out = {"minutes": None, "payload_pts_per_min": payload,
            "target_burn_pts_per_min": tb if measured else None, "target_burn_measured": measured,
-           "minutes_to_reset": None, "capped_by_reset": False}
+           "minutes_to_reset": None, "reset_before_wall": False, "rate_basis": None}
     t_reset = _panes_parse_ts(resets_at)
     if t_reset is not None and t_reset > now:
         out["minutes_to_reset"] = (t_reset - now).total_seconds() / 60.0
     if payload is None or headroom_pct is None:
         return out
-    rate = max(tb, payload) if own_account else (payload + tb)
+    if own_account:
+        # the account figure already includes this pane: the larger of the two
+        rate = max(tb, payload)
+        out["rate_basis"] = ("account" if (measured and tb >= payload)
+                             else ("payload" if measured else "payload-only"))
+    else:
+        rate = payload + tb
+        out["rate_basis"] = "payload+target" if measured else "payload-only"
     if rate <= 0:
         return out
-    mins = float(headroom_pct) / rate
-    if out["minutes_to_reset"] is not None and out["minutes_to_reset"] < mins:
-        mins, out["capped_by_reset"] = out["minutes_to_reset"], True
-    out["minutes"] = mins
+    # `minutes` is how long the CURRENT headroom lasts at this rate — uncapped.
+    # A 5h reset that comes first REFILLS the window, so it is good news, not a
+    # ceiling (focused pass: capping inverted the ranking, making the target
+    # about to refill look like the worst option). It is reported alongside.
+    out["minutes"] = float(headroom_pct) / rate
+    out["reset_before_wall"] = (out["minutes_to_reset"] is not None and out["minutes_to_reset"] < out["minutes"])
     return out
 
 
@@ -5688,6 +5703,8 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             try:
                 _attach_plan_tier(u, account_name, None,
                                   detail=sub_detail if verdict in ("active", "disabled") else None)
+            except AssertionError:
+                raise           # a test canary is never swallowed (PR #242 focused pass, HIGH 2)
             except Exception as _e:  # noqa: BLE001 — never lose the usage reading over metadata
                 click.echo(f"warning: plan-tier read failed for '{account_name}' ({type(_e).__name__}); usage reading kept")
             if verdict == "disabled":
@@ -5722,6 +5739,8 @@ def poll_account_usage(account_name: str) -> AccountUsage:
     )
     try:
         _attach_plan_tier(u, account_name, token)   # GH #237, rate-limited to one GET/hour
+    except AssertionError:
+        raise           # a test canary is never swallowed (PR #242 focused pass, HIGH 2)
     except Exception as _e:  # noqa: BLE001 — PR #242 review L3: metadata must never discard a good usage reading
         click.echo(f"warning: plan-tier read failed for '{account_name}' ({type(_e).__name__}); usage reading kept")
     return u
@@ -11205,6 +11224,20 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             _compute_burn_rate(old_5h, new_5h_val, old_poll_ts, u.polled_at)
             if old_5h_resets == new_5h_resets else 0.0
         )
+        # PR #242 review (focused pass, HIGH 1): `_compute_burn_rate` returns 0.0
+        # for every NOT-computable case and this branch stores a literal 0.0 on
+        # a window rollover, so downstream readers could not tell "measured and
+        # idle" from "no measurement" and printed a confident "+0.00 pts/min
+        # already burning" for an account that may be burning hard. This flag
+        # makes the two distinguishable: True only when two readings of the
+        # SAME window, both numeric, some time apart, produced the figure.
+        # Absent (older state.json) reads as not measured — the safe direction.
+        _t0, _t1 = _panes_parse_ts(old_poll_ts), _panes_parse_ts(u.polled_at)
+        acct["burn_rate_5h_measured"] = bool(
+            old_5h_resets == new_5h_resets
+            and isinstance(old_5h, (int, float)) and not isinstance(old_5h, bool)
+            and isinstance(new_5h_val, (int, float)) and not isinstance(new_5h_val, bool)
+            and _t0 is not None and _t1 is not None and (_t1 - _t0).total_seconds() > 0)
         acct["burn_rate_7d_pct_per_min"] = (
             _compute_burn_rate(old_7d, new_7d_val, old_poll_ts, u.polled_at)
             if old_7d_resets == new_7d_resets else 0.0
@@ -19163,8 +19196,13 @@ def account_headroom(acct: dict | None, now: "datetime",
     # its MEASURED 5h burn from the daemon's last two polls — the ground truth
     # for %/min, next to the per-pane token burn the rows carry.
     out["plan_tier"] = resolve_plan_tier(acct, now)
+    # None unless the daemon flagged the figure as a real two-reading measurement
+    # (burn_rate_5h_measured): a stored 0.0 is a rollover / not-computable
+    # sentinel unless that flag says otherwise, and a bool is never a rate.
     _br = (acct or {}).get("burn_rate_5h_pct_per_min")
-    out["burn_5h_pct_per_min_measured"] = float(_br) if isinstance(_br, (int, float)) else None
+    _ok = ((acct or {}).get("burn_rate_5h_measured") is True
+           and isinstance(_br, (int, float)) and not isinstance(_br, bool))
+    out["burn_5h_pct_per_min_measured"] = float(_br) if _ok else None
     if not acct:
         return out
     pm = acct.get("per_model_weekly_pct")
@@ -19811,7 +19849,7 @@ def sizing_estimate(payload: dict, row: dict, head: dict, config: dict | None = 
                         "target_burn_pts_per_min": w["target_burn_pts_per_min"],
                         "target_burn_measured": w["target_burn_measured"],
                         "minutes_to_reset": w["minutes_to_reset"],
-                        "capped_by_reset": w["capped_by_reset"]})
+                        "reset_before_wall": w["reset_before_wall"]})
     return {"plan_tier": tier, "new_tokens_per_min": tpm, "pts_per_min_est": ppm,
             "account_pts_per_min_measured": head.get("burn_5h_pct_per_min_measured"),
             "minutes_to_wall_est": own["minutes"], "own_wall": own,
@@ -19839,11 +19877,17 @@ def sizing_lines(payload: dict, row: dict, head: dict) -> list[str]:
     out.append(burn)
     own = sz["own_wall"]
     if sz["minutes_to_wall_est"] is not None:
-        basis = (f"account measured {own['target_burn_pts_per_min']:.2f} pts/min, all panes"
-                 if own["target_burn_measured"] else "this pane's burn only — account burn unmeasured")
-        cap = f"; the 5h window resets first, in {own['minutes_to_reset']:.0f} min" if own["capped_by_reset"] else ""
+        if own["rate_basis"] == "account":
+            basis = f"account measured {own['target_burn_pts_per_min']:.2f} pts/min, all panes"
+        elif own["rate_basis"] == "payload":
+            basis = (f"this pane's own burn, {own['payload_pts_per_min']:.2f} pts/min — larger than the "
+                     f"account's measured {own['target_burn_pts_per_min']:.2f}")
+        else:
+            basis = "this pane's burn only — account burn unmeasured"
+        refill = (f"; the 5h window resets first, in {own['minutes_to_reset']:.0f} min, and refills"
+                  if own["reset_before_wall"] else "")
         out.append(f"SIZING: the 5h headroom ({head['headroom_5h_pct']:.0f}%) lasts ~"
-                   f"{sz['minutes_to_wall_est']:.0f} min on {t['label']} ({basis}{cap}; "
+                   f"{sz['minutes_to_wall_est']:.0f} min on {t['label']} ({basis}{refill}; "
                    f"calibration {sz['calibration_tokens_per_5h_point_per_x']:.0f} tok/pt/x — estimate)")
     else:
         out.append("SIZING: unknown — needs a fresh profile tier reading and a measured headroom")
@@ -19853,10 +19897,14 @@ def sizing_lines(payload: dict, row: dict, head: dict) -> list[str]:
             s = f"{x['account']} {x['plan'].split(' ')[0]} {x['headroom_5h_pct']:.0f}% left ≈ {x['minutes_to_wall_est']:.0f} min"
             s += (f" (+{x['target_burn_pts_per_min']:.2f} pts/min already burning there)"
                   if x["target_burn_measured"] else " (target burn unmeasured — assumes idle)")
-            if x["capped_by_reset"]:
-                s += f" [resets first, {x['minutes_to_reset']:.0f} min]"
+            if x["reset_before_wall"]:
+                s += f" [window resets in {x['minutes_to_reset']:.0f} min and refills]"
             return s
-        out.append("PLACEMENT (this payload on another account, 5h axis only, estimates): "
+        # Ranked by how long the payload can run there — the thing the operator
+        # is choosing on. A window about to refill sits where its headroom puts
+        # it and carries the refill note; it is never pushed to the bottom.
+        known.sort(key=lambda x: -x["minutes_to_wall_est"])
+        out.append("PLACEMENT (this payload on another account, 5h axis only, estimates; longest first): "
                    + "; ".join(_one(x) for x in known))
     unknown = [x["account"] for x in sz["targets"] if x["minutes_to_wall_est"] is None]
     if unknown:
@@ -21646,7 +21694,7 @@ CONFIG_EXPLAIN_MAP: dict[str, str] = {
     "per_model_weekly": "Per-model WEEKLY usage tracking (fable/sonnet). The usage API exposes per-model data only weekly — there is NO per-model 5h window. Always parsed + shown in `cus status` (7d-by-model sub-line). `gate_enabled: false` (default) = surface-only. `gate_enabled: true` treats per-model weekly as a HARD CAP: force-swap the active account when a tracked model's week reaches the model cap, and never pick a swap target whose model-week is at/above it. It does NOT feed the progressive ladder — a weekly per-model budget is a hard line, so a model swaps ONLY at its cap, not gradually at ladder steps (fixed 2026-07-02). `cap_pct` (default null) sets that model cap explicitly; null inherits the strategy's `hard_7d_cap_pct`, so the two ceilings can differ (e.g. Fable gated at 97 while aggregate 7d stays capped at 80). `models: []` tracks every model the API reports; set e.g. [\"Fable\",\"Sonnet\"] to gate only on models you use.",
     "swap_hysteresis": "Anti-churn gates on the ladder swap path. `enabled: true` (default) turns them all on. `min_seconds_between_swaps: 300` = min interval between ladder swaps — keep this in MINUTES: it exists only to stop ping-pong between daemon swaps, and a long value strands a climbing account behind the lockout (2026-07-03: an unannotated 3000s (50 min) parked hot slots at 84-88%). Only DAEMON swaps arm this clock (last_auto_swap_ts, 2026-07-03) — a `cus launch` doesn't, so launches can't re-arm the cooldown out from under the ladder. `min_seconds_between_cap_swaps: 60` / `min_seconds_between_reactive_swaps: 60` = same for the hard-7d-cap and reactive-429 emergency paths (these still read last_swap_ts — counting launches in a 60s emergency spacing is harmless). `min_improvement_pct: 3` (GH #40) = a ladder swap must lower the active account's effective utilization by at least this many points; otherwise it's suppressed (prevents pingpong when both accounts sit in the same over-threshold band). The hard-7d-cap and reactive-429 paths bypass `min_improvement_pct` and `min_seconds_between_swaps` — they're emergencies.",
     "session_locks": "Per-session pinning + per-slot locks. `pinned: {pane_or_session_id: account_name}` — pinned sessions are never auto-swapped. `locked_slots: [slot-1, ...]` — per_session-mode slots the daemon never swaps or idle-gcs (manage via `cus lock`/`cus unlock`). `never_restart_patterns` is a regex list matched against tmux pane's current command name. `deprioritized_slots: [slot-3, ...]` / `deprioritized_panes: [<tmux session name or %pane>, ...]` (GH #238, `cus deprioritize`/`cus reprioritize`) — lanes/panes that can WAIT for a reset: the daemon never moves them off a wall (ladder / hard-cap / burn; a disabled-account eviction still applies), never counts them as needing a target, and their USAGE alarm (lane at N% with no swap target) downgrades to INFO — credential-integrity alarms (blanked mount, shared token family, stuck 'not logged in', subscription death) keep full severity, because a reset never clears those; unlike a lock they may still be joined, auto-picked and idle-gc'd. A pane deprioritized while sharing a lane with NORMAL panes is a MIXED-PRIORITY conflict: the lane is neither rescued nor silenced, and status/sessions/panes/sos tell you to split it out.",
-    "plan_tiers": "Per-account PLAN TIER (5x / 20x) tracking, GH #237. Read on each usage poll: `organization.rate_limit_tier` from the OAuth profile endpoint (authoritative, live; one GET per account per `profile_refresh_minutes`, reusing the poll's token) plus the credential file's `claudeAiOauth.rateLimitTier` as a labelled fallback. The file field is written at LOGIN and never updated by token refreshes, so it goes stale after a plan change (2026-09-20: rayi2 file 5x / live 20x; rayi3 file 20x / live 5x) — it renders as '5x? (credential file 3h, unverified)' — the age is the file's mtime — and NEVER drives sizing. A profile reading older than `profile_max_age_hours` is shown with its age and not used for sizing either. Shown in `cus status` (plan=…), on `cus panes` account headers and in `--me` / `--json`. `tokens_per_5h_point_per_x` calibrates 'minutes until this target walls under this payload' (new tokens per 5h-point per plan 'x'; estimate from the 2026-09-18/19 log, model-mix dependent); the estimate adds the target's own measured burn and is capped at its 5h reset. `enabled: false` is the kill switch on every path — no profile GET (200 or 429 poll), no credential-file read, nothing persisted, and everything renders 'plan unknown' and nothing sizes.",
+    "plan_tiers": "Per-account PLAN TIER (5x / 20x) tracking, GH #237. Read on each usage poll: `organization.rate_limit_tier` from the OAuth profile endpoint (authoritative, live; one GET per account per `profile_refresh_minutes`, reusing the poll's token) plus the credential file's `claudeAiOauth.rateLimitTier` as a labelled fallback. The file field is written at LOGIN and never updated by token refreshes, so it goes stale after a plan change (2026-09-20: rayi2 file 5x / live 20x; rayi3 file 20x / live 5x) — it renders as '5x? (credential file 3h, unverified)' — the age is the file's mtime — and NEVER drives sizing. A profile reading older than `profile_max_age_hours` is shown with its age and not used for sizing either. Shown in `cus status` (plan=…), on `cus panes` account headers and in `--me` / `--json`. `tokens_per_5h_point_per_x` calibrates 'minutes until this target walls under this payload' (new tokens per 5h-point per plan 'x'; estimate from the 2026-09-18/19 log, model-mix dependent); the estimate adds the target's own measured burn and is capped at its 5h reset. `enabled: false` is this feature's kill switch on every path: no plan-tier profile GET (on a 200 or a 429 poll), no credential-file read, nothing persisted, nothing sized, and the tier renders as unknown on every surface (`plan unknown` on `cus panes` headers, `plan=unknown` in `cus status`, `PLAN: unknown` in `--me`). Two things it does NOT do: it does not purge tier records already in state.json (they simply render unknown and cannot size), and it does not stop the UNRELATED subscription-disabled probe, which contacts the same profile endpoint on a 429 poll under its own switch, `subscription_guard.enabled`.",
     "hooks": "Which Claude Code hooks the installer manages. Each maps to a small bash script in <repo>/hooks/. `cus hooks install` reads this to know which to install.",
     "daemon": "Daemon-internal paths. log_path = where stdout/stderr goes; pid_path = where the daemon writes its PID (used by SOS to detect stale process).",
 }
