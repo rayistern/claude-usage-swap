@@ -46,6 +46,18 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 
 ## The recurring check — run this each interval
 
+> **FIRST QUESTION EVERY TICK: IS THE PRIORITY WORK MOVING? "No walls" is not health (2026-09-22 — owner, after asking what the estate's status actually was: *"I left you in charge of this machine a few days ago. gave you a spreadsheet."*).** For each pane carrying a PRIORITY in the owner's sheet, check when it last did anything. **An idle pane with a priority and a next step is a FINDING** — report it by name with how long it has been idle, alongside the wall/menu/memory checks. It is not silence and it is not fine.
+>
+> **The incident.** Across ~30 hours of hourly ticks this watchdog reported, truthfully, "no walls, no menus, all lanes idle, sweep clean" — while priority 1 (`8jira2a`) had been idle **three days**, priority 4 four days, and priorities 2, 3 and 6 over a day. None were walled. Every one sat at an empty `❯` having finished its turn with nobody saying what came next; the sheet's own "Next Steps" for priority 1 read **"Continue"**. The only workstream that advanced all weekend was `cus` itself — the instrument that manages the fleet — while the fleet's actual portfolio sat still.
+>
+> **The error to avoid:** measuring the ABSENCE OF FAILURE and reporting it as health. Zero walls and a clean sweep are necessary, not sufficient. The owner is paying for work to come out of the estate, not for uptime.
+>
+> **It compounds with the DO-NOT-INJECT default below**, so hold both correctly: that rule stops you waking panes needlessly; it was never meant for a pane whose entire state is *waiting to be told what to do next*. The carve-out (a pane stopped mid-task that only a message can resume) covers exactly this. Ask the question that triggers it — **what is this pane waiting for?** — before falling back on the default.
+>
+> **And when you do drive a pane, ask what it PRODUCED, not whether it was busy.** If a tick cannot name a deliverable that moved, the pane is not running as far as the owner is concerned.
+>
+> **Corollary on capacity.** When priority work is stalled, check whether it is *capped* or *undriven* before asking for more accounts. On 2026-09-22 the owner offered to add capacity; the panes were undriven, not capped, and more accounts would have bought more idle panes while hiding the real bug. Fix the measurement, prove throughput on the capacity in hand, then let the conversion rate justify the spend.
+
 > **TRACK WHAT'S RUNNING — do NOT watch a hardcoded pane list (2026-07-12 — user directive, learned from a bad miss):** the set of live sessions changes constantly; a fixed list (`sess-*`, `work-*`, …) silently drops panes and lets them die uncovered. **Each cycle, DISCOVER every pane that has a live `claude` process** and check all of them — the tracked set is "whatever is running now", recomputed every interval, not a list you carry forward. Enumerate with `cus sessions` (preferred — it already walks live pids) OR directly:
 > ```bash
 > tmux list-panes -a -F '#{session_name}	#{pane_pid}' | while IFS=$'\t' read s pid; do
