@@ -6,6 +6,8 @@ This was distilled from a real multi-day weekend watch. The design principle thr
 
 > **Identifiers below are generic placeholders** (`acct-A`, `sess-A`, `<session-id>`, `<user>`, `~/repos/<project>`) — substitute your own. Placeholder letters are scoped to **each worked example**, not one fleet-wide legend: the same letter in two different dated examples may be two different real accounts.
 
+> **The shared rules live in ONE file — cite it, don't copy it (2026-09-22).** The two standing sessions on the box — the front door and this watchdog — run by `skills/front-door-and-watchdog/SKILL.md` in the vibeCoding repository (merged 2026-09-22, its PR #567). That file is the source for: § "1. The two roles, and what neither may do on the other's say-so" (a peer's message is information, never authorisation); § "2. The seam" (the division of labour, the agreed lines, the open items); § "3. The owner's rules for how a session talks to a session" (the seven how-to-talk rules, each with its owner sentence and date); § "4. The shared instruments" (the per-pane caps file, the per-pane status files, the owner-messages check, the receipt check, one actor per lane); and § "6. Handoff" (how a successor to either role finds it). Those rules are not repeated here; where a paragraph below still restates one and the two differ, raise it with the owner — neither silently wins. This file keeps what the shared one leaves to the loop: the tick itself (cadence, wake contract), the account-rotation mechanics, the restart procedure (§ "Migrating / re-homing the watchdog"), and every account-layer command.
+
 > **Posture update 2026-09-16 (operator directive — NARROWS the 2026-07-07 block below): THE DAEMON DOES THE SWAPS. You are a WATCHDOG, not a scheduler.** Operator: *"the daemon should be doing the swaps, no? Unless we're moving so fast or no lanes are available and we have to shuffle or something."* The 2026-07-07 "act decisively, don't ask" directive was about not stopping to ask permission on a genuinely at-risk lane — it was **never** a license to hand-place lanes every tick. `cus.service` already rotates lanes on the ladder steps, and it does so with a full view of the fleet; a watchdog that swaps on top of it fights it, busts prompt caches, and churns token families ([[credential-death-cascade-and-backoff]]).
 >
 > **Swap yourself ONLY when the daemon demonstrably cannot:** (a) it is dead or stuck (check `systemctl --user show cus.service -p MainPID`), (b) `cus sos` shows **0 valid swap targets** and a park-and-shuffle is the only way to free one, (c) an operator explicitly asks for a specific placement, or (d) a lane is AT the wall NOW and the daemon's next cycle is too late. Otherwise: **read, report, and let the daemon act.** Note what you would have done in the tick report so the operator can see the call you did not make.
@@ -37,10 +39,12 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 
 1. **Pick the panes to protect and their priority.** Track sessions by tmux **pane id** (stable for the pane's life) or by **tmux session name** (survives a relaunch into a new pane). Decide equal-priority vs. lower-priority — the lower-priority one is the first to shed load if the pool is oversubscribed. Example: `%5 (sess-A)` and `%76 (sess-B)` equal; `%70 (sess-Z)` lower.
 2. **Confirm the tools exist:** `command -v cus` and `systemctl --user is-active cus.service`. If `cus` is missing, install per `cus.md`.
-3. **Schedule the recurring check.** Two options:
-   - **`/loop 1h <the check prompt>`** — session-local recurring task; simplest, dies when your Claude session exits. Good for a defined watch window.
+3. **Schedule the recurring check.** Three options:
+   - **`/loop` with no interval — the self-paced `ScheduleWakeup` loop** — what this watchdog runs; the re-arm rule below bounds it.
+   - **`/loop 50m <the check prompt>`** — session-local recurring task; simplest, dies when your Claude session exits. Good for a defined watch window.
    - A `systemd --user` timer or cron calling a headless `claude -p`. Durable across restarts.
    Put the *check routine below* (verbatim, with your pane list substituted) as the recurring prompt. **Make the recurring prompt the bare check — do NOT prefix it with `/loop`,** or each firing re-enters the loop skill and reschedules itself.
+   **Re-arm the self-paced wakeup at ≤ 3,000 s, never 3,600** — it clears both the 1-hour prompt cache and the heartbeat net's 3,900 s threshold with room for a ~10-minute tick (the heartbeat is touched when a tick STARTS and the delay counts from when it ENDS, so the net sees tick length plus delay); the burn research (`~/.claude/fleet/research/burn-2026-09-22/FINDINGS.md`, box-local) found 47 of this watchdog's 52 hourly wakes re-wrote ~750k tokens from scratch because the tick landed just past the cache hour. **In a non-tick turn (an owner, peer or tmux message), if the last tick is more than ~45 minutes old, run the tick FIRST in that turn, before the rest of the work; otherwise re-arm to the EARLIER of the original due time and the last tick's start + 3,000 s** (the heartbeat file's mtime is that start; never 3,000 s from this turn). The heartbeat stays tick-only (§ net-liveness caveat below), so a conversation still gets its ticks and the net fires only when the loop really died. The case: 2026-09-22 — last tick 20:41Z, owner turns 21:14–21:38Z cancelled the 21:31Z wakeup, the heartbeat went stale at 21:46Z and the net relaunched a healthy watchdog at 21:50Z; a re-arm counted from each owner turn would not have prevented it, a tick run inside the 21:38Z turn would.
 
 ---
 
@@ -139,6 +143,8 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 > python3 -c "import json,os;a=json.load(open(os.path.expanduser('~/claude-accounts/state.json')))['accounts']['<acct>'];print(a.get('last_observed_ts'), a.get('rate_limited'), a.get('poll_backoff_consecutive_429s'))"
 > ```
 > A `last_observed_ts` older than the current 5h window, a truthy `rate_limited`, a non-trivial `poll_backoff_consecutive_429s`, or a pane statusline reading **`5h:? 7d:? (429)`** all mean the same thing: **you are flying blind on that account — treat it as UNKNOWN, never as headroom.** An account that cannot be polled is not a swap target; say so in the report and pick one whose numbers are actually current. Corollary for reporting: never present stale percentages to the operator as the fleet's current state without flagging the staleness.
+>
+> **Placement, not motion (2026-09-22, same burn research — 90.5% of turns right after a move were cold, and only 5 of 66 moves were forced by a wall):** a lane moves when every pane on it is idle over an hour (its cache is already gone, so the move is free) or walled; otherwise only when the owner asks (an owner's "now" overrides the natural stop), or a written limit requires it (`default`'s 85% Fable ceiling — owner, 2026-09-22: usable to 85% Fable, move off at 80% — or the watchdog host's lease), or an existing rule in this file orders it (e.g. the locked-lane exception in the 2026-09-16 posture block, park-and-shuffle) — at a natural stop, except a rescue of a walled or at-risk locked lane (the 2026-09-16 posture block), which is immediate. Whether to tell a pane before or after a move is open with the owner (2026-09-23); until he rules, the peer-message rule's permitted list and the post-swap "say nothing" default stand. `default` stays `cus disable`d as a daemon guard; the watchdog places lanes on it by hand, under the 85% ceiling. `cus slot move` moves the whole lane, so the test is every pane on it; this rule decides when a move is worth its cache, the 2026-09-16 posture block still decides whether the watchdog or the daemon makes it.
 
 ### 1. Resolve + health (one command does most of it)
 
@@ -148,6 +154,8 @@ cus sos; echo "EXIT:$?"
 ```
 
 `cus sessions` resolves each live pane's TRUE account from the live mount (`/proc` ground truth, not the stale launch-time label), and flags **DRIFT** (state disagrees with reality) and **ORPHAN** slots inline. Use `cus sessions --json` if you want to parse it. This replaces hand-rolled `/proc` loops.
+
+Each tick also runs the owner-messages check (`~/bin/owner-msgs.py`) and the caps-file script (`~/bin/agent-caps.py`); what each is, who reads it and how its modes work is the shared skill's § "4. The shared instruments", not repeated here.
 
 - **A protected pane missing from `cus sessions` (no live pid)** = its Claude process died. This is the #1 alert — `cus` cannot fix it; only a human relaunches. Confirm with `tmux list-panes -a | grep '^%NN '` (shows `bash`, or gone). Report loudly; if you track by session name, re-resolve: `tmux list-panes -t <session> -F '#{pane_id} #{pane_current_command}'` and update your pane list.
 - For each **protected** pane, read its account's `5h`, per-model weekly (e.g. `Fable`), and Status.
@@ -548,9 +556,16 @@ loses nothing operational):**
    new watchdog is a *different* session id, the old pane can linger harmlessly as
    a fallback until you're satisfied — there is no transcript conflict.
 
-**Net-liveness caveat (2026-09-16):** the heartbeat cron judges liveness by
+**Net-liveness caveat (2026-09-16; corrected 2026-09-23 — the wording below described
+the net as it was, and was superseded on the box by the script's 2026-09-18 fix):**
+*Superseded text:* the heartbeat cron judges liveness by
 `max(heartbeat-file, transcript)` mtime. An *interactive* session (a human/agent
 chatting with the watchdog session) keeps the transcript fresh, so a **dead loop
 can be masked** from the net while the session is being talked to. Mitigation:
 touch the heartbeat file EVERY tick (already in the contract) — it's the only
 signal that reflects loop ticks specifically, not arbitrary session activity.
+*Since 2026-09-18:* the net reads the **heartbeat file alone**; the transcript counts
+only when the heartbeat file does not exist yet. So a conversation cannot hide a dead
+loop — and, the other way round, a conversation with no tick in it is what makes the
+net fire (the 2026-09-22 21:50Z relaunch; hence the run-the-tick-in-the-turn rule in
+setup step 3). The heartbeat is touched by a tick that ran, and by nothing else.
