@@ -39,11 +39,12 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 
 1. **Pick the panes to protect and their priority.** Track sessions by tmux **pane id** (stable for the pane's life) or by **tmux session name** (survives a relaunch into a new pane). Decide equal-priority vs. lower-priority — the lower-priority one is the first to shed load if the pool is oversubscribed. Example: `%5 (sess-A)` and `%76 (sess-B)` equal; `%70 (sess-Z)` lower.
 2. **Confirm the tools exist:** `command -v cus` and `systemctl --user is-active cus.service`. If `cus` is missing, install per `cus.md`.
-3. **Schedule the recurring check.** Two options:
+3. **Schedule the recurring check.** Three options:
+   - **`/loop` with no interval — the self-paced `ScheduleWakeup` loop** — what this watchdog runs; the re-arm rule below bounds it.
    - **`/loop 50m <the check prompt>`** — session-local recurring task; simplest, dies when your Claude session exits. Good for a defined watch window.
    - A `systemd --user` timer or cron calling a headless `claude -p`. Durable across restarts.
    Put the *check routine below* (verbatim, with your pane list substituted) as the recurring prompt. **Make the recurring prompt the bare check — do NOT prefix it with `/loop`,** or each firing re-enters the loop skill and reschedules itself.
-   **Re-arm the self-paced wakeup at ≤ 3,000 s, never 3,600** — it clears both the 1-hour prompt cache and the heartbeat net's 3,900 s threshold with room for a ~10-minute tick (the heartbeat is touched when a tick STARTS and the delay counts from when it ENDS, so the net sees tick length plus delay); the burn research (`~/.claude/fleet/research/burn-2026-09-22/FINDINGS.md`, box-local) found 47 of this watchdog's 52 hourly wakes re-wrote ~750k tokens from scratch because the tick landed just past the cache hour. **End every turn whose pending wakeup a message (owner, peer or tmux-delivered) may have cancelled with a re-arm** (2026-09-22: such a cancellation let the heartbeat cron relaunch a healthy watchdog); the heartbeat stays tick-only (§ net-liveness caveat below), so a long conversation with no tick is still caught by the net.
+   **Re-arm the self-paced wakeup at ≤ 3,000 s, never 3,600** — it clears both the 1-hour prompt cache and the heartbeat net's 3,900 s threshold with room for a ~10-minute tick (the heartbeat is touched when a tick STARTS and the delay counts from when it ENDS, so the net sees tick length plus delay); the burn research (`~/.claude/fleet/research/burn-2026-09-22/FINDINGS.md`, box-local) found 47 of this watchdog's 52 hourly wakes re-wrote ~750k tokens from scratch because the tick landed just past the cache hour. **In a non-tick turn (an owner, peer or tmux message), if the last tick is more than ~45 minutes old, run the tick in that turn; otherwise re-arm, keeping the ORIGINAL due time** (delay = last tick's start + 3,000 s − now, not 3,000 s from this turn). The heartbeat stays tick-only (§ net-liveness caveat below), so a conversation still gets its ticks and the net fires only when the loop really died. The case: 2026-09-22 — last tick 20:41Z, owner turns 21:14–21:38Z cancelled the 21:31Z wakeup, the heartbeat went stale at 21:46Z and the net relaunched a healthy watchdog at 21:50Z; a re-arm counted from each owner turn would not have prevented it, a tick run inside the 21:38Z turn would.
 
 ---
 
@@ -143,7 +144,7 @@ Not for: one-off status checks (use `/cus`), or forcing a swap now (use `/swap`)
 > ```
 > A `last_observed_ts` older than the current 5h window, a truthy `rate_limited`, a non-trivial `poll_backoff_consecutive_429s`, or a pane statusline reading **`5h:? 7d:? (429)`** all mean the same thing: **you are flying blind on that account — treat it as UNKNOWN, never as headroom.** An account that cannot be polled is not a swap target; say so in the report and pick one whose numbers are actually current. Corollary for reporting: never present stale percentages to the operator as the fleet's current state without flagging the staleness.
 >
-> **Placement, not motion (2026-09-22, same burn research — 90.5% of turns right after a move were cold, and only 5 of 66 moves were forced by a wall):** a lane moves when every pane on it is idle over an hour (its cache is already gone, so the move is free) or walled; otherwise only when the owner asks, or a written limit requires it (`default`'s 85% Fable ceiling, the watchdog host's lease), or an existing rule in this file orders it (the locked-lane exception in the 2026-09-16 posture block, park-and-shuffle) — and then at a natural stop, told first. `cus slot move` moves the whole lane, so the test is every pane on it.
+> **Placement, not motion (2026-09-22, same burn research — 90.5% of turns right after a move were cold, and only 5 of 66 moves were forced by a wall):** a lane moves when every pane on it is idle over an hour (its cache is already gone, so the move is free) or walled; otherwise only when the owner asks (an owner's "now" overrides the natural stop), or a written limit requires it (`default`'s 85% Fable ceiling — owner, 2026-09-22: usable to 85% Fable, move off at 80% — or the watchdog host's lease), or an existing rule in this file orders it (e.g. the locked-lane exception in the 2026-09-16 posture block, park-and-shuffle) — the owner-asks and written-limit branches at a natural stop, told first. **"Told first" is a cross-session message to a pane that is WORKING (delivered at its next tool round, no extra turn), never a keystroke; an idle pane gets a note in the report instead (the inject rule's "a swap you performed is a note, not a keystroke" and the post-swap "say nothing" default both stand); and a rescue of a walled or at-risk locked lane is immediate — the tell follows the move.** `cus slot move` moves the whole lane, so the test is every pane on it; this rule decides when a move is worth its cache, the 2026-09-16 posture block still decides whether the watchdog or the daemon makes it.
 
 ### 1. Resolve + health (one command does most of it)
 
@@ -555,9 +556,16 @@ loses nothing operational):**
    new watchdog is a *different* session id, the old pane can linger harmlessly as
    a fallback until you're satisfied — there is no transcript conflict.
 
-**Net-liveness caveat (2026-09-16):** the heartbeat cron judges liveness by
+**Net-liveness caveat (2026-09-16; corrected 2026-09-23 — the wording below described
+the net as it was, and was superseded on the box by the script's 2026-09-18 fix):**
+*Superseded text:* the heartbeat cron judges liveness by
 `max(heartbeat-file, transcript)` mtime. An *interactive* session (a human/agent
 chatting with the watchdog session) keeps the transcript fresh, so a **dead loop
 can be masked** from the net while the session is being talked to. Mitigation:
 touch the heartbeat file EVERY tick (already in the contract) — it's the only
 signal that reflects loop ticks specifically, not arbitrary session activity.
+*Since 2026-09-18:* the net reads the **heartbeat file alone**; the transcript counts
+only when the heartbeat file does not exist yet. So a conversation cannot hide a dead
+loop — and, the other way round, a conversation with no tick in it is what makes the
+net fire (the 2026-09-22 21:50Z relaunch; hence the run-the-tick-in-the-turn rule in
+setup step 3). The heartbeat is touched by a tick that ran, and by nothing else.
