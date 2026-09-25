@@ -108,13 +108,13 @@ def test_equal_keys_keep_the_earlier_candidate(tmp_path):
     for path in spots.values():
         os.utime(path, (stamp, stamp))
     order = []
-    for name in ("env", "home", "link", "sibling"):
+    for name in ("env", "link", "home", "sibling"):
         e = dict(env)
         if name == "env":
             e["PANE_STATE_PY"] = str(spots["env"])
         order.append(_run(shim, e).stdout.strip())
         spots[name].unlink()
-    assert order == ["env", "home", "link", "sibling"]
+    assert order == ["env", "link", "home", "sibling"]
 
 
 def _commit_reader(repo: Path, path: Path, body: str, date: str) -> None:
@@ -135,69 +135,64 @@ def _commit_reader(repo: Path, path: Path, body: str, date: str) -> None:
     )
 
 
-def test_newer_commit_wins_over_an_older_checkout_and_over_mtime(tmp_path):
-    """Two different files. The later git commit wins even when its mtime is older.
-    $PANE_STATE_PY still wins when it points at the older file."""
+def test_installed_skill_wins_over_a_later_commit_in_the_checkout(tmp_path):
+    """A plain skill copy wins over a checkout whose commit is later.
+    $PANE_STATE_PY still wins when it points at the checkout. Stderr names both."""
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
     checkout_repo = home / "repos" / "vibeCoding"
-    skill_repo = home / ".claude" / "skills" / "build-babysitter"
     checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
-    skill = skill_repo / "pane_state.py"
-    _commit_reader(checkout_repo, checkout, "print('checkout')\n", "2026-09-15T12:00:00+00:00")
-    _commit_reader(skill_repo, skill, "print('skill')\n", "2026-09-24T12:00:00+00:00")
-    # mtime would pick the checkout; commit time must pick the skill.
-    os.utime(checkout, (1_800_000_000, 1_800_000_000))
-    os.utime(skill, (1_700_000_000, 1_700_000_000))
+    _commit_reader(checkout_repo, checkout, "print('checkout')\n", "2026-09-24T12:00:00+00:00")
+    skill = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("print('skill')\n")
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "skill"
-    assert "chose" in r.stderr and "also found" in r.stderr
+    assert "chose" in r.stderr and str(checkout) in r.stderr
     env["PANE_STATE_PY"] = str(checkout)
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "checkout"
+    assert r.stderr.strip() == ""
 
 
-def test_untracked_copy_does_not_outrank_a_committed_reader(tmp_path):
-    """A fresh mtime on a file with no commit loses to a committed reader."""
+def test_fresh_untracked_file_on_the_skill_path_still_wins(tmp_path):
+    """Round 1's case. A stale untracked file on the skill path beats a committed
+    checkout. The choice is the path, and stderr names the checkout."""
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
     checkout_repo = home / "repos" / "vibeCoding"
     checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
     _commit_reader(checkout_repo, checkout, "print('committed')\n", "2026-09-24T12:00:00+00:00")
-    os.utime(checkout, (1_700_000_000, 1_700_000_000))
     plain = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
     plain.parent.mkdir(parents=True)
-    plain.write_text("print('untracked')\n")
-    os.utime(plain, (1_800_000_000, 1_800_000_000))
+    plain.write_text("print('stale')\n")
+    os.utime(plain, (1_900_000_000, 1_900_000_000))
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "committed"
-    assert "chose" in r.stderr and "also found" in r.stderr
+    assert r.stdout.strip() == "stale"
+    assert "chose" in r.stderr and str(checkout) in r.stderr
 
 
-def test_three_candidates_rank_by_one_key(tmp_path):
-    """A newer commit beats both an older commit and a fresher untracked file."""
+def test_sibling_with_a_later_commit_does_not_pass_the_skill(tmp_path):
+    """A later commit on the sibling path does not pass the installed skill."""
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
-    old_repo = home / "repos" / "vibeCoding"
-    old = old_repo / "skills" / "build-babysitter" / "pane_state.py"
-    _commit_reader(old_repo, old, "print('old')\n", "2026-09-15T12:00:00+00:00")
-    plain = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
-    plain.parent.mkdir(parents=True)
-    plain.write_text("print('plain')\n")
-    os.utime(plain, (1_900_000_000, 1_900_000_000))
+    skill = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("print('skill')\n")
     new_repo = tmp_path / "vibeCoding"
     new = new_repo / "skills" / "build-babysitter" / "pane_state.py"
     _commit_reader(new_repo, new, "print('new')\n", "2026-09-24T12:00:00+00:00")
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "new"
+    assert r.stdout.strip() == "skill"
+    assert str(new) in r.stderr
 
 
 def test_git_missing_from_path_falls_back_without_crashing(tmp_path):
-    """No git binary: neither file has a commit, so mtime decides, and we do not crash."""
+    """No git binary: the installed skill still wins, and we do not crash."""
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
     older = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"

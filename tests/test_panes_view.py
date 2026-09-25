@@ -433,6 +433,29 @@ def test_missing_pane_reader_raises_rather_than_fabricating(monkeypatch, tmp_pat
     raise AssertionError("expected PanesError")
 
 
+def test_reader_notice_reaches_the_payload_and_the_table(monkeypatch, tmp_path):
+    """A successful reader that names two copies must not drop that line."""
+    fake = tmp_path / "fake_reader.py"
+    fake.write_text(
+        'import json,sys\n'
+        'sys.stderr.write("pane_state: chose /skill; also found /checkout\\n")\n'
+        'print(json.dumps({"pane":"%1","profile":"claude-code","state":"idle","session":"s"}))\n'
+    )
+    monkeypatch.setenv("CUS_PANE_STATE_PY", str(fake))
+    rows = cus.read_panes_from_reader()
+    assert rows and rows[0]["state"] == "idle"
+    assert cus.read_panes_from_reader.last_reader_notice.startswith("pane_state: chose")
+    text = cus.render_panes_table({
+        "generated_at": "2026-09-25T00:00:00Z",
+        "window_minutes": 60,
+        "window_start": "2026-09-24T23:00:00Z",
+        "panes": [],
+        "accounts": {},
+        "reader_notice": cus.read_panes_from_reader.last_reader_notice,
+    })
+    assert text.splitlines()[0].startswith("pane_state: chose")
+
+
 def test_pane_reader_tmux_failure_is_distinguished(monkeypatch, tmp_path):
     fake = tmp_path / "fake_reader.py"
     fake.write_text('import sys\nsys.stderr.write("tmux down\\n")\nsys.exit(2)\n')

@@ -19345,6 +19345,10 @@ def read_panes_from_reader(include_all: bool = True) -> list[dict]:
             rows.append(json.loads(ln))
         except ValueError:
             continue
+    # The shim's choice is on stderr and is dropped if we only return rows.
+    # cus panes copies it into reader_notice so the operator sees two copies.
+    notice = next((ln for ln in proc.stderr.splitlines() if ln.startswith("pane_state:")), None)
+    read_panes_from_reader.last_reader_notice = notice
     return rows
 
 
@@ -19715,6 +19719,7 @@ def build_panes_payload(window_minutes: float, now: "datetime | None" = None) ->
         "account_order": account_order,
         "panes": rows,
         "accounts": accounts,
+        "reader_notice": getattr(read_panes_from_reader, "last_reader_notice", None),
     }
 
 
@@ -20168,9 +20173,12 @@ def render_panes_table(payload: dict) -> str:
     are the candidate destinations for a move.
     """
     now = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
-    out = [f"Live Claude panes — {payload['window_minutes']:g}m window "
+    out = []
+    if payload.get("reader_notice"):
+        out.append(payload["reader_notice"])
+    out.append(f"Live Claude panes — {payload['window_minutes']:g}m window "
            f"(since {payload['window_start']}) — grouped by account, hottest first; "
-           f"within an account, highest NEW burn first"]
+           f"within an account, highest NEW burn first")
     hdr = (f"  {'PANE':<5} {'TMUX SESSION':<22} {'SLOT':<8} {'STATE':<16} {'SUB':>3} "
            f"{'NEW':>7} {'NEW/MIN':>8} {'PTS/MIN~':>8} {'SHARE*':>7} {'TOK':>7} {'WALL':<22} MODELS")
     out += [hdr, "-" * len(hdr)]
