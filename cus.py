@@ -19310,8 +19310,11 @@ def _pane_state_script() -> "Path":
     return Path(__file__).resolve().parent / "skills" / "pane_state.py"
 
 
-def read_panes_from_reader(include_all: bool = True) -> list[dict]:
-    """Pane rows from skills/pane_state.py (JSON lines), or raise PanesError.
+def read_panes_from_reader(include_all: bool = True) -> tuple[list[dict], str | None]:
+    """Pane rows from skills/pane_state.py, plus the shim's choice line, or raise PanesError.
+
+    The second value is the stderr line that starts `pane_state: chose`, or None.
+    Other `pane_state:` lines belong to the upstream reader and are not this notice.
 
     We shell out rather than import: the reader is a separately-versioned file
     in vibeCoding reached through a shim, and its `--all` / exit-code contract
@@ -19345,7 +19348,9 @@ def read_panes_from_reader(include_all: bool = True) -> list[dict]:
             rows.append(json.loads(ln))
         except ValueError:
             continue
-    return rows
+    # Only the shim's choice line. The upstream reader has its own pane_state: warnings.
+    notice = next((ln for ln in proc.stderr.splitlines() if ln.startswith("pane_state: chose")), None)
+    return rows, notice
 
 
 def _proc_start_ticks(pid: int) -> str | None:
@@ -19667,7 +19672,8 @@ def build_panes_payload(window_minutes: float, now: "datetime | None" = None) ->
     window_start = now - timedelta(minutes=window_minutes)
     state = load_state()
     config = load_config()
-    reader_rows = [r for r in read_panes_from_reader(include_all=True)
+    reader_rows_all, reader_notice = read_panes_from_reader(include_all=True)
+    reader_rows = [r for r in reader_rows_all
                    if r.get("profile") == "claude-code" or r.get("claude_alive")]
     registry = read_peer_registry()
     rows = [collect_pane_row(r, registry, state, config, window_start, now)
@@ -19715,6 +19721,7 @@ def build_panes_payload(window_minutes: float, now: "datetime | None" = None) ->
         "account_order": account_order,
         "panes": rows,
         "accounts": accounts,
+        "reader_notice": reader_notice,
     }
 
 
@@ -20168,9 +20175,12 @@ def render_panes_table(payload: dict) -> str:
     are the candidate destinations for a move.
     """
     now = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
-    out = [f"Live Claude panes — {payload['window_minutes']:g}m window "
+    out = []
+    if payload.get("reader_notice"):
+        out.append(payload["reader_notice"])
+    out.append(f"Live Claude panes — {payload['window_minutes']:g}m window "
            f"(since {payload['window_start']}) — grouped by account, hottest first; "
-           f"within an account, highest NEW burn first"]
+           f"within an account, highest NEW burn first")
     hdr = (f"  {'PANE':<5} {'TMUX SESSION':<22} {'SLOT':<8} {'STATE':<16} {'SUB':>3} "
            f"{'NEW':>7} {'NEW/MIN':>8} {'PTS/MIN~':>8} {'SHARE*':>7} {'TOK':>7} {'WALL':<22} MODELS")
     out += [hdr, "-" * len(hdr)]
@@ -20431,6 +20441,9 @@ def panes_cmd(as_json: bool, window: str, me: bool) -> None:
     file stays cheap); a pane whose tail hit the cap is flagged and its totals
     are a floor. Subagent spend is included: each subagent writes its own
     transcript under <project>/<session-id>/subagents/.
+
+    `reader_notice` is set when the shim found two reader files. `--me` does
+    not show it.
     """
     try:
         minutes = parse_window_spec(window)
@@ -20449,7 +20462,8 @@ def panes_cmd(as_json: bool, window: str, me: bool) -> None:
         if as_json:
             now_ = _panes_parse_ts(payload["generated_at"]) or datetime.now(timezone.utc)
             head = payload["accounts"].get(row.get("account") or "", account_headroom(None, now_))
-            click.echo(json.dumps({**{k: v for k, v in payload.items() if k != "panes"},
+            click.echo(json.dumps({**{k: v for k, v in payload.items()
+                                       if k not in ("panes", "reader_notice")},
                                    "verdict": me_verdict(row, head),
                                    "sizing": sizing_estimate(payload, row, head),   # GH #237
                                    "pane": row}, indent=2, default=str))

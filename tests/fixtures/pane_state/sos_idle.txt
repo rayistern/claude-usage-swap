@@ -1,0 +1,11 @@
+  ⎿  Stop says: local time: 2026-09-24 18:25:05
+✻ Baked for 1m 35s · done 10:25 PM
+● How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  🚨 cus SOS: a lane is at 99% (≥85%) with no swap target · 23:10et
+  cus 🔒acct* 5h:10% 7d:82%·5h49m nxt:85% | other 5h:5% 7d:40%·1d nxt:85%
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+                                                                                           new task? /clear to save 172.6k tokens

@@ -445,6 +445,7 @@ Other things worth knowing about the numbers:
   "window_minutes": 30,
   "window_start": "2026-09-18T14:17:00Z",
   "schema_version": 1,
+  "reader_notice": null,               // set when the shim found two reader files; absent from --me
   "attribution_note": "...",          // the honesty caveat, verbatim
   "account_order": ["rayi3", "rayi2", null],
                                        // group order: hottest KNOWN account first, then

@@ -78,7 +78,7 @@ def test_missing_everywhere_is_one_error_line_and_exit_3(tmp_path):
     assert "state" not in doc  # never a fabricated pane row
 
 
-def test_user_skill_link_is_a_candidate_between_home_and_sibling(tmp_path):
+def test_installed_skill_is_used_when_the_checkout_is_absent(tmp_path):
     shim, env = _layout(tmp_path)
     canon = Path(env["HOME"]) / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
     canon.parent.mkdir(parents=True)
@@ -87,7 +87,11 @@ def test_user_skill_link_is_a_candidate_between_home_and_sibling(tmp_path):
     assert r.returncode == 7 and json.loads(r.stdout)["from"] == "fake"
 
 
-def test_resolution_order_is_env_then_home_then_skill_link_then_sibling(tmp_path):
+def test_removal_walks_the_documented_order(tmp_path):
+    """Override, then installed skill, then checkout, then sibling.
+
+    Removing the winner surfaces the next path in that order.
+    """
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
     spots = {
@@ -100,13 +104,144 @@ def test_resolution_order_is_env_then_home_then_skill_link_then_sibling(tmp_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"print('{name}')\n")
     order = []
-    for name in ("env", "home", "link", "sibling"):
+    for name in ("env", "link", "home", "sibling"):
         e = dict(env)
         if name == "env":
             e["PANE_STATE_PY"] = str(spots["env"])
         order.append(_run(shim, e).stdout.strip())
-        spots[name].unlink()                     # remove the winner, the next one must win
-    assert order == ["env", "home", "link", "sibling"]
+        spots[name].unlink()
+    assert order == ["env", "link", "home", "sibling"]
+
+
+def _commit_reader(repo: Path, path: Path, body: str, date: str) -> None:
+    """One commit of `path` inside `repo`, dated `date`, without touching git config."""
+    repo.mkdir(parents=True, exist_ok=True)
+    if not (repo / ".git").is_dir():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    env = dict(os.environ)
+    env["GIT_AUTHOR_DATE"] = date
+    env["GIT_COMMITTER_DATE"] = date
+    subprocess.run(["git", "-C", str(repo), "add", "--", str(path)], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=dev@example.com", "-c", "user.name=Dev",
+         "commit", "-q", "-m", "reader"],
+        check=True, env=env,
+    )
+
+
+def test_installed_skill_wins_over_a_later_commit_in_the_checkout(tmp_path):
+    """A plain skill copy wins over a checkout whose commit is later.
+    $PANE_STATE_PY still wins when it points at the checkout. Stderr names both."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    checkout_repo = home / "repos" / "vibeCoding"
+    checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
+    _commit_reader(checkout_repo, checkout, "print('checkout')\n", "2026-09-24T12:00:00+00:00")
+    skill = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("print('skill')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "skill"
+    assert "chose" in r.stderr and str(checkout) in r.stderr
+    env["PANE_STATE_PY"] = str(checkout)
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "checkout"
+    assert r.stderr.strip() == ""
+
+
+def test_fresh_untracked_file_on_the_skill_path_still_wins(tmp_path):
+    """Round 1's case. A stale untracked file on the skill path beats a committed
+    checkout. The choice is the path, and stderr names the checkout."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    checkout_repo = home / "repos" / "vibeCoding"
+    checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
+    _commit_reader(checkout_repo, checkout, "print('committed')\n", "2026-09-24T12:00:00+00:00")
+    plain = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    plain.parent.mkdir(parents=True)
+    plain.write_text("print('stale')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "stale"
+    assert "chose" in r.stderr and str(checkout) in r.stderr
+
+
+def test_sibling_with_a_later_commit_does_not_pass_the_skill(tmp_path):
+    """A later commit on the sibling path does not pass the installed skill."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    skill = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("print('skill')\n")
+    new_repo = tmp_path / "vibeCoding"
+    new = new_repo / "skills" / "build-babysitter" / "pane_state.py"
+    _commit_reader(new_repo, new, "print('new')\n", "2026-09-24T12:00:00+00:00")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "skill"
+    assert str(new) in r.stderr
+
+
+def test_installed_skill_precedes_the_checkout(tmp_path):
+    """The skill path wins when a checkout file also exists. No timestamps involved."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    older = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    newer = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    older.parent.mkdir(parents=True)
+    newer.parent.mkdir(parents=True)
+    older.write_text("print('older')\n")
+    newer.write_text("print('newer')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "newer"
+    assert "pane_state: chose" in r.stderr
+
+
+def test_self_link_falls_through_to_a_later_reader(tmp_path):
+    """A candidate that is this shim is skipped when a later real reader exists.
+
+    Before this change the first self match was exit 3 even if another reader
+    followed. Stderr names the skip. looked_in for an override that points at
+    the shim is only that path.
+    """
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    link = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shim)
+    checkout = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    checkout.parent.mkdir(parents=True)
+    checkout.write_text("print('checkout')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "checkout"
+    assert "skipped a candidate that is this shim" in r.stderr
+    env["PANE_STATE_PY"] = str(shim)
+    r = _run(shim, env, "x")
+    assert r.returncode == 3
+    doc = json.loads(r.stdout)
+    assert doc["looked_in"] == [str(shim)]
+
+
+def test_dangling_skill_link_is_named_and_the_checkout_runs(tmp_path):
+    """A skill link whose target is gone must not fall through in silence."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    link = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "missing-reader.py")
+    checkout = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    checkout.parent.mkdir(parents=True)
+    checkout.write_text("print('checkout')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "checkout"
+    assert f"skipped a dangling link at {link}" in r.stderr
 
 
 def test_shim_never_execs_itself(tmp_path):
@@ -169,3 +304,47 @@ def test_shim_against_the_real_canonical_copy_if_present():
     doc = json.loads(r.stdout.strip().splitlines()[0])
     assert r.returncode in (0, 2) and (doc.get("state") == "not_found" or "error" in doc)
     assert r.returncode != 3
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "pane_state"
+
+
+def _installed_reader():
+    """The reader the shim would exec. Skip, with a reason, when none is installed.
+
+    CI has no vibeCoding checkout and no skill link, so these two tests do not
+    run there. What CI does lock is the shim's newer-file choice
+    (test_newer_commit_wins_over_an_older_checkout_and_over_mtime). Classifying
+    the SOS fixtures is the installed reader's job, not a second regex in this file.
+    """
+    import importlib.util
+    import runpy
+
+    import pytest
+
+    ns = runpy.run_path(str(SHIM))
+    path, err, _looked = ns["resolve"]()
+    if path is None:
+        pytest.skip(err or "no pane reader installed; SOS fixtures run only where the shim finds one")
+    spec = importlib.util.spec_from_file_location("pane_state_reader", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pane_state_reader"] = mod
+    spec.loader.exec_module(mod)
+    sys.modules.pop("pane_state_reader", None)
+    if not hasattr(mod, "classify"):
+        pytest.skip("installed pane reader has no classify; SOS fixtures need that function")
+    return mod
+
+
+def test_sos_footer_with_an_empty_prompt_is_idle():
+    """A cus SOS line between the prompt and the status cluster is footer.
+    The optional feedback rows (1: Bad) are not an approval."""
+    lines = (FIXTURES / "sos_idle.txt").read_text(encoding="utf-8").splitlines()
+    assert _installed_reader().classify(lines, True)[0] == "idle"
+
+
+def test_sos_footer_with_an_unsent_draft_is_idle_with_draft():
+    lines = (FIXTURES / "sos_idle_with_draft.txt").read_text(encoding="utf-8").splitlines()
+    state, draft, _tui, _signed = _installed_reader().classify(lines, True)
+    assert state == "idle_with_draft"
+    assert draft == "please confirm the draft is saved"

@@ -416,6 +416,10 @@ this skill:
   set `PANE_STATE_PY=<file>`. Rollout order on this box: vibeCoding #334 → #336 → pull →
   a real row from a live pane → only then cus #200; a watchdog that reads exit 3 every tick
   is blind, not broken — escalate, do not scrape by hand.)
+  Annotation 2026-09-25: when more than one reader file exists, the shim execs the
+  installed skill (`~/.claude/skills/build-babysitter/pane_state.py`) ahead of a
+  checkout, and prints one stderr line naming the choice. `cus panes` shows that
+  line as `reader_notice`. `$PANE_STATE_PY` still points at one file.
 - **Session state from transcripts, not panes.** `python3
   ~/repos/context-dashboard/ingest/session_metrics.py <family-slug> --live` (PR #60)
   prints each owner-prompted session with a state judged from its transcript's last
