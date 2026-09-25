@@ -99,6 +99,12 @@ def test_resolution_order_is_env_then_home_then_skill_link_then_sibling(tmp_path
     for name, path in spots.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"print('{name}')\n")
+    # No git history here, so "newer" is mtime. Stamp them in candidate order so
+    # removing the winner still surfaces the next one. A newer commit on a later
+    # candidate is test_newer_commit_wins_over_an_older_checkout_and_over_mtime.
+    base = 1_700_000_000
+    for name, step in (("env", 40), ("home", 30), ("link", 20), ("sibling", 10)):
+        os.utime(spots[name], (base + step, base + step))
     order = []
     for name in ("env", "home", "link", "sibling"):
         e = dict(env)
@@ -107,6 +113,47 @@ def test_resolution_order_is_env_then_home_then_skill_link_then_sibling(tmp_path
         order.append(_run(shim, e).stdout.strip())
         spots[name].unlink()                     # remove the winner, the next one must win
     assert order == ["env", "home", "link", "sibling"]
+
+
+def _commit_reader(repo: Path, path: Path, body: str, date: str) -> None:
+    """One commit of `path` inside `repo`, dated `date`, without touching git config."""
+    repo.mkdir(parents=True, exist_ok=True)
+    if not (repo / ".git").is_dir():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    env = dict(os.environ)
+    env["GIT_AUTHOR_DATE"] = date
+    env["GIT_COMMITTER_DATE"] = date
+    subprocess.run(["git", "-C", str(repo), "add", "--", str(path)], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=dev@example.com", "-c", "user.name=Dev",
+         "commit", "-q", "-m", "reader"],
+        check=True, env=env,
+    )
+
+
+def test_newer_commit_wins_over_an_older_checkout_and_over_mtime(tmp_path):
+    """Two different files. The later git commit wins even when its mtime is older.
+    $PANE_STATE_PY still wins when it points at the older file."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    checkout_repo = home / "repos" / "vibeCoding"
+    skill_repo = home / ".claude" / "skills" / "build-babysitter"
+    checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
+    skill = skill_repo / "pane_state.py"
+    _commit_reader(checkout_repo, checkout, "print('checkout')\n", "2026-09-15T12:00:00+00:00")
+    _commit_reader(skill_repo, skill, "print('skill')\n", "2026-09-24T12:00:00+00:00")
+    # mtime would pick the checkout; commit time must pick the skill.
+    os.utime(checkout, (1_800_000_000, 1_800_000_000))
+    os.utime(skill, (1_700_000_000, 1_700_000_000))
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "skill"
+    env["PANE_STATE_PY"] = str(checkout)
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "checkout"
 
 
 def test_shim_never_execs_itself(tmp_path):
