@@ -216,3 +216,38 @@ def test_shim_against_the_real_canonical_copy_if_present():
     doc = json.loads(r.stdout.strip().splitlines()[0])
     assert r.returncode in (0, 2) and (doc.get("state") == "not_found" or "error" in doc)
     assert r.returncode != 3
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "pane_state"
+
+
+def _resolved_reader():
+    """The reader this shim would exec, imported. Skip when none is installed."""
+    import importlib.util
+    import runpy
+
+    import pytest
+
+    ns = runpy.run_path(str(SHIM))
+    path, err, _looked = ns["resolve"]()
+    if path is None:
+        pytest.skip(err or "no pane reader installed")
+    spec = importlib.util.spec_from_file_location("pane_state_reader", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pane_state_reader"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_sos_footer_with_an_empty_prompt_is_idle():
+    """A cus SOS line between the prompt and the status cluster is footer, not a reason
+    to read the pane as unknown. The optional feedback rows (1: Bad) are not an approval."""
+    lines = (FIXTURES / "sos_idle.txt").read_text(encoding="utf-8").splitlines()
+    assert _resolved_reader().classify(lines, True)[0] == "idle"
+
+
+def test_sos_footer_with_an_unsent_draft_is_idle_with_draft():
+    lines = (FIXTURES / "sos_idle_with_draft.txt").read_text(encoding="utf-8").splitlines()
+    state, draft, _tui, _signed = _resolved_reader().classify(lines, True)
+    assert state == "idle_with_draft"
+    assert draft == "are we good on disk now?"

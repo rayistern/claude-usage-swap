@@ -45,6 +45,8 @@ when both candidates have one. Commit time is not moved by a checkout or a copy.
 When either candidate has no commit (a plain file, git missing, or not a worktree),
 the later mtime wins instead. mtime is only that fallback: a checkout and a copy
 rewrite it, so it is not the primary key. A tie keeps the earlier candidate.
+Uncommitted edits do not count: a hand-patched checkout still loses to a later
+commit elsewhere, and `$PANE_STATE_PY` is how to point at that patch.
 
 On a miss it prints ONE JSON line `{"error": …, "looked_in": […]}` and exits 3 — distinct
 from the reader's own exit 2 ("tmux unusable"), so a watcher can tell "reader missing"
