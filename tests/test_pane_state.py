@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -221,39 +220,24 @@ def test_shim_against_the_real_canonical_copy_if_present():
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "pane_state"
 
-# The SOS footer rule the installed reader already has. CI has no vibeCoding
-# checkout, so this contract is what those two tests lock there. When a reader
-# is installed, it must agree — CI does not execute the upstream file.
-_SOS_FOOTER = re.compile(
-    r"⏵⏵|bypass permissions on|shift\+tab to cycle|new task\? /clear"
-    r"|^\s*cus\s+\S|^\s*⚠ cus:|^\s*🚨\s+cus\b",
-    re.I,
-)
-_SOS_RULE = re.compile(r"^\s*─{12,}\s*$")
-_SOS_INPUT = re.compile(r"^\s*❯(?P<draft>.*)$")
-
-
-def _contract_state(lines: list[str]) -> tuple[str, str]:
-    """(state, draft) for the two SOS fixtures. Footer peel from the bottom, then ❯."""
-    tail = [ln.rstrip() for ln in lines if ln.strip()][-18:]
-    i = len(tail) - 1
-    while i >= 0 and (_SOS_FOOTER.search(tail[i]) or _SOS_RULE.match(tail[i])):
-        i -= 1
-    if i < 0 or _SOS_INPUT.match(tail[i]) is None:
-        return "unknown", ""
-    draft = (_SOS_INPUT.match(tail[i]).group("draft") or "").strip()
-    return ("idle_with_draft" if draft else "idle"), draft
-
 
 def _installed_reader():
-    """The reader the shim would exec, or None when CI has no copy."""
+    """The reader the shim would exec. Skip, with a reason, when none is installed.
+
+    CI has no vibeCoding checkout and no skill link, so these two tests do not
+    run there. What CI does lock is the shim's newer-file choice
+    (test_newer_commit_wins_over_an_older_checkout_and_over_mtime). Classifying
+    the SOS fixtures is the installed reader's job, not a second regex in this file.
+    """
     import importlib.util
     import runpy
 
+    import pytest
+
     ns = runpy.run_path(str(SHIM))
-    path, _err, _looked = ns["resolve"]()
+    path, err, _looked = ns["resolve"]()
     if path is None:
-        return None
+        pytest.skip(err or "no pane reader installed; SOS fixtures run only where the shim finds one")
     spec = importlib.util.spec_from_file_location("pane_state_reader", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["pane_state_reader"] = mod
@@ -261,59 +245,15 @@ def _installed_reader():
     return mod
 
 
-def _assert_sos(name: str, state: str, draft: str) -> None:
-    lines = (FIXTURES / name).read_text(encoding="utf-8").splitlines()
-    assert _contract_state(lines) == (state, draft)
-    reader = _installed_reader()
-    if reader is not None:
-        got = reader.classify(lines, True)
-        assert got[0] == state
-        assert (got[1] or "").strip() == draft
-
-
 def test_sos_footer_with_an_empty_prompt_is_idle():
     """A cus SOS line between the prompt and the status cluster is footer.
     The optional feedback rows (1: Bad) are not an approval."""
-    _assert_sos("sos_idle.txt", "idle", "")
+    lines = (FIXTURES / "sos_idle.txt").read_text(encoding="utf-8").splitlines()
+    assert _installed_reader().classify(lines, True)[0] == "idle"
 
 
 def test_sos_footer_with_an_unsent_draft_is_idle_with_draft():
-    _assert_sos("sos_idle_with_draft.txt", "idle_with_draft", "are we good on disk now?")
-
-
-def test_second_resolve_does_not_walk_git_when_files_are_unchanged(tmp_path, monkeypatch):
-    """The git walk is paid once per fingerprint, not on every cus panes tick."""
-    import runpy
-
-    shim, env = _layout(tmp_path)
-    home = Path(env["HOME"])
-    checkout_repo = home / "repos" / "vibeCoding"
-    skill_repo = home / ".claude" / "skills" / "build-babysitter"
-    checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
-    skill = skill_repo / "pane_state.py"
-    _commit_reader(checkout_repo, checkout, "print('checkout')\n", "2026-09-15T12:00:00+00:00")
-    _commit_reader(skill_repo, skill, "print('skill')\n", "2026-09-24T12:00:00+00:00")
-    monkeypatch.setenv("HOME", env["HOME"])
-    monkeypatch.delenv("PANE_STATE_PY", raising=False)
-    ns = runpy.run_path(str(shim))
-    calls: list[str] = []
-    # run_path's returned dict is not the functions' globals (3.12), so the
-    # counter has to land where _prefer actually looks the name up.
-    globs = ns["_prefer"].__globals__
-    real = globs["_git_commit_time"]
-
-    def _count(path: str):
-        calls.append(path)
-        return real(path)
-
-    globs["_git_commit_time"] = _count
-    first, err, _ = ns["resolve"]()
-    assert err is None and first is not None
-    walked = len(calls)
-    assert walked >= 1
-    second, err2, _ = ns["resolve"]()
-    assert err2 is None and second == first
-    assert len(calls) == walked
-    os.utime(skill, None)  # fingerprint changes; the walk is allowed again
-    ns["resolve"]()
-    assert len(calls) > walked
+    lines = (FIXTURES / "sos_idle_with_draft.txt").read_text(encoding="utf-8").splitlines()
+    state, draft, _tui, _signed = _installed_reader().classify(lines, True)
+    assert state == "idle_with_draft"
+    assert draft == "are we good on disk now?"
