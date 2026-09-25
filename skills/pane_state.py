@@ -47,6 +47,9 @@ the later mtime wins instead. mtime is only that fallback: a checkout and a copy
 rewrite it, so it is not the primary key. A tie keeps the earlier candidate.
 Uncommitted edits do not count: a hand-patched checkout still loses to a later
 commit elsewhere, and `$PANE_STATE_PY` is how to point at that patch.
+The comparison is cached under `~/.cache/cus/pane_state_shim.json`, keyed on
+each candidate's real path, mtime, and size, so a later call does not walk git
+until one of those files changes (annotation 2026-09-25).
 
 On a miss it prints ONE JSON line `{"error": …, "looked_in": […]}` and exits 3 — distinct
 from the reader's own exit 2 ("tmux unusable"), so a watcher can tell "reader missing"
@@ -133,6 +136,50 @@ def _prefer(incumbent: str, challenger: str) -> str:
     return incumbent
 
 
+def _cache_path() -> str:
+    """Where the chosen reader is remembered. Under HOME so a test layout cannot
+    reuse this machine's choice."""
+    return os.path.join(os.path.expanduser("~"), ".cache", "cus", "pane_state_shim.json")
+
+
+def _fingerprint(found: list[str]) -> list:
+    """(realpath, mtime_ns, size) for each existing candidate, in candidate order.
+
+    mtime and size change when the file is edited, checked out, or replaced.
+    The git commit time is not in the key: it is what a miss recomputes."""
+    rows = []
+    for path in found:
+        st = os.stat(path)
+        rows.append([os.path.realpath(path), st.st_mtime_ns, st.st_size])
+    return rows
+
+
+def _cached_choice(found: list[str]) -> str | None:
+    """The stored winner if the candidate files are unchanged, else None."""
+    try:
+        with open(_cache_path(), encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if doc.get("fingerprint") != _fingerprint(found):
+        return None
+    chosen = doc.get("chosen")
+    if not isinstance(chosen, str) or not os.path.isfile(chosen):
+        return None
+    if os.path.realpath(chosen) not in {os.path.realpath(p) for p in found}:
+        return None
+    return chosen
+
+
+def _store_choice(found: list[str], chosen: str) -> None:
+    path = _cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"fingerprint": _fingerprint(found), "chosen": os.path.realpath(chosen)}, fh)
+    os.replace(tmp, path)
+
+
 def resolve() -> tuple[str | None, str | None, list[str]]:
     """(path, error, looked_in): the reader to exec, or None plus why and the
     paths that were actually considered.
@@ -166,9 +213,16 @@ def resolve() -> tuple[str | None, str | None, list[str]]:
         found.append(c)
     if not found:
         return None, (SELF_MSG if saw_self else MOVED_MSG), looked
+    cached = _cached_choice(found)
+    if cached is not None:
+        return cached, None, looked
     chosen = found[0]
     for challenger in found[1:]:
         chosen = _prefer(chosen, challenger)
+    try:
+        _store_choice(found, chosen)
+    except OSError:
+        pass  # a full cache dir must not hide the reader
     return chosen, None, looked
 
 
