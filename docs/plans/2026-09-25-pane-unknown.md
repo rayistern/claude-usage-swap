@@ -7,7 +7,7 @@
 
 `cus panes --json` on this box: **43** live panes. States: idle 21, working 11, unknown 9, idle_with_draft 2. No `limit_menu`.
 
-Each `unknown` row was captured with `tmux capture-pane -p` (read only) and classified with the canonical reader (`vibeCoding/skills/build-babysitter/pane_state.py`, `ClaudeCodeProfile`).
+Each `unknown` row was captured with `tmux capture-pane -p` (read only). The first classification used the checkout the shim resolves first (`~/repos/vibeCoding/skills/build-babysitter/pane_state.py`, commit `e3208ea8`, 2026-09-15). That checkout is **301** commits behind `origin/master`. The installed skill (`~/.claude/skills/build-babysitter/pane_state.py` → the serve worktree, `pane_state.py` at `8b3f52bb`, 2026-09-24) is a different file. Re-classification with that newer reader is in the correction below.
 
 ## Shapes
 
@@ -23,34 +23,43 @@ Each `unknown` row was captured with `tmux capture-pane -p` (read only) and clas
 
 ## Where the fix lives
 
-**Upstream**, in `ClaudeCodeProfile`'s footer pattern (`pane_state.py` in the build-babysitter skill). The zone walk peels only a contiguous footer from the bottom. Both shapes are footer lines the regex does not name:
+> **Correction 2026-09-25 (same day, after re-reading the installed skill).** The paragraph below was written against the checkout the shim resolves first. That file does not match `🚨 cus`. The installed skill already does. Superseded text kept here so the first reading stays visible.
 
-- a line containing `cus SOS:` (emoji prefix allowed)
-- a trailing `⧉` chip under the status cluster (the observed text was `review`)
+**Superseded:** both shapes need new footer patterns upstream, and the shim should extend the pattern until the skill absorbs it.
 
-After those lines peel with the existing `cus` / `⚠ cus:` / `⏵⏵` / `new task?` lines, the `❯` line is found and the current priority order already returns idle, idle_with_draft, or working. Do not treat the optional feedback widget as `approval`.
+**Measured:** two different gaps.
 
-**Cus's own copy** has no classifier (shim since 2026-09-04). **The call** does not need a new mapping. This repo still has to pass `python cus.py panes` from this worktree, because the installed `cus` must not be reinstalled and the vibeCoding file must not be edited from here. The cus-side change is therefore in the shim: extend that footer pattern on the imported reader, then run it, and keep a fixture per shape under `tests/` so the verdicts stay idle / idle_with_draft. When the skill absorbs the same pattern, the shim goes back to a pure exec. Issue text for that absorption is below; the desk files it.
+1. **SOS rows — shim resolution, not a missing pattern.** `skills/pane_state.py` tries `~/repos/vibeCoding/skills/build-babysitter/pane_state.py` first and stops. That file is `e3208ea8` (2026-09-15), 301 commits behind `origin/master`, and its `_R["footer"]` has no `🚨`. The next candidate, `~/.claude/skills/build-babysitter/pane_state.py`, is a different file (`8b3f52bb`, 2026-09-24) whose `_R["footer"]` already includes `^\s*🚨\s+cus\b`. Re-classifying the 9 captures with that reader: idle 6, idle_with_draft 1, working 1, unknown 1. The 7 SOS captures are idle or idle_with_draft. A live `--all` on that reader: 45 rows, **1** unknown. The shim's own comment says the checkout and the skill link are the same file; on this box they are not, and the older one wins. Cus-side fix: when those two candidates are different files, run the newer one (mtime). Do not add an SOS alternative in the shim. `collect_pane_row` still copies `state` through.
+
+2. **`⧉ review` chip — still unknown on the newest reader.** Footer and `footer_anchored` both miss `⧉`. One live pane, empty `❯`, true state idle. That pattern is the upstream change. This repo's shim does not grow a second classifier; the issue text below is what the desk files. A scrubbed fixture in this repo asserts idle for that shape against the reader the shim actually runs, so the gap stays visible until the skill lands it. If the after-count still shows that one pane as `unknown`, the row's reason is this chip, not a silent `unknown`.
+
+Cursor, on the newest reader: **6** panes (5 working, 1 idle). None `unknown`. The idle one is 84 columns wide and its path footer still matches, so it is not the wrapped-footer case in vibeCoding #637 (open: an idle Cursor pane reads `unknown` when `cwd · branch` wraps). No live pane is in that case. No fixture for it.
 
 ## Upstream issue text (desk files this; do not file from this cell)
 
-**Title:** pane reader: cus SOS line and the review chip leave a live Claude Code pane `unknown`
+**Title:** pane reader: a trailing `⧉ review` chip leaves a live Claude Code pane `unknown`
 
 **Body:**
 
-`ClaudeCodeProfile._zones` peels footer lines from the bottom only while they match `_R["footer"]` or a rule. `_R["footer"]` already includes `⏵⏵`, `bypass permissions on`, `new task? /clear`, `^\s*cus\s`, and `^\s*⚠ cus:`.
+`ClaudeCodeProfile._zones` peels footer lines from the bottom only while they match `_R["footer"]` or a rule. As of `8b3f52bb` (2026-09-24) that regex already includes `^\s*🚨\s+cus\b`, so a `cus SOS:` row is footer and a pane at `❯` under it reads `idle` or `idle_with_draft`. Do not re-file the SOS line.
 
-Two lines now sit in that cluster and match neither:
+What is still open: a last-row `⧉ review` chip under `new task? /clear`. It matches neither `_R["footer"]` nor `_R["footer_anchored"]`, the walk stops on row 0, and the pane reads `unknown`. The prompt above it is an empty `❯` and nothing is live, so the state is `idle`. Please treat a trailing `⧉` chip as a footer line. Hook lines (`Stop says`, `UserPromptSubmit says`) are content. The optional "How is Claude doing this session?" rows (`1: Bad`) are not an approval box.
 
-1. `🚨 cus SOS: …` — the alarm emoji is not whitespace, so `^\s*cus\s` misses it. The walk stops, `❯` is never found, and a pane with an empty prompt (or an unsent draft) reads `unknown`.
-2. A last-row `⧉ review` chip under `new task? /clear`. The walk stops on row 0.
+One fixture. claude-usage-swap will assert the same shape against whichever reader its shim runs.
 
-Please treat both as footer lines (a `cus SOS:` match that allows a prefix, and a trailing `⧉` chip). A pane at `❯` with nothing live stays `idle`; text on `❯` stays `idle_with_draft`; a live spinner row stays `working`. The optional "How is Claude doing this session?" rows (`1: Bad`) are not an approval box. Hook lines (`Stop says`, `UserPromptSubmit says`) are content and need no new state.
+## Checklist
 
-Add one fixture per shape. claude-usage-swap will carry the same expectation on its shim until this lands, then drop the shim patch.
+- [ ] Shim runs the newer reader when the vibeCoding checkout and the installed skill are different files.
+- [ ] Fixture: SOS screen, empty prompt → idle (newest reader; scrubbed).
+- [ ] Fixture: SOS screen, unsent draft → idle_with_draft (scrubbed).
+- [ ] Fixture: trailing `⧉ review` chip, empty prompt → idle, marked xfail until the skill lands the pattern (suite stays green). The after-count may still show this one pane, and the row must say why.
+- [ ] After-count: `python3 cus.py panes` from this worktree. Before: 43 panes, unknown 9 (idle 21, working 11, idle_with_draft 2). After: paste counts, not rows.
+- [ ] Full suite: `pytest tests/ -q` passes.
+- [ ] Draft PR. Installed `cus` is not reinstalled.
 
 ## Steps after this plan
 
-1. Shim: extend the footer pattern; fixtures for the SOS gap (idle), the SOS gap with a draft (idle_with_draft), and the `⧉ review` chip (idle). Scrub captures before they are written.
-2. Run this worktree's `python cus.py panes` and record counts (no row text) for the PR. Installed `cus` stays on the old checkout.
-3. Draft PR. Suite green.
+1. Shim resolution only (newer file when the two candidates differ). Fixtures for the two SOS shapes. Scrub before writing.
+2. Chip fixture that records the expected idle verdict. Upstream issue text stays in this plan for the desk; this cell does not file it and does not edit the skill.
+3. `python3 cus.py panes` from this worktree; record counts. `pytest tests/ -q`.
+4. Draft PR.
