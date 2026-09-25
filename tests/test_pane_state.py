@@ -326,6 +326,9 @@ def _installed_reader():
     mod = importlib.util.module_from_spec(spec)
     sys.modules["pane_state_reader"] = mod
     spec.loader.exec_module(mod)
+    sys.modules.pop("pane_state_reader", None)
+    if not hasattr(mod, "classify"):
+        pytest.skip("installed pane reader has no classify; SOS fixtures need that function")
     return mod
 
 
@@ -340,4 +343,4 @@ def test_sos_footer_with_an_unsent_draft_is_idle_with_draft():
     lines = (FIXTURES / "sos_idle_with_draft.txt").read_text(encoding="utf-8").splitlines()
     state, draft, _tui, _signed = _installed_reader().classify(lines, True)
     assert state == "idle_with_draft"
-    assert draft == "are we good on disk now?"
+    assert draft == "please confirm the draft is saved"

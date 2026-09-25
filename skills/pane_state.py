@@ -27,7 +27,7 @@ back to a different copy):
      (a link on this box; the only place it exists under plugin packaging, vibeCoding #332)
   4. `<this repo>/../vibeCoding/skills/build-babysitter/pane_state.py` (sibling checkout)
 Candidates are deduplicated on their real path (2 and 3 were the same file when this
-order was written; they are not, on a box whose skill link points at another worktree).
+order was written; they are not, when the skill link points at another worktree).
 When more than one of 2–4 exists as a different file, the newer one runs
 (annotation 2026-09-25, below). A single existing file is used as-is. The same
 realpath is one candidate, so there is nothing to compare.
@@ -61,8 +61,9 @@ and the other paths. The pick is not silent.
 When `$PANE_STATE_PY` points at this shim, `looked_in` is only that path.
 Before this change the same error listed every candidate.
 Annotation 2026-09-25, later the same day: a cache of that choice was added and
-then removed. A cold resolve is about 40 ms, and the cache file plus a shared
-`.tmp` write did not earn their place.
+then removed. One cold resolve measured about 40 ms; the same call under load
+measured 58–190 ms, so that figure is one measurement, not a bound. The cache
+file plus a shared `.tmp` write did not earn their place.
 
 On a miss it prints ONE JSON line `{"error": …, "looked_in": […]}` and exits 3 — distinct
 from the reader's own exit 2 ("tmux unusable"), so a watcher can tell "reader missing"
