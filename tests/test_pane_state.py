@@ -87,7 +87,12 @@ def test_user_skill_link_is_a_candidate_between_home_and_sibling(tmp_path):
     assert r.returncode == 7 and json.loads(r.stdout)["from"] == "fake"
 
 
-def test_resolution_order_is_env_then_home_then_skill_link_then_sibling(tmp_path):
+def test_equal_keys_keep_the_earlier_candidate(tmp_path):
+    """No commits, equal mtimes: a tie keeps candidate order, not recency.
+
+    The override still wins first. Removing the winner surfaces the next
+    earlier candidate. Reverse the old descending stamps and this still holds.
+    """
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
     spots = {
@@ -99,19 +104,16 @@ def test_resolution_order_is_env_then_home_then_skill_link_then_sibling(tmp_path
     for name, path in spots.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"print('{name}')\n")
-    # No git history here, so "newer" is mtime. Stamp them in candidate order so
-    # removing the winner still surfaces the next one. A newer commit on a later
-    # candidate is test_newer_commit_wins_over_an_older_checkout_and_over_mtime.
-    base = 1_700_000_000
-    for name, step in (("env", 40), ("home", 30), ("link", 20), ("sibling", 10)):
-        os.utime(spots[name], (base + step, base + step))
+    stamp = 1_700_000_000
+    for path in spots.values():
+        os.utime(path, (stamp, stamp))
     order = []
     for name in ("env", "home", "link", "sibling"):
         e = dict(env)
         if name == "env":
             e["PANE_STATE_PY"] = str(spots["env"])
         order.append(_run(shim, e).stdout.strip())
-        spots[name].unlink()                     # remove the winner, the next one must win
+        spots[name].unlink()
     assert order == ["env", "home", "link", "sibling"]
 
 
@@ -150,10 +152,92 @@ def test_newer_commit_wins_over_an_older_checkout_and_over_mtime(tmp_path):
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "skill"
+    assert "chose" in r.stderr and "also found" in r.stderr
     env["PANE_STATE_PY"] = str(checkout)
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "checkout"
+
+
+def test_untracked_copy_does_not_outrank_a_committed_reader(tmp_path):
+    """A fresh mtime on a file with no commit loses to a committed reader."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    checkout_repo = home / "repos" / "vibeCoding"
+    checkout = checkout_repo / "skills" / "build-babysitter" / "pane_state.py"
+    _commit_reader(checkout_repo, checkout, "print('committed')\n", "2026-09-24T12:00:00+00:00")
+    os.utime(checkout, (1_700_000_000, 1_700_000_000))
+    plain = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    plain.parent.mkdir(parents=True)
+    plain.write_text("print('untracked')\n")
+    os.utime(plain, (1_800_000_000, 1_800_000_000))
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "committed"
+    assert "chose" in r.stderr and "also found" in r.stderr
+
+
+def test_three_candidates_rank_by_one_key(tmp_path):
+    """A newer commit beats both an older commit and a fresher untracked file."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    old_repo = home / "repos" / "vibeCoding"
+    old = old_repo / "skills" / "build-babysitter" / "pane_state.py"
+    _commit_reader(old_repo, old, "print('old')\n", "2026-09-15T12:00:00+00:00")
+    plain = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    plain.parent.mkdir(parents=True)
+    plain.write_text("print('plain')\n")
+    os.utime(plain, (1_900_000_000, 1_900_000_000))
+    new_repo = tmp_path / "vibeCoding"
+    new = new_repo / "skills" / "build-babysitter" / "pane_state.py"
+    _commit_reader(new_repo, new, "print('new')\n", "2026-09-24T12:00:00+00:00")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "new"
+
+
+def test_git_missing_from_path_falls_back_without_crashing(tmp_path):
+    """No git binary: neither file has a commit, so mtime decides, and we do not crash."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    older = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    newer = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    older.parent.mkdir(parents=True)
+    newer.parent.mkdir(parents=True)
+    older.write_text("print('older')\n")
+    newer.write_text("print('newer')\n")
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newer, (1_800_000_000, 1_800_000_000))
+    env["PATH"] = str(tmp_path / "no-bin")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "newer"
+
+
+def test_self_link_falls_through_to_a_later_reader(tmp_path):
+    """A candidate that is this shim is skipped when a later real reader exists.
+
+    Before this change the first self match was exit 3 even if another reader
+    followed. Stderr names the skip. looked_in for an override that points at
+    the shim is only that path.
+    """
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    link = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shim)
+    skill = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("print('skill')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "skill"
+    assert "skipped a candidate that is this shim" in r.stderr
+    env["PANE_STATE_PY"] = str(shim)
+    r = _run(shim, env, "x")
+    assert r.returncode == 3
+    doc = json.loads(r.stdout)
+    assert doc["looked_in"] == [str(shim)]
 
 
 def test_shim_never_execs_itself(tmp_path):
