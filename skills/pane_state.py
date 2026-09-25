@@ -17,9 +17,11 @@ what a pane is doing.
 Annotation 2026-09-25: it does choose WHICH copy to exec when several exist. That
 choice is the resolution note below, not a second classifier.
 
-Resolution order (vibeCoding D-queue #333, D4 — an explicit override that points at a
-missing file is a configuration error and fails loudly rather than silently falling
-back to a different copy):
+Resolution order (revised 2026-09-25). vibeCoding D-queue #333, D4 listed the
+checkout before the installed skill. That default hid a stale checkout, so the
+installed skill now comes first. Walk back by setting `$PANE_STATE_PY` to the
+file you want. An override that points at a missing file is still a
+configuration error and fails loudly rather than falling back:
   1. `$PANE_STATE_PY` when set — must be a file (`~` is expanded). It wins even when
      an older or newer copy exists elsewhere.
   2. `~/.claude/skills/build-babysitter/pane_state.py` — the installed skill
@@ -49,9 +51,11 @@ plain or symlinked skill copy, because a git error ranks the same as untracked.
 Neither commit time nor modification time is the reader's behaviour.
 The rule now is the order above, with no git call and no mtime. The installed
 skill wins over a checkout. `$PANE_STATE_PY` is how to point at a specific file.
-When two different files exist, or a self-link is skipped, one stderr line
-names the choice and the other paths. `cus panes` copies that line into
-`reader_notice` (JSON) and prints it in text mode. A single file is silent.
+When two different files exist, a self-link is skipped, or a dangling link is
+skipped, one stderr line names the choice and the other paths. `cus panes`
+copies a line that starts `pane_state: chose` into `reader_notice` (JSON) and
+prints it in text mode. `cus panes --me` does not show `reader_notice`.
+A single file is silent, including one stale copy when no other candidate exists.
 What this cannot see: a newer checkout that was never installed, a stale
 installed skill, a feature branch whose later commit is only a comment, and a
 fresh untracked file sitting on the skill path. Those stay the installed
@@ -106,10 +110,11 @@ def candidates() -> list[str]:
     return uniq
 
 
-def _notice(found: list[str], chosen: str, saw_self: bool) -> None:
+def _notice(found: list[str], chosen: str, saw_self: bool, dangling: list[str]) -> None:
     """One stderr line when the pick could have gone another way. Silent when
-    there is a single real reader and nothing was skipped."""
-    if len(found) < 2 and not saw_self:
+    there is a single real reader and nothing was skipped, including one stale
+    copy with no other candidate."""
+    if len(found) < 2 and not saw_self and not dangling:
         return
     others = [p for p in found if os.path.realpath(p) != os.path.realpath(chosen)]
     parts = [f"pane_state: chose {chosen}"]
@@ -117,6 +122,8 @@ def _notice(found: list[str], chosen: str, saw_self: bool) -> None:
         parts.append("also found " + ", ".join(others))
     if saw_self:
         parts.append("skipped a candidate that is this shim")
+    if dangling:
+        parts.append("skipped a dangling link at " + ", ".join(dangling))
     print("; ".join(parts), file=sys.stderr)
 
 
@@ -144,7 +151,13 @@ def resolve() -> tuple[str | None, str | None, list[str]]:
     looked = candidates()
     found: list[str] = []
     saw_self = False
+    dangling: list[str] = []
     for c in looked:
+        # A link whose target is gone is not "missing". Falling through to the
+        # checkout without saying so is how a removed worktree hides the skill.
+        if os.path.lexists(c) and not os.path.isfile(c):
+            dangling.append(c)
+            continue
         if not os.path.isfile(c):
             continue
         if os.path.realpath(c) == me:
@@ -154,7 +167,7 @@ def resolve() -> tuple[str | None, str | None, list[str]]:
     if not found:
         return None, (SELF_MSG if saw_self else MOVED_MSG), looked
     chosen = found[0]
-    _notice(found, chosen, saw_self)
+    _notice(found, chosen, saw_self, dangling)
     return chosen, None, looked
 
 

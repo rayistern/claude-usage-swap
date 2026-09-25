@@ -442,16 +442,16 @@ def test_reader_notice_reaches_the_payload_and_the_table(monkeypatch, tmp_path):
         'print(json.dumps({"pane":"%1","profile":"claude-code","state":"idle","session":"s"}))\n'
     )
     monkeypatch.setenv("CUS_PANE_STATE_PY", str(fake))
-    rows = cus.read_panes_from_reader()
+    rows, notice = cus.read_panes_from_reader()
     assert rows and rows[0]["state"] == "idle"
-    assert cus.read_panes_from_reader.last_reader_notice.startswith("pane_state: chose")
+    assert notice is not None and notice.startswith("pane_state: chose")
     text = cus.render_panes_table({
         "generated_at": "2026-09-25T00:00:00Z",
         "window_minutes": 60,
         "window_start": "2026-09-24T23:00:00Z",
         "panes": [],
         "accounts": {},
-        "reader_notice": cus.read_panes_from_reader.last_reader_notice,
+        "reader_notice": notice,
     })
     assert text.splitlines()[0].startswith("pane_state: chose")
 

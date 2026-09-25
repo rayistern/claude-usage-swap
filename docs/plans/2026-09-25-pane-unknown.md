@@ -55,10 +55,11 @@ One fixture, in the skill's tests. A `READER_VERSION` constant on the reader wou
 - [x] After-count. Before (`cus panes --json`, earlier snapshot): 43 panes, unknown 9 (idle 21, working 11, idle_with_draft 2). After (`python3 cus.py panes --json` from this worktree, later snapshot, not the same set of panes): 45 panes, idle 37, working 7, unknown 1. Recorded on [#251](https://github.com/rayistern/claude-usage-swap/pull/251).
 - [x] Full suite, stated honestly. Local `pytest tests/ -q` on `2d2f53d`: 884 passed. The path-order commit's local run: 884 passed, 1 failed (`test_flat_config_polls_everyone_each_interval`). The docs-and-fixtures commit's local run was 883 passed and the same failure. That test passes on its own and fails the same way on `be98e0b` when the whole suite runs. An earlier full run on `f5b2194` failed the same test (879 passed). GitHub Actions on `f5b2194` is green: `gh pr checks 251` → test 3.11, 3.12, 3.13 pass (run `36099819413`). The round-2 disposition records runner CI green at `7cd9671`.
 - [x] Draft pull request [#251](https://github.com/rayistern/claude-usage-swap/pull/251). The installed `cus` command was not reinstalled; the commits do not change an install path.
+- [x] QA round: live `cus panes` from this worktree. Command: `HOME=/home/rayi python3 cus.py panes --json` (2026-09-25, later snapshot, not the same set of panes as the before-count). 45 panes, idle 37, working 7, unknown 1.
 
 ## What shipped
 
-1. Shim resolution: the installed skill, then the checkout, then the sibling. No git call. Two files print which one was chosen, and `cus panes` shows that line. One cold resolve measured about 40 ms before the git calls were removed; under load the same call measured 58–190 ms, so 40 ms was one measurement, not a bound.
+1. Shim resolution (`77d5076`): `$PANE_STATE_PY`, then `~/.claude/skills/build-babysitter/pane_state.py`, then `~/repos/vibeCoding/skills/build-babysitter/pane_state.py`, then the sibling checkout. No git call. Two files print which one was chosen, and `cus panes` shows that line as `reader_notice`. `cus panes --me` does not. One cold resolve measured about 40 ms before the git calls were removed; under load the same call measured 58–190 ms, so 40 ms was one measurement, not a bound.
 2. Two scrubbed SOS fixtures (`708c38f`), classified by the installed reader, skip when none is installed (`f5b2194`).
 3. Reader-choice cache added (`4164bcd`) and removed (`f5b2194`).
 4. Draft pull request #251.

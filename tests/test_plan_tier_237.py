@@ -282,8 +282,8 @@ def test_panes_measured_row_gets_a_numeric_pts_per_min_on_a_known_tier_and_a_que
     _write_session(claude, sid, [usage_line(datetime.now(timezone.utc) - timedelta(minutes=5),
                                             "claude-fable-5-1", "m1", inp=3_000_000, out=0)])
     monkeypatch.setattr(cus, "read_peer_registry", lambda: _reg(sid))
-    monkeypatch.setattr(cus, "read_panes_from_reader", lambda include_all=True: [
-        {"pane": "%9", "session": "x", "state": "working", "pane_pid": 11, "profile": "claude-code"}])
+    monkeypatch.setattr(cus, "read_panes_from_reader", lambda include_all=True: ([
+        {"pane": "%9", "session": "x", "state": "working", "pane_pid": 11, "profile": "claude-code"}], None))
     monkeypatch.setattr(cus, "load_config", lambda: dict(cus.DEFAULT_CONFIG))
     fresh = _acct(plan_tier_profile={"raw": "default_claude_max_20x", "observed_ts": _iso(datetime.now(timezone.utc))})
     monkeypatch.setattr(cus, "load_state", lambda: {"slots": {"slot-7": {"account": "rayi5"}}, "accounts": {"rayi5": fresh}})

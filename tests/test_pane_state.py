@@ -78,7 +78,7 @@ def test_missing_everywhere_is_one_error_line_and_exit_3(tmp_path):
     assert "state" not in doc  # never a fabricated pane row
 
 
-def test_user_skill_link_is_a_candidate_between_home_and_sibling(tmp_path):
+def test_installed_skill_is_used_when_the_checkout_is_absent(tmp_path):
     shim, env = _layout(tmp_path)
     canon = Path(env["HOME"]) / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
     canon.parent.mkdir(parents=True)
@@ -87,11 +87,10 @@ def test_user_skill_link_is_a_candidate_between_home_and_sibling(tmp_path):
     assert r.returncode == 7 and json.loads(r.stdout)["from"] == "fake"
 
 
-def test_equal_keys_keep_the_earlier_candidate(tmp_path):
-    """No commits, equal mtimes: a tie keeps candidate order, not recency.
+def test_removal_walks_the_documented_order(tmp_path):
+    """Override, then installed skill, then checkout, then sibling.
 
-    The override still wins first. Removing the winner surfaces the next
-    earlier candidate. Reverse the old descending stamps and this still holds.
+    Removing the winner surfaces the next path in that order.
     """
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
@@ -104,9 +103,6 @@ def test_equal_keys_keep_the_earlier_candidate(tmp_path):
     for name, path in spots.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"print('{name}')\n")
-    stamp = 1_700_000_000
-    for path in spots.values():
-        os.utime(path, (stamp, stamp))
     order = []
     for name in ("env", "link", "home", "sibling"):
         e = dict(env)
@@ -168,7 +164,6 @@ def test_fresh_untracked_file_on_the_skill_path_still_wins(tmp_path):
     plain = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
     plain.parent.mkdir(parents=True)
     plain.write_text("print('stale')\n")
-    os.utime(plain, (1_900_000_000, 1_900_000_000))
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "stale"
@@ -191,8 +186,8 @@ def test_sibling_with_a_later_commit_does_not_pass_the_skill(tmp_path):
     assert str(new) in r.stderr
 
 
-def test_git_missing_from_path_falls_back_without_crashing(tmp_path):
-    """No git binary: the installed skill still wins, and we do not crash."""
+def test_installed_skill_precedes_the_checkout(tmp_path):
+    """The skill path wins when a checkout file also exists. No timestamps involved."""
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
     older = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
@@ -201,12 +196,10 @@ def test_git_missing_from_path_falls_back_without_crashing(tmp_path):
     newer.parent.mkdir(parents=True)
     older.write_text("print('older')\n")
     newer.write_text("print('newer')\n")
-    os.utime(older, (1_700_000_000, 1_700_000_000))
-    os.utime(newer, (1_800_000_000, 1_800_000_000))
-    env["PATH"] = str(tmp_path / "no-bin")
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "newer"
+    assert "pane_state: chose" in r.stderr
 
 
 def test_self_link_falls_through_to_a_later_reader(tmp_path):
@@ -218,21 +211,37 @@ def test_self_link_falls_through_to_a_later_reader(tmp_path):
     """
     shim, env = _layout(tmp_path)
     home = Path(env["HOME"])
-    link = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    link = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
     link.parent.mkdir(parents=True)
     link.symlink_to(shim)
-    skill = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
-    skill.parent.mkdir(parents=True)
-    skill.write_text("print('skill')\n")
+    checkout = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    checkout.parent.mkdir(parents=True)
+    checkout.write_text("print('checkout')\n")
     r = _run(shim, env)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "skill"
+    assert r.stdout.strip() == "checkout"
     assert "skipped a candidate that is this shim" in r.stderr
     env["PANE_STATE_PY"] = str(shim)
     r = _run(shim, env, "x")
     assert r.returncode == 3
     doc = json.loads(r.stdout)
     assert doc["looked_in"] == [str(shim)]
+
+
+def test_dangling_skill_link_is_named_and_the_checkout_runs(tmp_path):
+    """A skill link whose target is gone must not fall through in silence."""
+    shim, env = _layout(tmp_path)
+    home = Path(env["HOME"])
+    link = home / ".claude" / "skills" / "build-babysitter" / "pane_state.py"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "missing-reader.py")
+    checkout = home / "repos" / "vibeCoding" / "skills" / "build-babysitter" / "pane_state.py"
+    checkout.parent.mkdir(parents=True)
+    checkout.write_text("print('checkout')\n")
+    r = _run(shim, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "checkout"
+    assert f"skipped a dangling link at {link}" in r.stderr
 
 
 def test_shim_never_execs_itself(tmp_path):

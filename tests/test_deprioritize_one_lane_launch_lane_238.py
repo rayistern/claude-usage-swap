@@ -663,7 +663,7 @@ def test_panes_payload_stamps_the_flag_end_to_end(monkeypatch, tmp_path):
     _fake_env(monkeypatch, tmp_path)
     reader = [{"pane": "%20", "session": "2good1a", "state": "idle", "pane_pid": 11, "profile": "claude-code"},
               {"pane": "%10", "session": "4mainsite1a", "state": "idle", "pane_pid": 12, "profile": "claude-code"}]
-    monkeypatch.setattr(cus, "read_panes_from_reader", lambda include_all=True: reader)
+    monkeypatch.setattr(cus, "read_panes_from_reader", lambda include_all=True: (reader, None))
     monkeypatch.setattr(cus, "read_peer_registry", lambda: {})
     monkeypatch.setattr(cus, "load_state", lambda: {"slots": {"slot-7": {"account": "rayi5"}},
                                                     "accounts": {"rayi5": {"current_5h_pct": 1.0, "current_7d_pct": 1.0}}})
