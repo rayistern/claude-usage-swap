@@ -2848,6 +2848,18 @@ def _held_proc_window(fn):
     return inner
 
 
+def _assert_no_hold(what: str) -> None:
+    """The discipline as a check (PR #256 pass 3, both seats): an ACTOR —
+    anything that acts on a `mount_in_use` answer — must not run inside a
+    reader's hold, where it would be served a scan taken earlier instead
+    of the table as it is now. Called at each acting entry point; a
+    reader that ever reaches one fails here instead of acting on a stale
+    answer."""
+    if _PROC_HOLD is not None:
+        raise RuntimeError(f"{what} called inside a process-table hold: an actor "
+                           f"must read the table as it is now (PR #256)")
+
+
 def _reset_proc_snapshot() -> None:
     """Drop any hold (a test hook; the previous design's window is gone)."""
     global _PROC_HOLD
@@ -2908,6 +2920,19 @@ def mount_pids(mount: Path) -> list[int]:
 # stands in for `mount_pids` (the suite has many, one-argument) is still
 # what `mount_in_use` answers from.
 _PROC_SCAN_FAILED = False
+# A module-level flag is fine while cus stays single-threaded (it is: one
+# process per command, and the daemon loop is sequential); a threaded cus
+# would need it per thread.
+
+
+def _mount_pids_or_unknown(mount: Path) -> list[int] | None:
+    """`mount_pids`, or None when the table could not be read — for the
+    displays, which must say "unknown" rather than "idle" then (PR #256
+    pass 3, Opus)."""
+    global _PROC_SCAN_FAILED
+    _PROC_SCAN_FAILED = False
+    pids = mount_pids(mount)
+    return None if (_PROC_SCAN_FAILED and not pids) else pids
 
 
 def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
@@ -3470,6 +3495,7 @@ def acquire_slot(state: dict, prefer_account: str | None = None,
     can't collide with them either (their dirs still exist on disk, so
     _allocate_slot_unlocked never reuses their indices).
     """
+    _assert_no_hold("acquire_slot")
     with _swap_lock():
         fresh = load_state()
         slots_state = fresh.setdefault("slots", {})
@@ -3713,6 +3739,7 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
         return {"action": "dropped_stale_entry", "slot": name}
     # The table as it is NOW (a fresh scan outside any hold): this answer
     # stands between a live session's mount and an rmtree (PR #256).
+    _assert_no_hold("gc_slot")
     if not force and mount_in_use(d):
         return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
     if not force and _slot_reserved(entry):
@@ -8176,6 +8203,7 @@ def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = N
 def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None,
                          bump_ladder: bool = True, force_reinstall: bool = False) -> dict:
     """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
+    _assert_no_hold("_execute_swap_locked")
     # State is loaded AFTER the lock is acquired: a concurrent swap that just
     # finished has already persisted its state.json, so `current` below is
     # never a stale pre-lock snapshot (the #76 interleaving scenario).
@@ -10060,6 +10088,7 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
     # callers): outside a hold every `mount_in_use` below is a fresh scan of
     # the table as it is NOW; a reader that holds a scan is served it.
     out: dict[str, list[str]] = {}
+    unreadable = False
     for name, entry in sorted(state.get("slots", {}).items()):
         acct = entry.get("account")
         if not acct:
@@ -10067,7 +10096,12 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
         d = slot_path(name)
         if d.exists() and mount_in_use(d):
             out.setdefault(acct, []).append(name)
-    _OCCUPIED_SLOTS_CACHE[key] = (now, out)
+            unreadable = unreadable or _PROC_SCAN_FAILED
+    # An unreadable table reads every slot as live (the safe answer for the
+    # guards that ask here); that answer is for THIS question only and is
+    # not kept for the cache's five seconds (PR #256 pass 3, Opus).
+    if not unreadable:
+        _OCCUPIED_SLOTS_CACHE[key] = (now, out)
     return out
 
 
@@ -12312,6 +12346,8 @@ def _slot_mount_creds_dead(slot_name: str, slot_dir: Path, account: str, state: 
     except OSError:
         before = None
     probe_ok = allow_probe and not mount_in_use(slot_dir)
+    if probe_ok:
+        _assert_no_hold("the token-rotating probe")   # a probe acts on that answer
     dead = _store_creds_dead(creds_path, f"mount:{slot_name}", config, allow_probe=probe_ok)
     if not dead and probe_ok:
         try:
@@ -12770,6 +12806,8 @@ def _release_dead_leases(state: dict, config: dict, *, execute: bool) -> list[st
     pops the ENTIRE slot entry on reap, lease included, so this stays a
     prune-only pass for slots that persist while their store died.
     Returns ["slot: account/family", ...] for each (would-be) release."""
+    if execute:
+        _assert_no_hold("_release_dead_leases(execute=True)")
     released: list[str] = []
     locked = _locked_slots(config)
     changed = False
@@ -13010,6 +13048,8 @@ def _deep_prune_stores(state: dict, config: dict, *, execute: bool, probe: bool,
 
     Returns rows: {"kind": "deep", "account", "store", "legacy": bool,
     "check", "detail", "leased": bool, "retired": str|None}."""
+    if execute or probe:
+        _assert_no_hold("_deep_prune_stores(execute/probe)")
     hk = config.get("housekeeping", {})
     check_mismatch = hk.get("deep_identity_mismatch", True)
     check_duplicate = hk.get("deep_duplicate_generation", True)
@@ -18329,8 +18369,9 @@ def status() -> None:
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
-            pids = mount_pids(d)
-            live_col = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+            pids = _mount_pids_or_unknown(d)
+            live_col = (click.style("unknown (process table unreadable)", fg="yellow") if pids is None
+                        else click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle")
             lock_col = click.style("  🔒locked", fg="yellow") if d.name in locked_slot_names else ""
             # GH #238 A: a lane that can wait (never rescued) / a MIXED lane (split it).
             if d.name in deprio_view["conflicts"]:
@@ -23818,6 +23859,7 @@ def slot_create_cmd() -> None:
 
 
 @slot.command("list")
+@_held_proc_window
 def slot_list_cmd() -> None:
     """List slot dirs: account held, live PIDs, state registration."""
     state = load_state()
@@ -23830,8 +23872,9 @@ def slot_list_cmd() -> None:
     for d in dirs:
         seen.add(d.name)
         entry = reg.get(d.name, {})
-        pids = mount_pids(d)
-        status = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+        pids = _mount_pids_or_unknown(d)
+        status = (click.style("unknown (process table unreadable)", fg="yellow") if pids is None
+                  else click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle")
         acct = entry.get("account") or "(empty)"
         unreg = "" if d.name in reg else click.style("  [not in state — doctor?]", fg="yellow")
         click.echo(f"  {d.name:<10} account={acct:<12} {status}{unreg}")

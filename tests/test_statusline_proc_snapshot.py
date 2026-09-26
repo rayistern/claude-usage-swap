@@ -316,3 +316,124 @@ def test_readers_hold_and_the_detector_is_served_the_held_scan(proc, slots, read
             with cus._proc_window_held():       # a nested reader takes no scan
                 cus.occupied_slot_accounts(slots, max_age_seconds=0.0)
     assert len(reads) == n_pids
+
+
+# ── pass 3 of PR #256: the discipline as a check, and the remaining sites ─
+#
+# `_assert_no_hold` at every acting entry point turns "no actor runs inside
+# a reader's hold" from a rule into a runtime check. The readers are run
+# end to end with the check on; each acting site is driven with a pid
+# appearing between two calls (through the suite's `_Env`, whose
+# `mount_pids` double is consulted on every call — there is no cache
+# anywhere any more, so a double or the real table behave alike here).
+
+import json                       # noqa: E402
+from click.testing import CliRunner   # noqa: E402
+
+from test_prune_housekeeping import _Env, _valid   # noqa: E402
+
+
+def test_an_actor_inside_a_hold_raises(proc, slots):
+    with cus._proc_window_held():
+        for what, call in (("gc_slot", lambda: cus.gc_slot("slot-3", dict(slots), force=False)),
+                           ("acquire_slot", lambda: cus.acquire_slot(dict(slots))),
+                           ("_release_dead_leases", lambda: cus._release_dead_leases(dict(slots), {}, execute=True)),
+                           ("_deep_prune_stores", lambda: cus._deep_prune_stores(dict(slots), {}, execute=True, probe=False)),
+                           ("_execute_swap_locked", lambda: cus._execute_swap_locked("a", "test"))):
+            with pytest.raises(RuntimeError, match="inside a process-table hold"):
+                call()
+    # Report-only prune and lease release are readers' business and may run held.
+    with cus._proc_window_held():
+        assert cus._release_dead_leases(dict(slots), {}, execute=False) == []
+
+
+def test_every_reader_runs_with_the_check_on():
+    """Each decorated reader, end to end, on a throwaway tree with a live and
+    an idle slot: none reaches an actor (the check would raise), and each
+    exits cleanly."""
+    env = _Env({"alpha": _valid("at-a", "rt-a"), "beta": _valid("at-b", "rt-b")}, active="alpha")
+    try:
+        env.make_slot("alpha", live=True, mount_creds=_valid("at-a", "rt-a"))
+        env.make_slot("beta", live=False, mount_creds=_valid("at-b", "rt-b"))
+        cus._reset_proc_snapshot()
+        runner = CliRunner()
+        for argv in (["status"], ["sessions"], ["panes"], ["statusline"], ["sos"], ["slot", "list"]):
+            r = runner.invoke(cus.cli, argv)
+            assert r.exit_code in (0, 1) and "process-table hold" not in (r.output + str(r.exception)), (argv, r.output[-400:], r.exception)
+        assert cus._PROC_HOLD is None
+        with cus._proc_window_held():
+            cus.diagnose(cus.load_state(), cus.load_config())
+    finally:
+        env.restore()
+
+
+def test_site_deep_prune_stores_holds_back_when_the_legacy_slot_becomes_live():
+    """`_deep_prune_stores(execute=True)` retires a legacy store whose
+    namesake slot is idle; a pid that appears between two calls holds it
+    back (a live mount MAY hold that store's generation)."""
+    env = _Env({"alpha": _valid("at-a", "rt-a")}, active="alpha",
+               config={"mode": "per_session", "independent_logins": {"use_independent_logins": True}})
+    try:
+        slot = env.make_slot("alpha", live=False, mount_creds=_valid("at-a", "rt-a"))
+        legacy = cus.login_family_dir("alpha", slot)
+        legacy.mkdir(parents=True, exist_ok=True)
+        cus.login_family_creds_path("alpha", slot).write_text(json.dumps(_valid("at-old", "rt-old")))
+        env.patch(cus, "_oauth_refresh_grant", lambda rt: ("unknown", None))
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        first = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=False, probe=False)
+                 if r["store"] == slot]
+        env.live_slots.add(slot)            # the pid appears between the two calls
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        second = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=False, probe=False)
+                  if r["store"] == slot]
+        assert first != second or not first, (first, second)
+        assert all("live" in r.get("problem", "").lower() or r.get("leased") for r in second) or not second, second
+        assert cus.login_family_creds_path("alpha", slot).exists()
+    finally:
+        env.restore()
+
+
+def test_site_launch_prepare_lane_refuses_a_lane_that_became_live_on_another_account():
+    env = _Env({"alpha": _valid("at-a", "rt-a"), "beta": _valid("at-b", "rt-b")}, active="alpha",
+               config={"mode": "per_session"})
+    try:
+        lane = env.make_slot("beta", live=False, mount_creds=_valid("at-b", "rt-b"))
+        state, config = cus.load_state(), cus.load_config()
+        cus._launch_prepare("alpha", state, config, lane=lane, dry_run=True)   # idle: accepted
+        env.live_slots.add(lane)                                                # beta's pid appears
+        with pytest.raises(cus.click.ClickException, match="is live on 'beta'"):
+            cus._launch_prepare("alpha", cus.load_state(), config, lane=lane, dry_run=True)
+    finally:
+        env.restore()
+
+
+def test_site_sync_config_skips_a_slot_that_became_live():
+    env = _Env({"alpha": _valid("at-a", "rt-a")}, active="alpha")
+    try:
+        slot = env.make_slot("alpha", live=False, mount_creds=_valid("at-a", "rt-a"))
+        canonical = cus.CLAUDE_DIR / ".claude.json"
+        canonical.write_text(json.dumps({"theme": "dark"}))
+        lines: list[str] = []
+        env.patch(cus.click, "echo", lambda msg="", *a, **k: lines.append(str(msg)))  # the env silences echo
+        cus.sync_config_cmd.callback(from_path=str(canonical), dry_run=True)
+        first = list(lines)
+        lines.clear()
+        env.live_slots.add(slot)
+        cus.sync_config_cmd.callback(from_path=str(canonical), dry_run=True)
+        assert any("would update" in ln for ln in first) and not any("skipped" in ln for ln in first), first
+        assert any(f"{slot}: live session — skipped" in ln for ln in lines), lines
+    finally:
+        env.restore()
+
+
+def test_displays_say_unknown_when_the_table_cannot_be_read(proc, slots, monkeypatch):
+    real_iterdir = Path.iterdir
+    monkeypatch.setattr(Path, "iterdir", lambda self: (_ for _ in ()).throw(OSError(24, "EMFILE")) if self == proc else real_iterdir(self))
+    assert cus._mount_pids_or_unknown(cus.slot_path("slot-1")) is None
+    monkeypatch.setattr(cus, "list_slot_dirs", lambda: [cus.slot_path("slot-1")])
+    r = CliRunner().invoke(cus.cli, ["slot", "list"])
+    assert "unknown (process table unreadable)" in r.output, r.output
+    # The occupancy cache keeps nothing computed from an unreadable table.
+    cus._OCCUPIED_SLOTS_CACHE.clear()
+    assert cus.occupied_slot_accounts(slots) == {"a": ["slot-1", "slot-3"], "b": ["slot-2"], "c": ["slot-9"]}
+    assert cus._OCCUPIED_SLOTS_CACHE == {}
