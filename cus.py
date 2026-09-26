@@ -2783,45 +2783,91 @@ def _pid_config_dir(pid: int) -> str | None:
 
 
 # One scan of the process table per short window, shared by every
-# `mount_pids` call in the same process: (taken-at monotonic seconds, the
-# reader and root it was built with, CLAUDE_CONFIG_DIR → [pids] in /proc
-# order). Before this, each `mount_pids` call re-read EVERY process's
-# environ, and one `cus statusline` — which asks about every slot for every
-# account it diagnoses — read /proc/<pid>/environ about 160,000 times, ~9 s
-# of CPU per call, once a second across ~30 panes (#255). The window is short
-# enough that a launch or exit is seen on the next call; a caller that must
-# see the table as it is right now passes `fresh=True`.
+# `mount_pids` call in the same process: (taken-at seconds, the reader and
+# root it was built with, CLAUDE_CONFIG_DIR → [pids] in /proc order). Before
+# this, each `mount_pids` call re-read EVERY process's environ, and one `cus
+# statusline` — which asks about every slot for every account it diagnoses —
+# read /proc/<pid>/environ about 160,000 times, ~9 s of CPU per call, once a
+# second across ~30 panes (#255). The window is for READERS (statusline,
+# diagnose, status); every path that ACTS on the answer or guards a
+# credential — gc before rmtree, the mode teardown, the GH #104 collision
+# check, the held-by-another-live-mount check — asks with `fresh=True` and
+# reads the table as it is now (PR #256 review, F-S-1 / F-O-1).
 _PROC_SNAPSHOT: tuple | None = None
 _PROC_SNAPSHOT_TTL_SECONDS = 1.0
+# The clock the window is measured on; a test replaces this, not
+# `time.monotonic` itself (F-O-6c).
+_proc_clock = time.monotonic
+
+
+# A scan a READER holds for the length of its loop (`_proc_window_held`):
+# inside the hold, a `fresh=True` request is answered from it — twelve
+# collision checks, one scan — while an actor outside any hold still reads
+# the table now. Held by `_divergence_risk_lanes` (the detector inside
+# `diagnose`); actors (gc, teardown, the swap-time guards) never run inside
+# a reader's hold.
+_PROC_HOLD: dict | None = None
+
+
+@contextlib.contextmanager
+def _proc_window_held():
+    """Take one fresh scan and serve every request from it until the block
+    ends — including `fresh=True` requests, which is the point: a reader's
+    loop asks the credential-safety guards, and those ask for the table
+    now; inside the hold "now" is the scan the reader took."""
+    global _PROC_HOLD
+    prev = _PROC_HOLD
+    _PROC_HOLD = None
+    dirs = _proc_config_dirs(fresh=True)
+    _PROC_HOLD = dirs
+    try:
+        yield
+    finally:
+        _PROC_HOLD = prev
+
+
+def _reset_proc_snapshot() -> None:
+    """Drop the shared scan. Tests call this from a fixture that swaps
+    `_pid_config_dir` or `PROC_ROOT`, and the snapshot also keys itself on
+    the reader and root objects (compared with `is`, holding a reference so
+    a freed object's id cannot be reused under the key — F-O-4 / F-S-3)."""
+    global _PROC_SNAPSHOT, _PROC_HOLD
+    _PROC_SNAPSHOT = None
+    _PROC_HOLD = None
 
 
 def _proc_config_dirs(fresh: bool = False) -> dict[str, list[int]]:
     """CLAUDE_CONFIG_DIR (trailing slash dropped) → pids holding it, from one
-    read of every `<pid>/environ` under PROC_ROOT, in the table's order.
-    Reused for `_PROC_SNAPSHOT_TTL_SECONDS`; rebuilt when `fresh`, when the
-    window has passed, or when the reader or the root was swapped (a test
-    that monkeypatches `_pid_config_dir` or `PROC_ROOT` gets its own scan).
-    """
+    read of every `<pid>/environ` under PROC_ROOT, in the table's order —
+    a fresh copy, so a caller cannot change the shared map. Reused for
+    `_PROC_SNAPSHOT_TTL_SECONDS`; rebuilt when `fresh`, when the window has
+    passed, or when the reader or the root is not the one it was built with.
+    A scan whose `iterdir` fails answers empty for THIS call only and caches
+    nothing — the next call reads /proc again, as before the cache existed
+    (F-S-2); a transient EMFILE must not read as "every mount idle" for a
+    second."""
     global _PROC_SNAPSHOT
-    now = time.monotonic()
-    key = (id(_pid_config_dir), str(PROC_ROOT))
-    if (not fresh and _PROC_SNAPSHOT is not None
-            and _PROC_SNAPSHOT[1] == key
-            and now - _PROC_SNAPSHOT[0] < _PROC_SNAPSHOT_TTL_SECONDS):
-        return _PROC_SNAPSHOT[2]
-    dirs: dict[str, list[int]] = {}
+    if _PROC_HOLD is not None:
+        return {k: list(v) for k, v in _PROC_HOLD.items()}
+    now = _proc_clock()
+    reader, root = _pid_config_dir, PROC_ROOT
+    snap = _PROC_SNAPSHOT
+    if (not fresh and snap is not None and snap[1] is reader and snap[2] is root
+            and now - snap[0] < _PROC_SNAPSHOT_TTL_SECONDS):
+        return {k: list(v) for k, v in snap[3].items()}
     try:
-        entries = list(PROC_ROOT.iterdir())
+        entries = list(root.iterdir())
     except OSError:
-        entries = []
+        return {}
+    dirs: dict[str, list[int]] = {}
     for p in entries:
         if not p.name.isdigit():
             continue
-        val = _pid_config_dir(int(p.name))
+        val = reader(int(p.name))
         if val is not None:
             dirs.setdefault(val.rstrip("/"), []).append(int(p.name))
-    _PROC_SNAPSHOT = (now, key, dirs)
-    return dirs
+    _PROC_SNAPSHOT = (now, reader, root, dirs)
+    return {k: list(v) for k, v in dirs.items()}
 
 
 def mount_pids(mount: Path, fresh: bool = False) -> list[int]:
@@ -2832,10 +2878,11 @@ def mount_pids(mount: Path, fresh: bool = False) -> list[int]:
     the env var and counts as "using the mount" — deliberately so: a slot is
     busy while ANY process holds it, not just the top-level claude.
     Read from the shared per-window scan (`_proc_config_dirs`); `fresh=True`
-    forces a new scan for a caller that must see the table as it is now.
+    reads the table as it is now — every path that acts on the answer or
+    guards a credential passes it (see `_proc_config_dirs`).
     """
     want = str(mount).rstrip("/")
-    return list(_proc_config_dirs(fresh).get(want, []))
+    return _proc_config_dirs(fresh).get(want, [])
 
 
 def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
@@ -3217,6 +3264,11 @@ def _force_poll_launch_candidate(account: str, state: dict, config: dict) -> boo
 
 
 def mount_in_use(mount: Path) -> bool:
+    """Whether any live process holds `mount` (see `mount_pids`). Readers
+    take the shared per-window scan; a path that ACTS on the answer takes
+    `_proc_config_dirs(fresh=True)` first and then asks, so this answer is
+    the table as it is now (PR #256, F-S-1). One argument, as the test
+    doubles that stand in for it expect."""
     return bool(mount_pids(mount))
 
 
@@ -3630,8 +3682,12 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
     if not d.exists():
         state.get("slots", {}).pop(name, None)
         return {"action": "dropped_stale_entry", "slot": name}
-    if not force and mount_in_use(d):
-        return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
+    # The table as it is NOW: this answer stands between a live session's
+    # mount and an rmtree (PR #256, F-O-1).
+    if not force:
+        _proc_config_dirs(fresh=True)
+        if mount_in_use(d):
+            return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
     if not force and _slot_reserved(entry):
         # An in-flight launch has claimed this slot but not exec'd claude yet
         # (no PID). rmtree'ing it now would pull the dir out from under the
@@ -9973,6 +10029,12 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
     hit = _OCCUPIED_SLOTS_CACHE.get(key)
     if hit and now - hit[0] < max_age_seconds:
         return hit[1]
+    # `max_age_seconds=0` has always meant ground-truth occupancy (the
+    # credential-safety callers): one scan of the table as it is NOW, then
+    # every slot answered from that scan (PR #256, F-S-1 / F-O-1). A READER
+    # that holds its own scan (`_proc_window_held`) is served that scan.
+    if max_age_seconds <= 0:
+        _proc_config_dirs(fresh=True)
     out: dict[str, list[str]] = {}
     for name, entry in sorted(state.get("slots", {}).items()):
         acct = entry.get("account")
@@ -13913,23 +13975,28 @@ def _divergence_risk_lanes(state: dict, config: dict) -> list[tuple[str, str, bo
     (`_live_mount_creds_invalid`) — the caller tiers severity on it (already
     clobbered ⇒ urgent, still valid ⇒ warning early nudge).
     """
-    if not independent_logins_enabled(config):
-        return []
-    if config.get("mode", "global") not in ("per_session", "hybrid"):
-        return []
-    out: list[tuple[str, str, bool]] = []
-    for account, slots in occupied_slot_accounts(state).items():
-        for slot in slots:
-            mount_path = mount_creds_path(slot_path(slot))
-            # Does THIS lane's live family already run on another mount of `account`?
-            if not _live_family_would_collide(account, mount_path, slot, state, config):
-                continue
-            try:
-                mount_creds = read_json(mount_path)
-            except (json.JSONDecodeError, OSError):
-                mount_creds = None
-            out.append((slot, account, _live_mount_creds_invalid(mount_creds)))
-    return out
+    # A READER: one scan of the table as it is now, held for the whole
+    # sweep — twelve collision checks, one scan (PR #256 second cut: the
+    # guards' own `max_age_seconds=0` rescanned per account and put the
+    # statusline back over a second).
+    with _proc_window_held():
+        if not independent_logins_enabled(config):
+            return []
+        if config.get("mode", "global") not in ("per_session", "hybrid"):
+            return []
+        out: list[tuple[str, str, bool]] = []
+        for account, slots in occupied_slot_accounts(state).items():
+            for slot in slots:
+                mount_path = mount_creds_path(slot_path(slot))
+                # Does THIS lane's live family already run on another mount of `account`?
+                if not _live_family_would_collide(account, mount_path, slot, state, config):
+                    continue
+                try:
+                    mount_creds = read_json(mount_path)
+                except (json.JSONDecodeError, OSError):
+                    mount_creds = None
+                out.append((slot, account, _live_mount_creds_invalid(mount_creds)))
+        return out
 
 
 def _lane_divergence_sos(slot: str, account: str, mount_expired: bool) -> SOSCondition:
@@ -25480,12 +25547,14 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
         return
 
     # → global
+    _proc_config_dirs(fresh=True)  # the table as it is now, for the whole teardown
     live = [d.name for d in list_slot_dirs() if mount_in_use(d)]
     if live and not force:
         click.echo(click.style(f"live slot session(s): {', '.join(live)} — exit them first, or --force "
                                f"(they keep running but become unmanaged)", fg="red"))
         sys.exit(1)
     for d in list_slot_dirs():
+        _proc_config_dirs(fresh=True)     # each slot re-read before gc_slot(force=True)
         if mount_in_use(d):
             click.echo(f"  {d.name}: still live — left in place (unmanaged)")
             continue
