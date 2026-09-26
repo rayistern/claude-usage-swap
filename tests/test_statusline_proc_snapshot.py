@@ -1,12 +1,17 @@
 """#255: `cus statusline` cost ~10 s of CPU per call because every
 `mount_pids` call re-read every process's environ; one statusline call made
-~165,000 environ reads. The fix scans the process table once per short
-window and serves every `mount_pids` call from that map.
+~157,000 environ reads. Third pass of PR #256 (the reviewers' structural
+fix): every `mount_pids` / `mount_in_use` call OUTSIDE a hold is a fresh
+scan of the table — an actor or a guard reads the table as it is now
+without asking — and the READERS (statusline, status, sessions, panes, sos,
+diagnose) wrap themselves in `_proc_window_held()`, which serves one scan
+to every question in the block.
 
 The oracle here is the OLD algorithm, inlined: one environ read per process
-PER mount. On a recorded process table (a directory of `<pid>/environ`
-files) the new code must return the same pids, in the same order, for every
-mount, and the collision verdicts built on it must not change.
+PER mount, the FIRST `CLAUDE_CONFIG_DIR=` winning. On a recorded process
+table (a directory of `<pid>/environ` files) the new code must return the
+same pids, in the same order, for every mount, and the collision verdicts
+built on it must not change.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ import cus  # noqa: E402
 def _record_proc(root: Path, table: dict[int, str | None], extra: dict[int, bytes] | None = None):
     """A recorded process table: `<pid>/environ` per entry, NUL-separated like
     the kernel's; None means a process with no CLAUDE_CONFIG_DIR; `extra`
-    holds unreadable-looking oddities (an empty environ, a non-pid entry)."""
+    holds oddities (an empty environ, an empty value, the variable twice)."""
     for pid, cfg in table.items():
         d = root / str(pid)
         d.mkdir()
@@ -41,7 +46,8 @@ def _record_proc(root: Path, table: dict[int, str | None], extra: dict[int, byte
 
 
 def _old_mount_pids(root: Path, mount: Path | str) -> list[int]:
-    """The pre-#255 algorithm, verbatim in shape: read every environ, per mount."""
+    """The pre-#255 algorithm (`d52d2e4`), verbatim in shape: read every
+    environ, per mount, the first `CLAUDE_CONFIG_DIR=` chunk winning."""
     want = (mount if isinstance(mount, str) else str(mount)).rstrip("/")
     pids = []
     for p in list(root.iterdir()):
@@ -88,172 +94,225 @@ def proc(tmp_path, monkeypatch):
     cus._reset_proc_snapshot()
 
 
+def _add(proc: Path, pid: int, cfg: str) -> Path:
+    d = proc / str(pid)
+    d.mkdir()
+    (d / "environ").write_bytes(b"CLAUDE_CONFIG_DIR=" + cfg.encode() + b"\0")
+    return d
+
+
+@pytest.fixture
+def reads(monkeypatch):
+    """Count environ reads: one per pid per scan."""
+    seen = []
+    real = cus._pid_config_dir
+    monkeypatch.setattr(cus, "_pid_config_dir", lambda pid: (seen.append(pid), real(pid))[1])
+    return seen
+
+
 def test_mount_pids_matches_the_old_algorithm_on_a_recorded_table(proc):
     mounts = [Path("/home/x/claude-accounts/slot-1"), Path("/home/x/claude-accounts/slot-1/"),
               Path("/home/x/claude-accounts/slot-2"), Path("/home/x/.claude"),
               Path("/home/x/claude-accounts/slot-9"), Path("/home/x/claude-accounts/slot-3"),
               Path("/nowhere")]
-    for m in mounts:
-        assert cus.mount_pids(m) == _old_mount_pids(proc, m), m
-        assert cus.mount_in_use(m) == bool(_old_mount_pids(proc, m)), m
-    # The empty-value environ (pid 106) maps the empty string, as the old code did
-    # for a caller asking about the empty mount name; pid 107 sits under its
-    # FIRST value, slot-2, in both.
-    assert cus._proc_config_dirs().get("") == [106] == _old_mount_pids(proc, "")
-    assert 107 in cus.mount_pids(Path("/home/x/claude-accounts/slot-2"))
-    assert 107 not in cus.mount_pids(Path("/home/x/claude-accounts/slot-9"))
+    for held in (False, True):
+        with (cus._proc_window_held() if held else _no_hold()):
+            for m in mounts:
+                assert cus.mount_pids(m) == _old_mount_pids(proc, m), (m, held)
+                assert cus.mount_in_use(m) == bool(_old_mount_pids(proc, m)), (m, held)
+            assert cus._proc_config_dirs().get("") == [106] == _old_mount_pids(proc, "")
+            assert 107 in cus.mount_pids(Path("/home/x/claude-accounts/slot-2"))
+            assert 107 not in cus.mount_pids(Path("/home/x/claude-accounts/slot-9"))
 
 
-def test_one_scan_serves_every_mount_within_the_window(proc, monkeypatch):
-    reads = []
-    real = cus._pid_config_dir
+class _no_hold:
+    def __enter__(self):
+        return None
 
-    def counting(pid):
-        reads.append(pid)
-        return real(pid)
+    def __exit__(self, *exc):
+        return False
 
-    monkeypatch.setattr(cus, "_pid_config_dir", counting)
-    cus._reset_proc_snapshot()
+
+def test_outside_a_hold_every_question_is_a_fresh_scan(proc, reads):
+    """The inverted default: an actor never has to ask for freshness."""
     n_pids = len([p for p in proc.iterdir() if p.name.isdigit()])
-    for _ in range(50):
-        for m in ("/home/x/claude-accounts/slot-1", "/home/x/claude-accounts/slot-2",
-                  "/home/x/.claude", "/nowhere"):
-            cus.mount_pids(Path(m))
-    assert len(reads) == n_pids, (len(reads), n_pids)   # 200 calls, one read per pid
+    slot1 = Path("/home/x/claude-accounts/slot-1")
+    cus.mount_in_use(slot1)
+    cus.mount_in_use(slot1)
+    cus.mount_pids(slot1)
+    assert len(reads) == 3 * n_pids
+    _add(proc, 777, str(slot1))
+    assert 777 in cus.mount_pids(slot1)        # the pid that appeared is seen at once
 
 
-def test_the_window_expires_and_fresh_forces_a_scan(proc, monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr(cus, "_proc_clock", lambda: clock[0])   # the hook, not time.monotonic
-    cus._reset_proc_snapshot()
-    slot3 = Path("/home/x/claude-accounts/slot-3")
-    assert cus.mount_pids(slot3) == []
-    # A process appears after the scan: unseen within the window …
-    d = proc / "777"
-    d.mkdir()
-    (d / "environ").write_bytes(b"CLAUDE_CONFIG_DIR=/home/x/claude-accounts/slot-3\0")
-    assert cus.mount_pids(slot3) == []
-    # … seen with `fresh=True`, and after the window on a plain call.
-    assert cus.mount_pids(slot3, fresh=True) == [777]
-    (d / "environ").unlink()
-    d.rmdir()
-    assert cus.mount_pids(slot3) == [777]
-    clock[0] += cus._PROC_SNAPSHOT_TTL_SECONDS + 0.01
-    assert cus.mount_pids(slot3) == []
+def test_inside_a_hold_one_scan_serves_every_question(proc, reads):
+    n_pids = len([p for p in proc.iterdir() if p.name.isdigit()])
+    with cus._proc_window_held():
+        for _ in range(50):
+            for m in ("/home/x/claude-accounts/slot-1", "/home/x/claude-accounts/slot-2",
+                      "/home/x/.claude", "/nowhere"):
+                cus.mount_pids(Path(m))
+        _add(proc, 777, "/home/x/claude-accounts/slot-1")
+        assert 777 not in cus.mount_pids(Path("/home/x/claude-accounts/slot-1"))   # held
+    assert len(reads) == n_pids                                                    # one scan
+    assert 777 in cus.mount_pids(Path("/home/x/claude-accounts/slot-1"))           # released
 
 
-def test_a_swapped_reader_gets_its_own_scan(proc, monkeypatch):
-    """Tests elsewhere monkeypatch `_pid_config_dir`; the snapshot must not
-    serve one test's table to the next within the window."""
-    cus._reset_proc_snapshot()
+def test_the_hold_is_released_on_exception_and_restores_an_outer_hold(proc, reads):
+    """F-O-9: released on any exception; nested, the outer hold comes back."""
+    with pytest.raises(RuntimeError):
+        with cus._proc_window_held():
+            raise RuntimeError("boom")
+    assert cus._PROC_HOLD is None
+    with cus._proc_window_held():
+        outer = cus._PROC_HOLD
+        with cus._proc_window_held():
+            assert cus._PROC_HOLD is outer      # nested: the outer scan is served, no new scan
+        assert cus._PROC_HOLD is outer
+        try:
+            with cus._proc_window_held():
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        assert cus._PROC_HOLD is outer
+    assert cus._PROC_HOLD is None
+
+
+def test_an_unreadable_table_reads_as_in_use_for_an_actor(proc, monkeypatch):
+    """F-O-8: a scan that cannot list the table must not answer "idle" to
+    anything that would act on it — `mount_in_use` answers True, `mount_pids`
+    []; nothing is cached, so the next call reads the table again. A hold
+    whose own scan failed answers the same way inside the block."""
+    real_iterdir = Path.iterdir
+    fail = [True]
+
+    def flaky(self):
+        if fail[0] and self == proc:
+            raise OSError(24, "too many open files")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", flaky)
+    shared = Path("/home/x/.claude")
+    idle = Path("/home/x/claude-accounts/slot-3")
+    assert cus.mount_in_use(idle) is True and cus.mount_pids(idle) == []
+    assert cus.mount_in_use(shared) is True
+    with cus._proc_window_held():
+        assert cus._PROC_HOLD is cus._PROC_UNKNOWN
+        assert cus.mount_in_use(idle) is True and cus.mount_pids(idle) == []
+    fail[0] = False
+    assert cus.mount_in_use(idle) is False and cus.mount_pids(shared) == [104]
+
+
+def test_a_swapped_reader_or_root_is_honoured(proc, monkeypatch):
+    """Other tests monkeypatch `_pid_config_dir`; with no cache there is
+    nothing to leak, and a swapped reader is used at once."""
     assert cus.mount_in_use(Path("/home/x/.claude")) is True
     monkeypatch.setattr(cus, "_pid_config_dir", lambda pid: None)
     assert cus.mount_in_use(Path("/home/x/.claude")) is False
-    # The snapshot holds the reader it was built with and compares by
-    # identity, so a new reader object — even one at a freed object's
-    # address — cannot inherit the table (F-O-4 / F-S-3).
     monkeypatch.setattr(cus, "_pid_config_dir", lambda pid: "/home/x/.claude")
     assert cus.mount_in_use(Path("/home/x/.claude")) is True
 
 
-def test_occupied_slot_accounts_verdicts_match_the_old_algorithm(proc, tmp_path, monkeypatch):
+@pytest.fixture
+def slots(proc, tmp_path, monkeypatch):
+    """Four slots under a tmp ACCOUNTS_DIR; the recorded pids point at them."""
     accounts = tmp_path / "accounts"
     monkeypatch.setattr(cus, "ACCOUNTS_DIR", accounts)
     monkeypatch.setattr(cus, "_OCCUPIED_SLOTS_CACHE", {})
-    slots = {}
+    table = {}
     for name, acct in (("slot-1", "a"), ("slot-2", "b"), ("slot-3", "a"), ("slot-9", "c")):
         (accounts / name).mkdir(parents=True)     # slot_path(name) is ACCOUNTS_DIR / name
-        slots[name] = {"account": acct}
-    state = {"slots": slots}
-    # `slot_path` under the patched ACCOUNTS_DIR; the recorded table names
-    # mounts under /home/x — point the recorded pids at the tmp slot dirs.
+        table[name] = {"account": acct}
     for pid, cfg in TABLE.items():
-        if cfg:
-            new = str(accounts / Path(cfg.rstrip("/")).name) if "slot-" in cfg else cfg
+        if cfg and "slot-" in cfg:
+            new = str(accounts / Path(cfg.rstrip("/")).name)
             (proc / str(pid) / "environ").write_bytes(b"CLAUDE_CONFIG_DIR=" + new.encode() + b"\0")
-    cus._reset_proc_snapshot()
-    got = cus.occupied_slot_accounts(state, max_age_seconds=0.0)
+    return {"slots": table}
+
+
+def test_occupied_slot_accounts_verdicts_match_the_old_algorithm(proc, slots):
+    got = cus.occupied_slot_accounts(slots, max_age_seconds=0.0)
     expect: dict[str, list[str]] = {}
-    for name, entry in sorted(slots.items()):
+    for name, entry in sorted(slots["slots"].items()):
         d = cus.slot_path(name)
         if d.exists() and _old_mount_pids(proc, d):
             expect.setdefault(entry["account"], []).append(name)
     assert got == expect == {"a": ["slot-1"], "b": ["slot-2"], "c": ["slot-9"]}
 
 
-def test_a_failed_scan_answers_empty_once_and_caches_nothing(proc, monkeypatch):
-    """F-S-2: a transient `iterdir` failure must not read as "every mount
-    idle" for a second — the call answers empty (the old `mount_pids`'s
-    answer), nothing is cached, and the next call reads the table."""
-    cus._reset_proc_snapshot()
-    shared = Path("/home/x/.claude")
-    real_iterdir = Path.iterdir
-    fail = [True]
+# ── the reviewers' seven acting / guard sites ─────────────────────────────
+#
+# Each asks `mount_in_use` with no hold active, so each sees a pid that
+# appears between two calls. Where the site's own fixture is small it is
+# driven directly; the sites whose fixtures are the launch pipeline
+# (`acquire_slot` via `_slot_busy`, `_launch_prepare --lane`,
+# `_sync_slot_json`, sync-config) rest on `_slot_busy` and on the property
+# above (no hold → every question is a fresh scan), since none of them
+# runs inside a reader's hold — the only holders are the six readers.
 
-    def flaky(self):
-        if fail[0] and self == proc:
-            fail[0] = False
-            raise OSError(24, "too many open files")
-        return real_iterdir(self)
-
-    monkeypatch.setattr(Path, "iterdir", flaky)
-    assert cus.mount_pids(shared) == []          # this call: empty, as before
-    assert cus._PROC_SNAPSHOT is None            # nothing cached from the failure
-    assert cus.mount_pids(shared) == [104]       # the next call reads the table
+def test_site_slot_busy_and_acquire_path_see_a_new_pid(proc, slots):
+    assert cus._slot_busy("slot-3", {}) is False
+    _add(proc, 777, str(cus.slot_path("slot-3")))
+    assert cus._slot_busy("slot-3", {}) is True
 
 
-def test_acting_paths_read_the_table_now(proc, monkeypatch, tmp_path):
-    """F-S-1 / F-O-1: an actor takes `_proc_config_dirs(fresh=True)` and then
-    asks; `occupied_slot_accounts(max_age_seconds=0)` and `gc_slot`'s
-    refusal see a process that appeared after the window's scan; a plain
-    reader does not until the window passes. `mount_in_use` stays
-    one-argument (the test doubles elsewhere are one-argument lambdas)."""
-    clock = [1000.0]
-    monkeypatch.setattr(cus, "_proc_clock", lambda: clock[0])
-    cus._reset_proc_snapshot()
-    accounts = tmp_path / "accounts"
-    monkeypatch.setattr(cus, "ACCOUNTS_DIR", accounts)
-    monkeypatch.setattr(cus, "_OCCUPIED_SLOTS_CACHE", {})
-    (accounts / "slot-3").mkdir(parents=True)
-    slot3 = cus.slot_path("slot-3")
-    state = {"slots": {"slot-3": {"account": "a"}}}
-    assert cus.mount_in_use(slot3) is False                       # scan taken now
-    d = proc / "777"
-    d.mkdir()
-    (d / "environ").write_bytes(b"CLAUDE_CONFIG_DIR=" + str(slot3).encode() + b"\0")
-    assert cus.mount_in_use(slot3) is False                       # a reader: the window
-    cus._proc_config_dirs(fresh=True)                             # an actor: now
-    assert cus.mount_in_use(slot3) is True
-    (d / "environ").unlink()
-    d.rmdir()
-    assert cus.mount_in_use(slot3) is True                        # the fresh scan is the window's now
-    assert cus.occupied_slot_accounts(state, max_age_seconds=0.0) == {}   # ground truth: gone
-    d.mkdir()
-    (d / "environ").write_bytes(b"CLAUDE_CONFIG_DIR=" + str(slot3).encode() + b"\0")
-    res = cus.gc_slot("slot-3", dict(state), force=False)
+def test_site_gc_slot_refuses_a_mount_that_just_became_live(proc, slots):
+    _add(proc, 777, str(cus.slot_path("slot-3")))
+    res = cus.gc_slot("slot-3", dict(slots), force=False)
     assert res["action"] == "refused_in_use" and res["pids"] == [777], res
 
 
-def test_a_reader_holds_one_scan_across_the_guards(proc, monkeypatch, tmp_path):
-    """The detector inside `diagnose` runs the credential-safety guards for
-    every lane; each asks for the table now. Inside `_proc_window_held`
-    they are all served the one scan the reader took — twelve checks, one
-    scan — and outside the hold an actor still gets a new scan."""
-    cus._reset_proc_snapshot()
-    reads = []
-    real_reader = cus._pid_config_dir
-    monkeypatch.setattr(cus, "_pid_config_dir", lambda pid: (reads.append(pid), real_reader(pid))[1])
-    accounts = tmp_path / "accounts"
-    monkeypatch.setattr(cus, "ACCOUNTS_DIR", accounts)
-    monkeypatch.setattr(cus, "_OCCUPIED_SLOTS_CACHE", {})
-    (accounts / "slot-3").mkdir(parents=True)
-    state = {"slots": {"slot-3": {"account": "a"}}}
+def test_site_release_dead_leases_skips_a_slot_that_just_became_live(proc, slots, monkeypatch):
+    """`_release_dead_leases(execute=True)` pops the lease of an idle slot
+    whose store is gone; a pid that appears between two calls keeps the
+    lease (a live mount's lease is its session's generation record)."""
+    monkeypatch.setattr(cus, "_locked_slots", lambda config: set())
+    monkeypatch.setattr(cus, "slot_leased_family", lambda state, name: ("a", "family-1"))
+    monkeypatch.setattr(cus, "login_family_creds_path", lambda acct, fam: Path("/nonexistent/creds"))
+    state = {"slots": {"slot-3": {"account": "a", "login_family": "family-1"}}}
+    assert cus._release_dead_leases(dict(state, slots={"slot-3": dict(state["slots"]["slot-3"])}),
+                                    {}, execute=False) == ["slot-3: a/family-1"]
+    _add(proc, 777, str(cus.slot_path("slot-3")))
+    st = {"slots": {"slot-3": {"account": "a", "login_family": "family-1"}}}
+    assert cus._release_dead_leases(st, {}, execute=True) == []
+    assert st["slots"]["slot-3"]["login_family"] == "family-1"
+
+
+def test_site_slot_mount_creds_dead_disables_the_probe_on_a_live_mount(proc, slots, monkeypatch):
+    """`_slot_mount_creds_dead`'s probe rotates a token; it must be off for a
+    mount that became live between two calls."""
+    calls = []
+    monkeypatch.setattr(cus, "_store_creds_dead",
+                        lambda path, label, config, *, allow_probe: (calls.append(allow_probe), False)[1])
+    d = cus.slot_path("slot-3")
+    cus._slot_mount_creds_dead("slot-3", d, "a", dict(slots), {}, allow_probe=True)
+    _add(proc, 777, str(d))
+    cus._slot_mount_creds_dead("slot-3", d, "a", dict(slots), {}, allow_probe=True)
+    assert calls == [True, False]
+
+
+def test_site_deep_prune_stores_asks_without_a_hold(proc, slots, monkeypatch):
+    """`_deep_prune_stores` (prune --execute) holds back a probe or retire when
+    the legacy slot is live; its `mount_in_use` runs with no hold active, so
+    it is a fresh scan. Pinned by the property that no hold is installed
+    while it runs (the function is not a reader) and by the fresh-scan
+    property above; its own fixture is the store layout, not driven here."""
+    holds = []
+    real = cus._proc_config_dirs
+    monkeypatch.setattr(cus, "_proc_config_dirs", lambda: (holds.append(cus._PROC_HOLD), real())[1])
+    cus.mount_in_use(cus.slot_path("slot-3"))
+    assert holds == [None]
+
+
+def test_readers_hold_and_the_detector_is_served_the_held_scan(proc, slots, reads, monkeypatch):
+    """`diagnose` is a reader: wrapped in the hold, its guards' questions
+    (each a `max_age_seconds=0` occupancy read) are served one scan."""
+    assert cus.diagnose.__wrapped__ is not None            # decorated with the hold
+    for fn in (cus.status, cus.sessions_cmd, cus.panes_cmd, cus.statusline_cmd, cus.sos_cmd):
+        assert getattr(fn, "callback", fn).__wrapped__ is not None, fn
+    n_pids = len([p for p in proc.iterdir() if p.name.isdigit()])
     with cus._proc_window_held():
-        n = len(reads)
         for _ in range(12):
-            cus.occupied_slot_accounts(state, max_age_seconds=0.0)
-            cus._proc_config_dirs(fresh=True)
-        assert len(reads) == n                                    # held: no rescan
-    cus.occupied_slot_accounts(state, max_age_seconds=0.0)
-    assert len(reads) > n                                         # outside: a scan
-    assert cus._PROC_HOLD is None
+            with cus._proc_window_held():       # a nested reader takes no scan
+                cus.occupied_slot_accounts(slots, max_age_seconds=0.0)
+    assert len(reads) == n_pids
