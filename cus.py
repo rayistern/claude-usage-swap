@@ -2761,15 +2761,19 @@ def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_byte
     return "saved"
 
 
+# Where the process table is read from. A module constant so a test can point
+# the scan at a recorded snapshot (a directory of `<pid>/environ` files).
+PROC_ROOT = Path("/proc")
+
+
 def _pid_config_dir(pid: int) -> str | None:
     """CLAUDE_CONFIG_DIR from one process's /proc environ, or None.
-
     Orchestration-independent ground truth for which mount a live process is
     using — readable only for same-user processes, which is exactly the set
     that could be holding our mounts.
     """
     try:
-        environ = Path(f"/proc/{pid}/environ").read_bytes()
+        environ = (PROC_ROOT / str(pid) / "environ").read_bytes()
     except (OSError, PermissionError):
         return None
     for chunk in environ.split(b"\0"):
@@ -2778,30 +2782,60 @@ def _pid_config_dir(pid: int) -> str | None:
     return None
 
 
-def mount_pids(mount: Path) -> list[int]:
-    """PIDs of live processes whose CLAUDE_CONFIG_DIR is this mount.
+# One scan of the process table per short window, shared by every
+# `mount_pids` call in the same process: (taken-at monotonic seconds, the
+# reader and root it was built with, CLAUDE_CONFIG_DIR → [pids] in /proc
+# order). Before this, each `mount_pids` call re-read EVERY process's
+# environ, and one `cus statusline` — which asks about every slot for every
+# account it diagnoses — read /proc/<pid>/environ about 160,000 times, ~9 s
+# of CPU per call, once a second across ~30 panes (#255). The window is short
+# enough that a launch or exit is seen on the next call; a caller that must
+# see the table as it is right now passes `fresh=True`.
+_PROC_SNAPSHOT: tuple | None = None
+_PROC_SNAPSHOT_TTL_SECONDS = 1.0
 
-    Ground truth from /proc/<pid>/environ — orchestration-independent, so it
-    catches sessions cus didn't launch and survives state.json drift.
 
-    Every descendant of a claude process (hook shells, subagent bash) inherits
-    the env var and counts as "using the mount" — deliberately so: a slot is
-    busy while ANY process holds it, not just the top-level claude.
+def _proc_config_dirs(fresh: bool = False) -> dict[str, list[int]]:
+    """CLAUDE_CONFIG_DIR (trailing slash dropped) → pids holding it, from one
+    read of every `<pid>/environ` under PROC_ROOT, in the table's order.
+    Reused for `_PROC_SNAPSHOT_TTL_SECONDS`; rebuilt when `fresh`, when the
+    window has passed, or when the reader or the root was swapped (a test
+    that monkeypatches `_pid_config_dir` or `PROC_ROOT` gets its own scan).
     """
-    want = str(mount).rstrip("/")
-    pids: list[int] = []
-    proc = Path("/proc")
+    global _PROC_SNAPSHOT
+    now = time.monotonic()
+    key = (id(_pid_config_dir), str(PROC_ROOT))
+    if (not fresh and _PROC_SNAPSHOT is not None
+            and _PROC_SNAPSHOT[1] == key
+            and now - _PROC_SNAPSHOT[0] < _PROC_SNAPSHOT_TTL_SECONDS):
+        return _PROC_SNAPSHOT[2]
+    dirs: dict[str, list[int]] = {}
     try:
-        entries = list(proc.iterdir())
+        entries = list(PROC_ROOT.iterdir())
     except OSError:
-        return []
+        entries = []
     for p in entries:
         if not p.name.isdigit():
             continue
         val = _pid_config_dir(int(p.name))
-        if val is not None and val.rstrip("/") == want:
-            pids.append(int(p.name))
-    return pids
+        if val is not None:
+            dirs.setdefault(val.rstrip("/"), []).append(int(p.name))
+    _PROC_SNAPSHOT = (now, key, dirs)
+    return dirs
+
+
+def mount_pids(mount: Path, fresh: bool = False) -> list[int]:
+    """PIDs of live processes whose CLAUDE_CONFIG_DIR is this mount.
+    Ground truth from /proc/<pid>/environ — orchestration-independent, so it
+    catches sessions cus didn't launch and survives state.json drift.
+    Every descendant of a claude process (hook shells, subagent bash) inherits
+    the env var and counts as "using the mount" — deliberately so: a slot is
+    busy while ANY process holds it, not just the top-level claude.
+    Read from the shared per-window scan (`_proc_config_dirs`); `fresh=True`
+    forces a new scan for a caller that must see the table as it is now.
+    """
+    want = str(mount).rstrip("/")
+    return list(_proc_config_dirs(fresh).get(want, []))
 
 
 def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
