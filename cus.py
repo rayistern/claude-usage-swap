@@ -68,6 +68,7 @@ import errno
 import fcntl
 import filecmp
 import hashlib
+import functools
 import json
 import os
 import re
@@ -2761,15 +2762,19 @@ def saveback_to_login_store(account: str, slot: str, live_creds: dict, live_byte
     return "saved"
 
 
+# Where the process table is read from. A module constant so a test can point
+# the scan at a recorded snapshot (a directory of `<pid>/environ` files).
+PROC_ROOT = Path("/proc")
+
+
 def _pid_config_dir(pid: int) -> str | None:
     """CLAUDE_CONFIG_DIR from one process's /proc environ, or None.
-
     Orchestration-independent ground truth for which mount a live process is
     using — readable only for same-user processes, which is exactly the set
     that could be holding our mounts.
     """
     try:
-        environ = Path(f"/proc/{pid}/environ").read_bytes()
+        environ = (PROC_ROOT / str(pid) / "environ").read_bytes()
     except (OSError, PermissionError):
         return None
     for chunk in environ.split(b"\0"):
@@ -2778,30 +2783,156 @@ def _pid_config_dir(pid: int) -> str | None:
     return None
 
 
-def mount_pids(mount: Path) -> list[int]:
-    """PIDs of live processes whose CLAUDE_CONFIG_DIR is this mount.
+# How `mount_pids` reads the process table (PR #256, third pass — the
+# reviewers' structural fix). OUTSIDE a hold every call is a fresh scan of
+# every `<pid>/environ`: an actor or a guard — gc before rmtree, the mode
+# teardown, the launch gate's probe, prune, lease release, slot allocation,
+# the GH #104 collision check — reads the table as it is now without anyone
+# having to remember to ask. INSIDE `_proc_window_held()` every call is
+# served the one scan the hold took at entry: the READERS — statusline,
+# status, sessions, panes, sos and `diagnose` — wrap themselves in it, and
+# that is what turned one `cus statusline` from ~160,000 environ reads
+# (~9 s of CPU, once a second across ~30 panes; #255) into one scan. A
+# reader inside a hold that runs a guard is served the held scan too, which
+# is the point of the hold and safe because the readers act on nothing;
+# no actor runs inside a reader's hold.
+#
+# A scan that cannot list the table (`iterdir` raising — EMFILE on a loaded
+# host) raises `ProcTableUnavailable`: outside a hold `mount_in_use` then
+# answers True — the mount is treated as IN USE, the credential-safe answer
+# for an actor (F-O-8) — and `mount_pids` answers []; a hold whose entry
+# scan fails holds `_PROC_UNKNOWN`, and every reader question inside it
+# answers "in use" the same way.
+_PROC_HOLD: dict | None = None
+_PROC_UNKNOWN: dict = {}   # identity marker: a hold whose scan failed
 
-    Ground truth from /proc/<pid>/environ — orchestration-independent, so it
-    catches sessions cus didn't launch and survives state.json drift.
 
-    Every descendant of a claude process (hook shells, subagent bash) inherits
-    the env var and counts as "using the mount" — deliberately so: a slot is
-    busy while ANY process holds it, not just the top-level claude.
-    """
-    want = str(mount).rstrip("/")
-    pids: list[int] = []
-    proc = Path("/proc")
+class ProcTableUnavailable(OSError):
+    """The process table could not be listed for this call."""
+
+
+@contextlib.contextmanager
+def _proc_window_held():
+    """Take one scan and serve every `mount_pids` question in the block from
+    it. Released on any exception; nested inside another hold it takes no
+    scan and leaves the outer hold as it is (F-O-9). The outermost entry
+    scan is taken BEFORE the hold is installed, so a failing scan never
+    leaves a hold half-installed."""
+    global _PROC_HOLD
+    prev = _PROC_HOLD
+    if prev is not None:
+        # A reader inside a reader's hold (statusline → diagnose → the
+        # detector) is served the outer scan: one scan per call, not one
+        # per nesting level.
+        yield
+        return
     try:
-        entries = list(proc.iterdir())
-    except OSError:
-        return []
+        held = _scan_proc()
+    except ProcTableUnavailable:
+        held = _PROC_UNKNOWN
+    _PROC_HOLD = held
+    try:
+        yield
+    finally:
+        _PROC_HOLD = None
+
+
+def _held_proc_window(fn):
+    """Decorator: run `fn` inside `_proc_window_held()` — for the READERS,
+    which ask about every mount and act on none (statusline, status,
+    sessions, panes, sos, diagnose)."""
+    @functools.wraps(fn)
+    def inner(*a, **k):
+        with _proc_window_held():
+            return fn(*a, **k)
+    return inner
+
+
+def _assert_no_hold(what: str) -> None:
+    """The discipline as a check (PR #256 pass 3, both seats): an ACTOR —
+    anything that acts on a `mount_in_use` answer — must not run inside a
+    reader's hold, where it would be served a scan taken earlier instead
+    of the table as it is now. Called at each acting entry point; a
+    reader that ever reaches one fails here instead of acting on a stale
+    answer."""
+    if _PROC_HOLD is not None:
+        raise RuntimeError(f"{what} called inside a process-table hold: an actor "
+                           f"must read the table as it is now (PR #256)")
+
+
+def _reset_proc_snapshot() -> None:
+    """Drop any hold (a test hook; the previous design's window is gone)."""
+    global _PROC_HOLD
+    _PROC_HOLD = None
+
+
+def _scan_proc() -> dict[str, list[int]]:
+    """One read of every `<pid>/environ` under PROC_ROOT → CLAUDE_CONFIG_DIR
+    (trailing slash dropped) → pids holding it, in the table's order."""
+    try:
+        entries = list(PROC_ROOT.iterdir())
+    except OSError as exc:
+        raise ProcTableUnavailable(str(exc)) from exc
+    dirs: dict[str, list[int]] = {}
     for p in entries:
         if not p.name.isdigit():
             continue
         val = _pid_config_dir(int(p.name))
-        if val is not None and val.rstrip("/") == want:
-            pids.append(int(p.name))
-    return pids
+        if val is not None:
+            dirs.setdefault(val.rstrip("/"), []).append(int(p.name))
+    return dirs
+
+
+def _proc_config_dirs() -> dict[str, list[int]]:
+    """The table for this question: the held scan inside a hold (a copy),
+    a fresh scan outside one. Raises `ProcTableUnavailable` when the table
+    cannot be read — inside a hold, when the hold's own scan failed."""
+    if _PROC_HOLD is not None:
+        if _PROC_HOLD is _PROC_UNKNOWN:
+            raise ProcTableUnavailable("the held scan failed")
+        return {k: list(v) for k, v in _PROC_HOLD.items()}
+    return _scan_proc()
+
+
+def mount_pids(mount: Path) -> list[int]:
+    """PIDs of live processes whose CLAUDE_CONFIG_DIR is this mount.
+    Ground truth from /proc/<pid>/environ — orchestration-independent, so it
+    catches sessions cus didn't launch and survives state.json drift.
+    Every descendant of a claude process (hook shells, subagent bash) inherits
+    the env var and counts as "using the mount" — deliberately so: a slot is
+    busy while ANY process holds it, not just the top-level claude.
+    A fresh scan outside a hold, the held scan inside one (`_proc_config_dirs`);
+    an unreadable table answers [] here — `mount_in_use` is what actors ask,
+    and it answers True then.
+    """
+    global _PROC_SCAN_FAILED
+    want = str(mount).rstrip("/")
+    try:
+        return _proc_config_dirs().get(want, [])
+    except ProcTableUnavailable:
+        _PROC_SCAN_FAILED = True
+        return []
+
+
+# Set by `mount_pids` when the table could not be read for its question and
+# it answered []; `mount_in_use` clears it before asking and reads it after,
+# so an unreadable table reads as "in use" (F-O-8) while a test double that
+# stands in for `mount_pids` (the suite has many, one-argument) is still
+# what `mount_in_use` answers from.
+_PROC_SCAN_FAILED = False
+# A module-level flag is fine while cus stays single-threaded (it is: one
+# process per command, and the daemon loop is sequential); a threaded cus
+# would need it per thread.
+
+
+def _mount_pids_or_unknown(mount: Path) -> list[int] | None:
+    """`mount_pids`, or None when the table could not be read — for the
+    displays, which must say "unknown" rather than "idle" then (PR #256
+    pass 3, Opus)."""
+    global _PROC_SCAN_FAILED
+    _PROC_SCAN_FAILED = False
+    pids = mount_pids(mount)
+    return None if (_PROC_SCAN_FAILED and not pids) else pids
 
 
 def pane_mount_name(pane: str, tmux_socket: str | None = None) -> str | None:
@@ -3183,7 +3314,16 @@ def _force_poll_launch_candidate(account: str, state: dict, config: dict) -> boo
 
 
 def mount_in_use(mount: Path) -> bool:
-    return bool(mount_pids(mount))
+    """Whether any live process holds `mount` (see `mount_pids`): the table
+    as it is now outside a hold, the held scan inside one. An unreadable
+    table answers True — in use — because every caller that ACTS on a
+    False (gc before rmtree, a token-rotating probe, a lease pop) must not
+    get one from a scan that did not happen (PR #256, F-O-8). One
+    argument, as the test doubles that stand in for it expect."""
+    global _PROC_SCAN_FAILED
+    _PROC_SCAN_FAILED = False
+    pids = mount_pids(mount)
+    return bool(pids) or _PROC_SCAN_FAILED
 
 
 def scaffold_mount_dir(mount: Path) -> list[str]:
@@ -3355,6 +3495,7 @@ def acquire_slot(state: dict, prefer_account: str | None = None,
     can't collide with them either (their dirs still exist on disk, so
     _allocate_slot_unlocked never reuses their indices).
     """
+    _assert_no_hold("acquire_slot")
     with _swap_lock():
         fresh = load_state()
         slots_state = fresh.setdefault("slots", {})
@@ -3596,6 +3737,9 @@ def gc_slot(name: str, state: dict, force: bool = False) -> dict:
     if not d.exists():
         state.get("slots", {}).pop(name, None)
         return {"action": "dropped_stale_entry", "slot": name}
+    # The table as it is NOW (a fresh scan outside any hold): this answer
+    # stands between a live session's mount and an rmtree (PR #256).
+    _assert_no_hold("gc_slot")
     if not force and mount_in_use(d):
         return {"action": "refused_in_use", "slot": name, "pids": mount_pids(d)}
     if not force and _slot_reserved(entry):
@@ -8059,6 +8203,7 @@ def execute_swap(target_name: str, trigger: str = "manual", slot: str | None = N
 def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None,
                          bump_ladder: bool = True, force_reinstall: bool = False) -> dict:
     """Inner swap sequence. Caller (execute_swap) holds the global swap lock."""
+    _assert_no_hold("_execute_swap_locked")
     # State is loaded AFTER the lock is acquired: a concurrent swap that just
     # finished has already persisted its state.json, so `current` below is
     # never a stale pre-lock snapshot (the #76 interleaving scenario).
@@ -9939,7 +10084,11 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
     hit = _OCCUPIED_SLOTS_CACHE.get(key)
     if hit and now - hit[0] < max_age_seconds:
         return hit[1]
+    # `max_age_seconds=0` means ground-truth occupancy (the credential-safety
+    # callers): outside a hold every `mount_in_use` below is a fresh scan of
+    # the table as it is NOW; a reader that holds a scan is served it.
     out: dict[str, list[str]] = {}
+    unreadable = False
     for name, entry in sorted(state.get("slots", {}).items()):
         acct = entry.get("account")
         if not acct:
@@ -9947,7 +10096,12 @@ def occupied_slot_accounts(state: dict, max_age_seconds: float = 5.0) -> dict[st
         d = slot_path(name)
         if d.exists() and mount_in_use(d):
             out.setdefault(acct, []).append(name)
-    _OCCUPIED_SLOTS_CACHE[key] = (now, out)
+            unreadable = unreadable or _PROC_SCAN_FAILED
+    # An unreadable table reads every slot as live (the safe answer for the
+    # guards that ask here); that answer is for THIS question only and is
+    # not kept for the cache's five seconds (PR #256 pass 3, Opus).
+    if not unreadable:
+        _OCCUPIED_SLOTS_CACHE[key] = (now, out)
     return out
 
 
@@ -12192,6 +12346,8 @@ def _slot_mount_creds_dead(slot_name: str, slot_dir: Path, account: str, state: 
     except OSError:
         before = None
     probe_ok = allow_probe and not mount_in_use(slot_dir)
+    if probe_ok:
+        _assert_no_hold("the token-rotating probe")   # a probe acts on that answer
     dead = _store_creds_dead(creds_path, f"mount:{slot_name}", config, allow_probe=probe_ok)
     if not dead and probe_ok:
         try:
@@ -12650,6 +12806,8 @@ def _release_dead_leases(state: dict, config: dict, *, execute: bool) -> list[st
     pops the ENTIRE slot entry on reap, lease included, so this stays a
     prune-only pass for slots that persist while their store died.
     Returns ["slot: account/family", ...] for each (would-be) release."""
+    if execute:
+        _assert_no_hold("_release_dead_leases(execute=True)")
     released: list[str] = []
     locked = _locked_slots(config)
     changed = False
@@ -12890,6 +13048,8 @@ def _deep_prune_stores(state: dict, config: dict, *, execute: bool, probe: bool,
 
     Returns rows: {"kind": "deep", "account", "store", "legacy": bool,
     "check", "detail", "leased": bool, "retired": str|None}."""
+    if execute or probe:
+        _assert_no_hold("_deep_prune_stores(execute/probe)")
     hk = config.get("housekeeping", {})
     check_mismatch = hk.get("deep_identity_mismatch", True)
     check_duplicate = hk.get("deep_duplicate_generation", True)
@@ -13879,23 +14039,28 @@ def _divergence_risk_lanes(state: dict, config: dict) -> list[tuple[str, str, bo
     (`_live_mount_creds_invalid`) — the caller tiers severity on it (already
     clobbered ⇒ urgent, still valid ⇒ warning early nudge).
     """
-    if not independent_logins_enabled(config):
-        return []
-    if config.get("mode", "global") not in ("per_session", "hybrid"):
-        return []
-    out: list[tuple[str, str, bool]] = []
-    for account, slots in occupied_slot_accounts(state).items():
-        for slot in slots:
-            mount_path = mount_creds_path(slot_path(slot))
-            # Does THIS lane's live family already run on another mount of `account`?
-            if not _live_family_would_collide(account, mount_path, slot, state, config):
-                continue
-            try:
-                mount_creds = read_json(mount_path)
-            except (json.JSONDecodeError, OSError):
-                mount_creds = None
-            out.append((slot, account, _live_mount_creds_invalid(mount_creds)))
-    return out
+    # A READER: one scan of the table as it is now, held for the whole
+    # sweep — twelve collision checks, one scan (PR #256 second cut: the
+    # guards' own `max_age_seconds=0` rescanned per account and put the
+    # statusline back over a second).
+    with _proc_window_held():
+        if not independent_logins_enabled(config):
+            return []
+        if config.get("mode", "global") not in ("per_session", "hybrid"):
+            return []
+        out: list[tuple[str, str, bool]] = []
+        for account, slots in occupied_slot_accounts(state).items():
+            for slot in slots:
+                mount_path = mount_creds_path(slot_path(slot))
+                # Does THIS lane's live family already run on another mount of `account`?
+                if not _live_family_would_collide(account, mount_path, slot, state, config):
+                    continue
+                try:
+                    mount_creds = read_json(mount_path)
+                except (json.JSONDecodeError, OSError):
+                    mount_creds = None
+                out.append((slot, account, _live_mount_creds_invalid(mount_creds)))
+        return out
 
 
 def _lane_divergence_sos(slot: str, account: str, mount_expired: bool) -> SOSCondition:
@@ -14849,6 +15014,7 @@ def _diagnose_premium_headroom(
     )
 
 
+@_held_proc_window
 def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSCondition]:
     """Scan state + system for conditions requiring human intervention.
 
@@ -18085,6 +18251,7 @@ def whoami_cmd() -> None:
 
 
 @cli.command()
+@_held_proc_window
 def status() -> None:
     """Show active account, per-account usage state, locks, and recent activity."""
     if not STATE_JSON.exists():
@@ -18202,8 +18369,9 @@ def status() -> None:
         for d in slot_dirs_on_disk:
             seen.add(d.name)
             entry = slots_state.get(d.name, {})
-            pids = mount_pids(d)
-            live_col = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+            pids = _mount_pids_or_unknown(d)
+            live_col = (click.style("unknown (process table unreadable)", fg="yellow") if pids is None
+                        else click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle")
             lock_col = click.style("  🔒locked", fg="yellow") if d.name in locked_slot_names else ""
             # GH #238 A: a lane that can wait (never rescued) / a MIXED lane (split it).
             if d.name in deprio_view["conflicts"]:
@@ -18652,6 +18820,7 @@ def detect_slot_orphans(slot_pids: dict[str, int], panes_on_slot: set) -> list[d
 
 @cli.command(name="sessions")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of a table.")
+@_held_proc_window
 def sessions_cmd(as_json: bool) -> None:
     """Per-pane -> slot -> account -> binding-limit view of live sessions.
 
@@ -20404,6 +20573,7 @@ def render_me(payload: dict, row: dict) -> str:
               help="Look-back window: 30m / 2h / 90s / bare minutes.")
 @click.option("--me", "me", is_flag=True,
               help="Just THIS pane's row plus its account's headroom — run it before fanning out subagents.")
+@_held_proc_window
 def panes_cmd(as_json: bool, window: str, me: bool) -> None:
     """Per-pane live view: subagents, models, token burn, wall, account headroom.
 
@@ -22357,6 +22527,7 @@ def _sl_pin_label(pin_account: str | None, active: str, color_on: bool) -> str:
 @cli.command(name="statusline")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output: reset times + poll age + other accounts.")
 @click.option("--compact", "-c", is_flag=True, help="Force compact output (overrides config).")
+@_held_proc_window
 def statusline_cmd(verbose: bool, compact: bool) -> None:
     """One-line summary for Claude Code statusline integration.
 
@@ -22785,6 +22956,7 @@ def decisions_cmd(tail: int, swaps_only: bool, as_json: bool) -> None:
 
 @cli.command(name="sos")
 @click.option("--quiet", is_flag=True, help="No output if all clear (for scripting).")
+@_held_proc_window
 def sos_cmd(quiet: bool) -> None:
     """Check for conditions requiring human action.
 
@@ -23687,6 +23859,7 @@ def slot_create_cmd() -> None:
 
 
 @slot.command("list")
+@_held_proc_window
 def slot_list_cmd() -> None:
     """List slot dirs: account held, live PIDs, state registration."""
     state = load_state()
@@ -23699,8 +23872,9 @@ def slot_list_cmd() -> None:
     for d in dirs:
         seen.add(d.name)
         entry = reg.get(d.name, {})
-        pids = mount_pids(d)
-        status = click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle"
+        pids = _mount_pids_or_unknown(d)
+        status = (click.style("unknown (process table unreadable)", fg="yellow") if pids is None
+                  else click.style(f"live ({len(pids)} pids)", fg="green") if pids else "idle")
         acct = entry.get("account") or "(empty)"
         unreg = "" if d.name in reg else click.style("  [not in state — doctor?]", fg="yellow")
         click.echo(f"  {d.name:<10} account={acct:<12} {status}{unreg}")
@@ -25446,13 +25620,13 @@ def mode_cmd(new_mode: str | None, force: bool) -> None:
         return
 
     # → global
-    live = [d.name for d in list_slot_dirs() if mount_in_use(d)]
+    live = [d.name for d in list_slot_dirs() if mount_in_use(d)]   # fresh scans: no hold here
     if live and not force:
         click.echo(click.style(f"live slot session(s): {', '.join(live)} — exit them first, or --force "
                                f"(they keep running but become unmanaged)", fg="red"))
         sys.exit(1)
     for d in list_slot_dirs():
-        if mount_in_use(d):
+        if mount_in_use(d):               # a fresh scan per slot, before gc_slot(force=True)
             click.echo(f"  {d.name}: still live — left in place (unmanaged)")
             continue
         # force=True so a lingering reservation (an in-flight launch that never
