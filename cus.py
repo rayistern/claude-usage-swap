@@ -1133,6 +1133,7 @@ def atomic_write_bytes(path: Path, content: bytes, mode: int = 0o644) -> None:
             f.write(content)
         os.chmod(tmp, mode)
         os.replace(tmp, path)
+        _forget_parsed(path)
     except Exception:
         try:
             os.unlink(tmp)
@@ -1249,9 +1250,71 @@ def restore_creds_backup(account_name: str, backup: Path, into_live: bool = Fals
                            mode=0o600)
 
 
-def read_json(path: Path) -> dict:
+def _load_json(path: Path) -> dict:
     with path.open() as f:
         return json.load(f)
+
+
+def _load_yaml(path: Path) -> dict:
+    with path.open() as f:
+        return yaml.safe_load(f) or {}
+
+
+# The parse memo (PR #258): a statusline read 935 JSON files for 269 distinct
+# paths — the same `.claude.json` and `.credentials.json` parsed up to
+# fifteen times each within one call, a third of its wall time. The memo
+# lives only inside a READER's hold (`_proc_window_held`, the same window
+# that serves one process-table scan): outside a hold `read_json` and
+# `read_yaml` are exactly what they were — one open and one parse per
+# call — so every actor keeps reading files as they are now.
+#
+# A memoised entry is keyed on the file's (inode, mtime_ns, size), checked
+# with one stat per read: a file rewritten in the hold — by `write_json`
+# (a new inode: `atomic_write_bytes` replaces, and forgets the path
+# besides) or by another process — is parsed again. What the key does not
+# see is an in-place rewrite of the same size within one clock tick of the
+# kernel's coarse file-time; a hold lasts about a second and reads only,
+# so the worst case is one call answering from that tick's content.
+#
+# The contract that keeps the output identical: inside a hold the SAME
+# object is handed to every reader of that file, so a reader must not
+# mutate what `read_json` / `read_yaml` return (tests/test_parse_memo.py
+# runs every held reader and checks each memoised object against a fresh
+# parse afterwards). Actors, which do mutate and write, never run inside a
+# hold (`_assert_no_hold`).
+_PARSE_MEMO: dict | None = None
+
+
+def _parsed(path: Path, loader) -> dict:
+    """`loader(path)`, memoised on the file's stat while a reader's hold is
+    open; a plain `loader(path)` otherwise. A loader that raises leaves
+    nothing behind, and a missing file raises from the stat as `open`
+    would (both FileNotFoundError)."""
+    memo = _PARSE_MEMO
+    if memo is None:
+        return loader(path)
+    st = os.stat(path)
+    sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+    key = (loader.__name__, os.fspath(path))
+    hit = memo.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    obj = loader(path)
+    memo[key] = (sig, obj)
+    return obj
+
+
+def _forget_parsed(path: Path) -> None:
+    """Drop a path from the parse memo after cus itself rewrote it (belt
+    and braces over the stat key, which the replace changes anyway)."""
+    if _PARSE_MEMO is not None:
+        p = os.fspath(path)
+        for key in [k for k in _PARSE_MEMO if k[1] == p]:
+            del _PARSE_MEMO[key]
+
+
+def read_json(path: Path) -> dict:
+    return _parsed(path, _load_json)
 
 
 def write_json(path: Path, data: Any, mode: int = 0o644) -> None:
@@ -1443,8 +1506,7 @@ def _preserve_mcp_oauth(dest: Path | dict | None, new_creds: dict, *,
 
 
 def read_yaml(path: Path) -> dict:
-    with path.open() as f:
-        return yaml.safe_load(f) or {}
+    return _parsed(path, _load_yaml)
 
 
 def write_yaml(path: Path, data: Any) -> None:
@@ -2814,10 +2876,12 @@ class ProcTableUnavailable(OSError):
 @contextlib.contextmanager
 def _proc_window_held():
     """Take one scan and serve every `mount_pids` question in the block from
-    it. Released on any exception; nested inside another hold it takes no
-    scan and leaves the outer hold as it is (F-O-9). The outermost entry
-    scan is taken BEFORE the hold is installed, so a failing scan never
-    leaves a hold half-installed."""
+    it, and open the parse memo that serves repeat `read_json` /
+    `read_yaml` reads (see `_PARSE_MEMO`). Released on any exception;
+    nested inside another hold it takes no scan and leaves the outer hold
+    (and its memo) as it is (F-O-9). The outermost entry scan is taken
+    BEFORE the hold is installed, so a failing scan never leaves a hold
+    half-installed."""
     global _PROC_HOLD
     prev = _PROC_HOLD
     if prev is not None:
@@ -2830,11 +2894,14 @@ def _proc_window_held():
         held = _scan_proc()
     except ProcTableUnavailable:
         held = _PROC_UNKNOWN
+    global _PARSE_MEMO
     _PROC_HOLD = held
+    _PARSE_MEMO = {}      # the parse memo lives exactly as long as the hold
     try:
         yield
     finally:
         _PROC_HOLD = None
+        _PARSE_MEMO = None
 
 
 def _held_proc_window(fn):
@@ -2861,9 +2928,11 @@ def _assert_no_hold(what: str) -> None:
 
 
 def _reset_proc_snapshot() -> None:
-    """Drop any hold (a test hook; the previous design's window is gone)."""
-    global _PROC_HOLD
+    """Drop any hold and its parse memo (a test hook; the previous design's
+    window is gone)."""
+    global _PROC_HOLD, _PARSE_MEMO
     _PROC_HOLD = None
+    _PARSE_MEMO = None
 
 
 def _scan_proc() -> dict[str, list[int]]:
@@ -3561,6 +3630,10 @@ def sync_mount_claude_json(mount: Path, canonical: dict) -> dict:
 
     Returns {"changed": bool, "keys_updated": [...]}.
     """
+    # PR #256 light check, F-L-3: every caller gates on `mount_in_use`, so
+    # this write acts on that answer — it must not run inside a reader's
+    # hold (the launch sync, `sync-config` and the slot heal all land here).
+    _assert_no_hold("sync_mount_claude_json")
     cj_path = mount_claude_json_path(mount)
     existing = read_json(cj_path) if cj_path.exists() else {}
     merged = dict(existing)

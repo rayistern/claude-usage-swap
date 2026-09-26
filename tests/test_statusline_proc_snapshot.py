@@ -345,6 +345,36 @@ def test_an_actor_inside_a_hold_raises(proc, slots):
     # Report-only prune and lease release are readers' business and may run held.
     with cus._proc_window_held():
         assert cus._release_dead_leases(dict(slots), {}, execute=False) == []
+        assert isinstance(cus._deep_prune_stores(dict(slots), {}, execute=False, probe=False), list)
+
+
+def test_the_token_probe_and_the_mount_json_writer_refuse_inside_a_hold():
+    """PR #256 light check, F-L-2 and F-L-3: the token-rotating probe branch
+    of `_slot_mount_creds_dead` (reached only for an IDLE mount whose creds
+    are suspect) raises inside a hold before any grant is attempted; the
+    mount `.claude.json` writer — behind the launch sync, `sync-config` and
+    `slot create` — raises too, so `sync-config` inside a hold fails instead
+    of writing."""
+    from test_prune_housekeeping import _expired
+    env = _Env({"alpha": _valid("at-a", "rt-a")}, active="alpha")
+    try:
+        slot = env.make_slot("alpha", live=False, mount_creds=_expired("rt-suspect"))
+        grants: list[str] = []
+        env.patch(cus, "_oauth_refresh_grant", lambda rt: grants.append(rt) or ("unknown", None))
+        state, config = cus.load_state(), cus.load_config()
+        with cus._proc_window_held():
+            with pytest.raises(RuntimeError, match="the token-rotating probe.*inside a process-table hold"):
+                cus._slot_mount_creds_dead(slot, cus.slot_path(slot), "alpha", state, config, allow_probe=True)
+            assert grants == []                       # raised before the grant
+            with pytest.raises(RuntimeError, match="sync_mount_claude_json.*inside a process-table hold"):
+                cus.sync_mount_claude_json(cus.slot_path(slot), {"theme": "dark"})
+            (cus.HOME / ".claude" / ".claude.json").write_text(json.dumps({"theme": "dark"}))
+            env.patch(cus, "CLAUDE_JSON", cus.HOME / ".claude" / ".claude.json")
+            r = CliRunner().invoke(cus.cli, ["sync-config"])
+            assert isinstance(r.exception, RuntimeError) and "sync_mount_claude_json" in str(r.exception), (r.output, r.exception)
+        assert json.loads((cus.slot_path(slot) / ".claude.json").read_text()).get("theme") is None
+    finally:
+        env.restore()
 
 
 def test_every_reader_runs_with_the_check_on():
@@ -368,27 +398,37 @@ def test_every_reader_runs_with_the_check_on():
 
 
 def test_site_deep_prune_stores_holds_back_when_the_legacy_slot_becomes_live():
-    """`_deep_prune_stores(execute=True)` retires a legacy store whose
-    namesake slot is idle; a pid that appears between two calls holds it
-    back (a live mount MAY hold that store's generation)."""
+    """`_deep_prune_stores(execute=True)` retires a legacy per-slot store
+    filed under the wrong identity (identity-mismatch) when its namesake
+    slot is idle; while a pid holds that slot the store is left alone (a
+    live mount MAY hold the store's generation). Driven end to end: first
+    with the pid present (no row, file kept), then without it (the retire
+    row, the creds file renamed `.dead-<date>`)."""
     env = _Env({"alpha": _valid("at-a", "rt-a")}, active="alpha",
                config={"mode": "per_session", "independent_logins": {"use_independent_logins": True}})
     try:
-        slot = env.make_slot("alpha", live=False, mount_creds=_valid("at-a", "rt-a"))
-        legacy = cus.login_family_dir("alpha", slot)
-        legacy.mkdir(parents=True, exist_ok=True)
-        cus.login_family_creds_path("alpha", slot).write_text(json.dumps(_valid("at-old", "rt-old")))
+        slot = env.make_slot("alpha", live=True, mount_creds=_valid("at-a", "rt-a"))
+        store = cus.login_store_dir("alpha", slot)            # the LEGACY per-(account, slot) store
+        store.mkdir(parents=True, exist_ok=True)
+        creds = cus.login_store_creds_path("alpha", slot)
+        creds.write_text(json.dumps(_valid("at-old", "rt-old")))
+        cus.login_store_cj_path("alpha", slot).write_text(json.dumps(
+            {"oauthAccount": {"accountUuid": "uuid-beta", "emailAddress": "beta@x"}}))   # filed under alpha, is beta
         env.patch(cus, "_oauth_refresh_grant", lambda rt: ("unknown", None))
+        assert slot in cus._legacy_login_store_ids("alpha")
+
         cus._OCCUPIED_SLOTS_CACHE.clear()
-        first = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=False, probe=False)
-                 if r["store"] == slot]
-        env.live_slots.add(slot)            # the pid appears between the two calls
+        held = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=True, probe=False)
+                if r["store"] == slot]
+        assert held == [] and creds.exists(), held          # the pid holds it back
+
+        env.live_slots.discard(slot)                         # the pid is gone
         cus._OCCUPIED_SLOTS_CACHE.clear()
-        second = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=False, probe=False)
-                  if r["store"] == slot]
-        assert first != second or not first, (first, second)
-        assert all("live" in r.get("problem", "").lower() or r.get("leased") for r in second) or not second, second
-        assert cus.login_family_creds_path("alpha", slot).exists()
+        rows = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=True, probe=False)
+                if r["store"] == slot]
+        assert len(rows) == 1 and rows[0]["check"] == "identity-mismatch" and rows[0]["legacy"], rows
+        assert rows[0]["retired"], rows
+        assert not creds.exists() and list(store.glob(".credentials.json.dead-*")), list(store.iterdir())
     finally:
         env.restore()
 
