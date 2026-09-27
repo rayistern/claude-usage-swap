@@ -1,4 +1,4 @@
-"""The parse memo that lives inside a reader's hold (PR #258).
+"""The parse memo that lives inside a reader's hold (PR #259).
 
 A statusline read 935 JSON files for 269 distinct paths — the same
 `.claude.json` and `.credentials.json` parsed up to fifteen times within

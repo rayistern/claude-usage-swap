@@ -1260,7 +1260,7 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-# The parse memo (PR #258): a statusline read 935 JSON files for 269 distinct
+# The parse memo (PR #259): a statusline read 935 JSON files for 269 distinct
 # paths — the same `.claude.json` and `.credentials.json` parsed up to
 # fifteen times each within one call, a third of its wall time. The memo
 # lives only inside a READER's hold (`_proc_window_held`, the same window
