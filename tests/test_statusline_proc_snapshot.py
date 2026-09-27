@@ -401,9 +401,10 @@ def test_site_deep_prune_stores_holds_back_when_the_legacy_slot_becomes_live():
     """`_deep_prune_stores(execute=True)` retires a legacy per-slot store
     filed under the wrong identity (identity-mismatch) when its namesake
     slot is idle; while a pid holds that slot the store is left alone (a
-    live mount MAY hold the store's generation). Driven end to end: first
-    with the pid present (no row, file kept), then without it (the retire
-    row, the creds file renamed `.dead-<date>`)."""
+    live mount MAY hold the store's generation) and the mismatch is only
+    REPORTED (PR #259 review: both seats flagged the silence; #260). Driven
+    end to end: first with the pid present (a report-only row, file kept),
+    then without it (the retire row, the creds file renamed `.dead-<date>`)."""
     env = _Env({"alpha": _valid("at-a", "rt-a")}, active="alpha",
                config={"mode": "per_session", "independent_logins": {"use_independent_logins": True}})
     try:
@@ -420,7 +421,9 @@ def test_site_deep_prune_stores_holds_back_when_the_legacy_slot_becomes_live():
         cus._OCCUPIED_SLOTS_CACHE.clear()
         held = [r for r in cus._deep_prune_stores(cus.load_state(), cus.load_config(), execute=True, probe=False)
                 if r["store"] == slot]
-        assert held == [] and creds.exists(), held          # the pid holds it back
+        assert len(held) == 1 and held[0]["check"] == "identity-mismatch" and held[0]["leased"], held
+        assert held[0]["retired"] is None and not held[0]["would_retire"], held   # reported, not retired
+        assert "LIVE-HELD" in held[0]["detail"] and creds.exists()                # the pid holds it back
 
         env.live_slots.discard(slot)                         # the pid is gone
         cus._OCCUPIED_SLOTS_CACHE.clear()

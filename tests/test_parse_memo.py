@@ -12,6 +12,7 @@ end to end and check that contract against a fresh parse.
 """
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import os
@@ -190,26 +191,52 @@ def test_an_empty_yaml_file_reads_as_an_empty_dict_both_ways(tmp_path, loads, mo
 _READERS = (["status"], ["sessions"], ["panes"], ["statusline"], ["sos"], ["slot", "list"])
 
 
-def _fresh(loader_name: str, path: str):
-    return (cus._load_json if loader_name == "_load_json" else cus._load_yaml)(Path(path))
+def _rich_env() -> _Env:
+    """Four accounts, two pooled families each, six slots (leased, unleased,
+    live and idle): on this tree a statusline makes ~109 reads for ~25
+    parses, so the memo is exercised, not brushed (PR #259 pass 1, F-O-2 —
+    the first fixture gave it three hits)."""
+    names = ("alpha", "beta", "gamma", "delta")
+    env = _Env({n: _valid(f"at-{n}", f"rt-{n}") for n in names}, active="alpha",
+               config={"mode": "per_session",
+                       "independent_logins": {"use_independent_logins": True, "pool_size": 2}})
+    for n in names:
+        for i in (1, 2):
+            env.plant_family(n, f"family-{i}", _valid(f"at-{n}-f{i}", f"rt-{n}-f{i}"))
+    env.make_slot("alpha", live=True, mount_creds=_valid("at-alpha-f1", "rt-alpha-f1"), family_id="family-1")
+    env.make_slot("alpha", live=True, mount_creds=_valid("at-alpha-f2", "rt-alpha-f2"), family_id="family-2")
+    env.make_slot("beta", live=True, mount_creds=_valid("at-beta-f1", "rt-beta-f1"), family_id="family-1")
+    env.make_slot("beta", live=False, mount_creds=_valid("at-beta", "rt-beta"))
+    env.make_slot("gamma", live=True, mount_creds=_valid("at-gamma", "rt-gamma"))
+    env.make_slot("delta", live=False, mount_creds=_valid("at-delta-f1", "rt-delta-f1"), family_id="family-1")
+    return env
 
 
-def test_no_held_reader_mutates_a_memoised_parse(loads, monkeypatch):
+def test_no_held_reader_mutates_a_memoised_parse(loads):
     """Every held reader, end to end, under one outer hold so the memo
-    persists across them; afterwards each memoised object still equals a
-    fresh parse of its file (a reader that mutated what `read_json` handed it
-    would show here), and the memo served at least one repeat."""
-    env = _Env({"alpha": _valid("at-a", "rt-a"), "beta": _valid("at-b", "rt-b")}, active="alpha")
+    persists across them. Each object is snapshotted (deep copy) the first
+    time the memo hands it out, and at hold exit every object still equals
+    its snapshot — including objects evicted since (a cus write forgets the
+    path; an outside rewrite re-parses), which a comparison against the
+    disk would never see (PR #259 pass 1, F-O-1). And the memo served
+    repeats: parses are well under reads."""
+    env = _rich_env()
     reads = {"n": 0}
-    real_read = cus.read_json
+    handed: dict[int, tuple[object, object]] = {}      # id(obj) -> (obj, snapshot at hand-out)
+    real_read, real_parsed = cus.read_json, cus._parsed
 
     def counting_read(path):
         reads["n"] += 1
         return real_read(path)
+
+    def snapshotting_parsed(path, loader):
+        obj = real_parsed(path, loader)
+        if cus._PARSE_MEMO is not None and id(obj) not in handed:
+            handed[id(obj)] = (obj, copy.deepcopy(obj))
+        return obj
     try:
-        env.make_slot("alpha", live=True, mount_creds=_valid("at-a", "rt-a"))
-        env.make_slot("beta", live=False, mount_creds=_valid("at-b", "rt-b"))
         env.patch(cus, "read_json", counting_read)
+        env.patch(cus, "_parsed", snapshotting_parsed)
         cus._reset_proc_snapshot()
         runner = CliRunner()
         with cus._proc_window_held():
@@ -218,26 +245,18 @@ def test_no_held_reader_mutates_a_memoised_parse(loads, monkeypatch):
                 assert r.exit_code in (0, 1) and "process-table hold" not in (r.output + str(r.exception)), \
                     (argv, r.output[-400:], r.exception)
             cus.diagnose(cus.load_state(), cus.load_config())
-            memo = dict(cus._PARSE_MEMO)
-        mutated = []
-        for (loader_name, path), (sig, obj) in memo.items():
-            st = os.stat(path)
-            if (st.st_ino, st.st_mtime_ns, st.st_size) != sig:
-                continue    # rewritten after it was memoised: not comparable
-            if _fresh(loader_name, path) != obj:
-                mutated.append(path)
-        assert mutated == [], mutated
-        assert reads["n"] > loads["json"] > 0, (reads, loads)
+            mutated = [obj for obj, snap in handed.values() if obj != snap]
+        assert mutated == [], mutated[:3]
+        assert len(handed) >= 25, len(handed)
+        assert reads["n"] >= 3 * loads["json"] > 0, (reads, loads)
     finally:
         env.restore()
         cus._reset_proc_snapshot()
 
 
-def test_statusline_output_is_identical_with_and_without_the_memo():
-    env = _Env({"alpha": _valid("at-a", "rt-a"), "beta": _valid("at-b", "rt-b")}, active="alpha")
+def test_statusline_output_is_identical_with_and_without_the_memo(loads):
+    env = _rich_env()
     try:
-        env.make_slot("alpha", live=True, mount_creds=_valid("at-a", "rt-a"))
-        env.make_slot("beta", live=False, mount_creds=_valid("at-b", "rt-b"))
         lines: list[str] = []
         env.patch(cus.click, "echo", lambda msg="", *a, **k: lines.append(str(msg)))
         cus._reset_proc_snapshot()
@@ -250,10 +269,16 @@ def test_statusline_output_is_identical_with_and_without_the_memo():
             return re.sub(r"\d{1,2}:\d{2}", "HH:MM", "\n".join(lines) + r.output)
 
         with_memo = run()
+        memo_parses = loads["json"]
         env.patch(cus, "_parsed", lambda path, loader: loader(path))    # the memo bypassed
         without = run()
         assert with_memo == without
         assert with_memo.strip()
+        # The run WITH the memo parsed well under half of what the run
+        # without did (37 against 109 on this fixture) — the comparison
+        # covered a memo that was doing its job.
+        without_parses = loads["json"] - memo_parses
+        assert without_parses >= 2 * memo_parses, (memo_parses, without_parses)
     finally:
         env.restore()
         cus._reset_proc_snapshot()

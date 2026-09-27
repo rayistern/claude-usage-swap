@@ -1262,19 +1262,23 @@ def _load_yaml(path: Path) -> dict:
 
 # The parse memo (PR #259): a statusline read 935 JSON files for 269 distinct
 # paths — the same `.claude.json` and `.credentials.json` parsed up to
-# fifteen times each within one call, a third of its wall time. The memo
-# lives only inside a READER's hold (`_proc_window_held`, the same window
+# fifteen times each within one call, a third of its in-process time. The
+# memo lives only inside a READER's hold (`_proc_window_held`, the same window
 # that serves one process-table scan): outside a hold `read_json` and
 # `read_yaml` are exactly what they were — one open and one parse per
 # call — so every actor keeps reading files as they are now.
 #
-# A memoised entry is keyed on the file's (inode, mtime_ns, size), checked
-# with one stat per read: a file rewritten in the hold — by `write_json`
-# (a new inode: `atomic_write_bytes` replaces, and forgets the path
-# besides) or by another process — is parsed again. What the key does not
-# see is an in-place rewrite of the same size within one clock tick of the
-# kernel's coarse file-time; a hold lasts about a second and reads only,
-# so the worst case is one call answering from that tick's content.
+# A memoised entry is keyed on the file's (inode, mtime_ns, ctime_ns,
+# size), checked with one stat per read: a file rewritten in the hold — by
+# `write_json` (a new inode: `atomic_write_bytes` replaces, and forgets the
+# path besides) or by another process — is parsed again. ctime is in the
+# key because a copy that restores the mtime (`shutil.copy2`, `cp -p`,
+# `rsync -t`; cus's own snapshot copies use copy2) leaves inode, mtime and
+# size alone, and ctime is the one field userland cannot set back. What
+# the key does not see is an in-place rewrite of the same size within one
+# tick of the kernel's coarse file-time; a hold lasts about a second and
+# reads only, so the worst case is one call answering from that tick's
+# content.
 #
 # The contract that keeps the output identical: inside a hold the SAME
 # object is handed to every reader of that file, so a reader must not
@@ -1294,7 +1298,7 @@ def _parsed(path: Path, loader) -> dict:
     if memo is None:
         return loader(path)
     st = os.stat(path)
-    sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+    sig = (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
     key = (loader.__name__, os.fspath(path))
     hit = memo.get(key)
     if hit is not None and hit[0] == sig:
@@ -3630,9 +3634,11 @@ def sync_mount_claude_json(mount: Path, canonical: dict) -> dict:
 
     Returns {"changed": bool, "keys_updated": [...]}.
     """
-    # PR #256 light check, F-L-3: every caller gates on `mount_in_use`, so
-    # this write acts on that answer — it must not run inside a reader's
-    # hold (the launch sync, `sync-config` and the slot heal all land here).
+    # PR #256 light check, F-L-3: this is the one writer of a mount's
+    # .claude.json, and the launch sync and `sync-config` reach it on a
+    # `mount_in_use` answer (`slot create` reaches it for a slot it just
+    # made) — so it must not run inside a reader's hold, where that answer
+    # would come from a scan taken earlier.
     _assert_no_hold("sync_mount_claude_json")
     cj_path = mount_claude_json_path(mount)
     existing = read_json(cj_path) if cj_path.exists() else {}
@@ -13204,6 +13210,18 @@ def _deep_prune_stores(state: dict, config: dict, *, execute: bool, probe: bool,
                     # The legacy store's namesake slot is live: the mount MAY
                     # hold this store's generation (the pre-pool arrangement),
                     # so probing OR retiring under it is a clobber risk.
+                    if mismatch:
+                        # Report-only, mirroring rung 1 for a leased pooled
+                        # store: the lane is running the wrong account's
+                        # creds and the operator must hear it, even though
+                        # nothing may be retired under a live mount (PR #259
+                        # review, both seats; issue #260).
+                        out.append(_row(acct, store_id, legacy, "identity-mismatch",
+                                        f"LIVE-HELD by {store_id} but stores {ident} while account "
+                                        f"reference ({ref_src}) is {ref} — the lane is running the "
+                                        f"WRONG account's creds; evacuate it (`cus slot move "
+                                        f"{store_id} <clean-acct>`), then re-run deep prune to "
+                                        f"retire this store", leased=True))
                     continue
             try:
                 creds = read_json(path)
