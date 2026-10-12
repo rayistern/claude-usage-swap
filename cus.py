@@ -6674,11 +6674,15 @@ def _shared_mount_account_unhealthy(account: str | None, state: dict, config: di
     03-subscription-ended incident).
 
     Two failure modes, both seen that day:
-      (a) subscription-ended / operator-disabled — `_disabled_accounts(config,
-          state)` (org-disabled bare sessions answer "organization has disabled
-          Claude subscription access for Claude Code"). UNCONDITIONAL: an
-          org-disabled account 429s every request even with a live token, so it
-          is a real block no matter what the live mount looks like.
+      (a) subscription-ended / operator-disabled — `_disabled_accounts(config)`
+          ∪ `_subscription_dead_accounts(state, config)` (org-disabled bare
+          sessions answer "organization has disabled Claude subscription access
+          for Claude Code"). UNCONDITIONAL: an org-disabled account 429s every
+          request even with a live token, so it is a real block no matter what
+          the live mount looks like. A PAST-DUE account (GH #261) is deliberately
+          NOT in this set: it never triggers a migration (see the code comment).
+          Consequence, filed as its own design question: while the shared
+          mount's own account is past due, a NEW bare launch on it still walls.
       (b) dead canonical refresh — the cached `snapshot_refresh_dead` flag (set by
           the un-stale sweep's refresh-grant probe; bare sessions answer "Login
           expired"). We read the CACHED flag here, not a fresh probe: this runs
@@ -13622,7 +13626,9 @@ def _evacuation_candidates(state: dict, config: dict) -> list[dict]:
     answers org-disabled), so unlike ordinary rebalancing there is no
     cache-warmth argument for leaving it (the "don't churn workable lanes"
     rule doesn't apply — nothing on it is workable). Targets are accounts
-    that are not operator-disabled, not subscription-dead, and whose
+    that are not operator-disabled, not subscription-dead, not subscription
+    past-due (GH #261 — never a destination, though never a source here
+    either), and whose
     `_slot_move_plan` previews a clean install ("snapshot" or "claim" — the
     same clobber guards the real move enforces), preferred emptiest-first by
     max(5h%, 7d%). Locked slots are skipped entirely (a lock is user intent;
@@ -17778,7 +17784,10 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         if fresh.token_expired:
             click.echo(f"    ABORT: {target} is now TOKEN_EXPIRED — letting next cycle pick a different target")
             return
-        if fresh.raw.get("error") == "rate_limited":
+        if fresh.raw.get("rate_limited"):
+            # Same dead `== "rate_limited"` comparison as force-poll had (PR #262
+            # review); the 429 shape is "HTTP 429 (rate_limited): …" with a
+            # structured `rate_limited` key. Message-only branch here.
             click.echo(f"    note: {target} polling endpoint is rate-limited; proceeding with cached numbers (account itself may still be usable)")
         else:
             fh = f"{fresh.five_hour.utilization:.1f}%" if fresh.five_hour else "—"
@@ -21119,6 +21128,21 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
         if target not in state["accounts"]:
             click.echo(f"Unknown account '{target}'. Known: {sorted(state['accounts'].keys())}")
             sys.exit(1)
+        # Explicit-target refusals (PR #262 review, HIGH): `cus auto-swap <acct>`
+        # moved the shared mount onto a flagged account after only an
+        # existence check — `cus switch` refused the same state. An ENDED or
+        # past-due account is never a placement target; this command has no
+        # --force (the override is `cus switch <acct> --force`).
+        if target in _subscription_dead_accounts(state, config):
+            click.echo(click.style(
+                f"refusing: '{target}' has NO active Claude subscription (auto-detected — every "
+                f"session on it opens logged-out). Renew in the Anthropic console then "
+                f"`cus force-poll {target}` to clear, or pick another target. "
+                f"`cus switch {target} --force` overrides.", fg="red"))
+            sys.exit(1)
+        if target in _subscription_past_due_accounts(state, config):
+            click.echo(click.style(_past_due_refusal_text(target), fg="red"))
+            sys.exit(1)
         chosen_name = target
         reason = f"explicit (auto-swap {target})"
     else:
@@ -21455,11 +21479,35 @@ def force_poll(account: str) -> None:
         update_state_with_usage(state, {account: u})
         save_state(state)
         sys.exit(2)
-    if u.raw.get("error") == "rate_limited":
-        click.echo("  STILL 429 — Anthropic throttle still engaged. Backoff cycle restarted.")
-        update_backoff(acct, success=False, config=config)
+    if u.raw.get("rate_limited"):
+        # PR #262 review (both seats, HIGH): this branch used to test
+        # `u.raw.get("error") == "rate_limited"`, but the poll layer writes
+        # `"HTTP 429 (rate_limited): <body>"` plus a separate structured
+        # `rate_limited: True` key, so the branch was dead and a 429 fell to
+        # the generic ERROR exit below — which returns BEFORE
+        # update_state_with_usage. force-poll therefore never recorded a 429:
+        # no backoff, no rate_limited flag, and neither subscription flag (the
+        # ENDED flag since #191, the past-due flag of #261) — while the SOS
+        # and refusal texts tell the operator to run exactly this command.
+        # Now keyed on the structured field; state is updated through the
+        # same path `cus poll` uses (Branch 1.5 / 1.6 / 2 there set the flags,
+        # clear them on a probe "active", and apply the backoff — so no
+        # separate update_backoff call here, which double-counted the 429).
         update_state_with_usage(state, {account: u})
         save_state(state)
+        acct = state["accounts"][account]
+        if acct.get("subscription_disabled"):
+            click.echo(f"  SUB_ENDED — the 429 is an ended subscription (profile probe); "
+                       f"'{account}' stays out of rotation. See `cus sos`.")
+        elif acct.get("subscription_past_due"):
+            click.echo(f"  PAST_DUE — the 429 is a past-due subscription (profile probe): "
+                       f"no launches or rotation onto '{account}' until the account owner "
+                       f"updates the payment method (claude.ai Settings, Billing). "
+                       f"Lanes already on it stay. See `cus sos`.")
+        else:
+            click.echo("  STILL 429 — Anthropic throttle still engaged. Backoff cycle restarted."
+                       + ("  (subscription flag cleared — profile probe reads ACTIVE again)"
+                          if u.raw.get("subscription_probe") == "active" else ""))
         sys.exit(3)
     if u.raw.get("error"):
         click.echo(f"  ERROR: {u.raw['error']}")
