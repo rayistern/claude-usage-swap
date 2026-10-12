@@ -61,7 +61,7 @@ Same as add, but use `cus relogin <name>`. Walk through the same interactive flo
 ### "Daemon isn't swapping when I think it should"
 Walk the troubleshooting tree from `docs/TROUBLESHOOTING.md`:
 1. Is the active account actually over its `next_swap_at_pct`? Show `cus status`.
-2. Are valid swap targets available? Check for `TOKEN_EXPIRED`, `RATE_LIMITED`, `POLL_ERROR` flags on other accounts.
+2. Are valid swap targets available? Check for `TOKEN_EXPIRED`, `RATE_LIMITED`, `POLL_ERROR`, `SUB_ENDED` or `PAST_DUE` flags on other accounts (`SUB_ENDED` = the subscription ended; `PAST_DUE` = its renewal payment failed — both block launches and rotation onto the account, and `cus sos` names the fix).
 3. Run `cus daemon --once --no-execute` to see the decision logic + reasoning.
 4. Check the daemon log: `journalctl --user -u cus.service -n 50` (systemd) or `tail -50 ~/claude-accounts/daemon.log`.
 
