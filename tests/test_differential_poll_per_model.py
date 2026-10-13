@@ -34,7 +34,42 @@ def _iso(dt):
     return dt.isoformat().replace("+00:00", "Z")
 
 
-NOW = datetime.now(timezone.utc)
+def _now():
+    """The reference instant a test builds its timestamps against.
+
+    Read through ``cus.datetime`` -- the very clock object ``_account_poll_due``
+    reads -- and taken INSIDE each test, not at import. Issue #265: a
+    module-level reference captured at import drifted from the clock the
+    code reads by however long collection and the earlier files took, and
+    the flat-config boundary test (10 s of slack) failed on any full-suite
+    run slower than that, then passed alone. A reference taken at the start
+    of the test is microseconds from the code's read, and reading it through
+    ``cus.datetime`` means a frozen clock (see the #265 pin below) moves the
+    reference and the code together.
+    """
+    return cus.datetime.now(timezone.utc)
+
+
+class _FrozenDatetime(datetime):
+    """``datetime`` whose ``now()`` is pinned. Installed on ``cus`` by
+    ``_freeze_cus_clock``; everything else (fromisoformat, arithmetic,
+    isinstance checks) behaves like the real class."""
+
+    _at = None
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:  # cus never asks for a naive now; keep the signature honest
+            return cls._at.replace(tzinfo=None)
+        return cls._at.astimezone(tz)
+
+
+def _freeze_cus_clock(monkeypatch, at):
+    """Pin the clock ``cus`` reads to ``at`` for the rest of this test."""
+    frozen = type("_FrozenDatetimeAt", (_FrozenDatetime,), {"_at": at})
+    monkeypatch.setattr(cus, "datetime", frozen)
+    return frozen
+
 
 # Differential config: fast active, slow inactive, flat fallback distinct
 # from both so tests can tell WHICH interval was picked.
@@ -94,7 +129,8 @@ def test_due_fails_open_on_unparseable_timestamp():
 
 
 def test_active_due_after_fast_interval_elapsed():
-    st = _state(active="a", accounts={"a": {"last_poll_ts": _iso(NOW - timedelta(seconds=50))}})
+    now = _now()
+    st = _state(active="a", accounts={"a": {"last_poll_ts": _iso(now - timedelta(seconds=50))}})
     due, why = cus._account_poll_due(st, DIFF_CFG, "a")
     assert due and "active" in why
 
@@ -102,16 +138,18 @@ def test_active_due_after_fast_interval_elapsed():
 def test_inactive_not_due_before_slow_interval():
     # 50s ago: past the ACTIVE interval but far short of the 600s inactive
     # one — the differential schedule must skip the idle account.
+    now = _now()
     st = _state(active="a", accounts={
-        "a": {"last_poll_ts": _iso(NOW - timedelta(seconds=50))},
-        "b": {"last_poll_ts": _iso(NOW - timedelta(seconds=50))},
+        "a": {"last_poll_ts": _iso(now - timedelta(seconds=50))},
+        "b": {"last_poll_ts": _iso(now - timedelta(seconds=50))},
     })
     due, why = cus._account_poll_due(st, DIFF_CFG, "b")
     assert not due and "inactive" in why
 
 
 def test_inactive_due_after_slow_interval():
-    st = _state(active="a", accounts={"b": {"last_poll_ts": _iso(NOW - timedelta(seconds=700))}})
+    now = _now()
+    st = _state(active="a", accounts={"b": {"last_poll_ts": _iso(now - timedelta(seconds=700))}})
     due, _ = cus._account_poll_due(st, DIFF_CFG, "b")
     assert due
 
@@ -119,12 +157,28 @@ def test_inactive_due_after_slow_interval():
 def test_flat_config_polls_everyone_each_interval():
     # Backward-compat: with no polling.* keys, both roles are due after the
     # flat interval and not before.
+    now = _now()
     st = _state(active="a", accounts={
-        "a": {"last_poll_ts": _iso(NOW - timedelta(seconds=310))},
-        "b": {"last_poll_ts": _iso(NOW - timedelta(seconds=290))},
+        "a": {"last_poll_ts": _iso(now - timedelta(seconds=310))},
+        "b": {"last_poll_ts": _iso(now - timedelta(seconds=290))},
     })
     assert cus._account_poll_due(st, FLAT_CFG, "a")[0]
     assert not cus._account_poll_due(st, FLAT_CFG, "b")[0]
+
+
+def test_flat_config_boundary_holds_when_execution_lags_collection(monkeypatch):
+    """Pin for issue #265. The flaky run was: module imported at collection,
+    then 10+ s of other files, then this boundary test -- whose 290 s-ago
+    stamp had aged past the 300 s flat interval by the time the code read the
+    clock. The reproduction was an 11 s pause after collection; this is that
+    pause made deterministic: the clock ``cus`` reads is frozen 11 s past the
+    wall clock, so any reference captured at import (or at any earlier wall
+    time) is already stale by more than the 10 s margin. With the reference
+    taken per test through ``cus.datetime``, the boundary test passes under
+    the frozen clock; with an import-time reference it fails -- "b" reads as
+    due -- which is exactly the failure the issue reports."""
+    _freeze_cus_clock(monkeypatch, datetime.now(timezone.utc) + timedelta(seconds=11))
+    test_flat_config_polls_everyone_each_interval()
 
 
 def test_5h_rollover_forces_due_despite_slow_cadence():
@@ -134,9 +188,10 @@ def test_5h_rollover_forces_due_despite_slow_cadence():
     since last poll' as due regardless of cadence class — otherwise the early
     wake finds the account not-due, skips it, and the daemon flies on the
     countdown-inferred 0% for up to a whole inactive interval."""
-    reset_at = NOW - timedelta(minutes=10)
+    now = _now()
+    reset_at = now - timedelta(minutes=10)
     st = _state(active="a", accounts={"a": {}, "b": {
-        "last_poll_ts": _iso(NOW - timedelta(minutes=20)),  # predates the reset
+        "last_poll_ts": _iso(now - timedelta(minutes=20)),  # predates the reset
         "five_hour_resets_at": _iso(reset_at),
         "current_5h_pct": 96.0,
     }})
@@ -147,9 +202,10 @@ def test_5h_rollover_forces_due_despite_slow_cadence():
 def test_no_rollover_override_once_post_reset_state_observed():
     # The last poll happened AFTER the reset, so the stored 0% is real —
     # the slow inactive cadence applies again (no poll-storm after resets).
-    reset_at = NOW - timedelta(minutes=10)
+    now = _now()
+    reset_at = now - timedelta(minutes=10)
     st = _state(active="a", accounts={"a": {}, "b": {
-        "last_poll_ts": _iso(NOW - timedelta(minutes=5)),  # after the reset
+        "last_poll_ts": _iso(now - timedelta(minutes=5)),  # after the reset
         "five_hour_resets_at": _iso(reset_at),
         "current_5h_pct": 0.0,
     }})
@@ -354,17 +410,19 @@ def test_idle_account_on_slow_cadence_is_not_stale():
     # 25 min since last poll: >4x the flat 300s interval, but well within 4x
     # the 600s inactive cadence. Pre-fix this fired a false "daemon down"
     # warning on every idle account; post-fix it must stay quiet.
+    now = _now()
     st = _state(active="a", accounts={
-        "a": {"last_poll_ts": _iso(NOW - timedelta(seconds=60)), "next_swap_at_pct": 50},
-        "b": {"last_poll_ts": _iso(NOW - timedelta(minutes=25)), "next_swap_at_pct": 50},
+        "a": {"last_poll_ts": _iso(now - timedelta(seconds=60)), "next_swap_at_pct": 50},
+        "b": {"last_poll_ts": _iso(now - timedelta(minutes=25)), "next_swap_at_pct": 50},
     })
     assert _stale_conditions(st, DIFF_CFG) == []
 
 
 def test_active_account_stale_past_4x_fast_cadence():
     # Active on a 45s cadence, silent for 10 min (>4x45s) → real staleness.
+    now = _now()
     st = _state(active="a", accounts={
-        "a": {"last_poll_ts": _iso(NOW - timedelta(minutes=10)), "next_swap_at_pct": 50},
+        "a": {"last_poll_ts": _iso(now - timedelta(minutes=10)), "next_swap_at_pct": 50},
     })
     conds = _stale_conditions(st, DIFF_CFG)
     assert len(conds) == 1 and "a" in conds[0].summary
@@ -372,8 +430,9 @@ def test_active_account_stale_past_4x_fast_cadence():
 
 def test_flat_config_staleness_unchanged():
     # Backward-compat: no polling.* keys → 4x flat interval, as before.
+    now = _now()
     st = _state(active="a", accounts={
-        "a": {"last_poll_ts": _iso(NOW - timedelta(minutes=25)), "next_swap_at_pct": 50},
+        "a": {"last_poll_ts": _iso(now - timedelta(minutes=25)), "next_swap_at_pct": 50},
     })
     conds = _stale_conditions(st, FLAT_CFG)
     assert len(conds) == 1
