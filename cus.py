@@ -617,6 +617,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # back "active". Nothing is deleted from config — exclusion is a state
     # flag, reversible by renewal or `subscription_guard.enabled: false`.
     #
+    # GH #261 (2026-10-11): the same probe also recognises a PAST-DUE plan
+    # (`subscription_status: "past_due"`, plan still attached — a failed
+    # renewal payment). That flags `subscription_past_due`: a PLACEMENT block
+    # only (no launch, no rotation onto the account; `cus status` shows
+    # PAST_DUE and `cus sos` names the fix — the account owner updates the
+    # payment method under claude.ai Settings, Billing). Lanes already on the
+    # account are never moved for it; a successful poll clears it. Same
+    # master gate and cooldown as the ended detection, no extra knob.
+    #
     # DEFAULT ON — justified three ways: (1) a subscription-disabled account is
     # DEFINITIVELY unusable for Claude Code (every lane placed on it opens
     # logged-out — there is no workload that succeeds); (2) detection requires
@@ -1684,6 +1693,13 @@ class AccountUsage:
         (profile 200s, refresh grants pass), usage is what's gone — so this is
         NOT token_expired, and unlike rate_limited it never self-resolves by
         waiting. See DEFAULT_CONFIG["subscription_guard"].
+      - subscription_past_due (GH #261, 2026-10-11, also alongside
+        rate_limited): the same probe read `subscription_status: "past_due"`
+        with the plan STILL attached — the renewal payment failed. Launches on
+        the account wall with the same org-disabled text as an ended
+        subscription, but the plan recovers once the payment goes through, so
+        this is its own flag: it blocks launch and rotation ONTO the account
+        and never moves a lane already on it.
     """
     five_hour: UsageWindow | None = None
     seven_day: UsageWindow | None = None
@@ -1701,6 +1717,11 @@ class AccountUsage:
     # probe positively identified the 429 as a subscription-ended org. Default
     # False keeps every existing constructor call-site backward-compatible.
     subscription_disabled: bool = False
+    # GH #261 (2026-10-11): the probe read `subscription_status: "past_due"`
+    # with the plan still attached. Mutually exclusive with the flag above in
+    # effect (the poll layer sets at most one per cycle); both default False
+    # so every existing constructor call-site is unchanged.
+    subscription_past_due: bool = False
     polled_at: str = field(default_factory=now_iso)
     raw: dict = field(default_factory=dict)
     # GH #237 plan tier, two sources, persisted raw (interpretation lives in
@@ -5404,22 +5425,42 @@ def _subscription_guard_enabled(config: dict) -> bool:
     return bool(config.get("subscription_guard", {}).get("enabled", True))
 
 
-def _profile_says_subscription_disabled(profile: dict) -> tuple[bool, dict]:
-    """Pure classifier over an OAuth-profile response body: is this account's
-    Claude subscription ENDED (org-disabled for Claude Code)?
+# The subscription verdicts a profile body can classify to (GH #191 + #261).
+# "active" is the fail-open default: anything the two signatures below do not
+# match exactly — missing keys, schema drift, an org type never seen — reads
+# as active, so a profile-API reshape can only ever leave an account in its
+# pre-guard state (plain rate_limited), never wrongly exclude a healthy one.
+SUBSCRIPTION_VERDICTS = ("disabled", "past_due", "active")
 
-    Returns (disabled, detail) where detail carries the fields worth logging.
 
-    DELIBERATELY CONSERVATIVE — requires the full observed dead signature
-    (rayi5, captured live 2026-08-07):
-      account.has_claude_max == false AND account.has_claude_pro == false
-      AND organization.organization_type == "claude_free"
-    and additionally treats any org with a seat_tier (team/enterprise seat —
-    not a personal subscription org) as ACTIVE. Anything ambiguous — missing
-    keys, schema drift, an org type we've never seen — classifies as NOT
-    disabled, so a profile-API reshape can only ever fail OPEN (account stays
-    plain rate_limited, the pre-guard behavior), never wrongly exclude a
-    healthy account.
+def _classify_subscription_profile(profile: dict) -> tuple[str, dict]:
+    """Pure classifier over an OAuth-profile response body.
+
+    Returns (verdict, detail): verdict is one of SUBSCRIPTION_VERDICTS and
+    detail carries the fields worth logging.
+
+      "disabled" — the subscription ENDED (org-disabled for Claude Code).
+        DELIBERATELY CONSERVATIVE — requires the full observed dead signature
+        (captured live 2026-08-07):
+          account.has_claude_max == false AND account.has_claude_pro == false
+          AND organization.organization_type == "claude_free"
+      "past_due" — GH #261 (2026-10-11): `organization.subscription_status ==
+        "past_due"`. Captured live: a Max account whose renewal payment failed
+        kept `has_claude_max: true` and `organization_type: "claude_max"`, so
+        the ENDED signature above did not match and the account read as
+        active — yet every Claude Code launch on it walled at the first prompt
+        with the org-disabled text, and its usage poll 429'd exactly like an
+        ended subscription. The status string alone is the signal; the plan
+        flags are NOT consulted for this verdict, because they are exactly
+        what stayed attached. A past-due plan recovers once the payment goes
+        through, so callers treat it as a placement block, not a death (see
+        _subscription_past_due_accounts).
+      "active" — everything else, including a team/enterprise seat
+        (`organization.seat_tier` set — not a personal subscription org, out
+        of scope for both signatures) and every ambiguous shape.
+
+    Order matters: the ENDED signature is checked first so a canceled org that
+    somehow also carries a past_due status is still classified as ended.
     """
     acct = profile.get("account") if isinstance(profile.get("account"), dict) else {}
     org = profile.get("organization") if isinstance(profile.get("organization"), dict) else {}
@@ -5433,25 +5474,38 @@ def _profile_says_subscription_disabled(profile: dict) -> tuple[bool, dict]:
         # 2026-09-20: `organization.rate_limit_tier` = "default_claude_max_20x").
         "rate_limit_tier": org.get("rate_limit_tier"),
     }
-    if acct.get("has_claude_max") or acct.get("has_claude_pro"):
-        return False, detail          # an active personal subscription exists
     if org.get("seat_tier"):
-        return False, detail          # team/enterprise seat — out of scope
-    # Explicit-negative requirement: the keys must be PRESENT and say "free".
-    # `.get(...) is False` (not `not .get(...)`) so an absent key ≠ a negative.
+        return "active", detail       # team/enterprise seat — out of scope
+    # ENDED. Explicit-negative requirement: the keys must be PRESENT and say
+    # "free". `.get(...) is False` (not `not .get(...)`) so an absent key ≠ a
+    # negative. A plan flag set means the ENDED signature cannot match.
     if (acct.get("has_claude_max") is False
             and acct.get("has_claude_pro") is False
             and org.get("organization_type") == "claude_free"):
-        return True, detail
-    return False, detail
+        return "disabled", detail
+    # PAST DUE (GH #261). Exact string match only — "past_due" is the value
+    # observed live 2026-10-11; any other spelling fails open to "active".
+    if org.get("subscription_status") == "past_due":
+        return "past_due", detail
+    return "active", detail
+
+
+def _profile_says_subscription_disabled(profile: dict) -> tuple[bool, dict]:
+    """Back-compat view of _classify_subscription_profile for the ENDED
+    verdict only: (disabled, detail). A past-due subscription is NOT ended
+    (the plan is still attached and can recover), so it answers False here —
+    callers that must also block on past_due read the verdict directly."""
+    verdict, detail = _classify_subscription_profile(profile)
+    return verdict == "disabled", detail
 
 
 def _probe_subscription_profile(token: str) -> tuple[str, dict]:
     """One GET of the OAuth profile endpoint with `token`.
 
-    Returns (verdict, detail): "disabled" | "active" | "unknown". "unknown" on
-    ANY failure (network, non-200, parse, oversized) — the caller must treat
-    unknown as fail-open (keep the plain rate_limited classification).
+    Returns (verdict, detail): "disabled" | "past_due" | "active" | "unknown".
+    "unknown" on ANY failure (network, non-200, parse, oversized) — the caller
+    must treat unknown as fail-open (keep the plain rate_limited
+    classification). "past_due" (GH #261) is a placement block, not a death.
     """
     req = urllib.request.Request(
         PROFILE_API_URL,
@@ -5474,16 +5528,15 @@ def _probe_subscription_profile(token: str) -> tuple[str, dict]:
         return "unknown", {}
     if not isinstance(data, dict):
         return "unknown", {}
-    disabled, detail = _profile_says_subscription_disabled(data)
-    return ("disabled" if disabled else "active"), detail
+    return _classify_subscription_profile(data)
 
 
 def _subscription_probe_verdict(account_name: str, token: str,
                                 config: dict | None = None) -> tuple[str, dict]:
     """Config-gated + cooldown-cached wrapper around the profile probe.
 
-    Returns (verdict, detail) with verdict "disabled" | "active" | "unknown"
-    | "off" (guard disabled). All verdicts (including "unknown") are cached
+    Returns (verdict, detail) with verdict "disabled" | "past_due" | "active"
+    | "unknown" | "off" (guard disabled). All verdicts (including "unknown") are cached
     for subscription_guard.probe_cooldown_minutes so a 429 storm across many
     polls costs at most one profile GET per account per window.
     """
@@ -5916,8 +5969,11 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             # same generic 429 as a real rate limit (verified live: rayi5).
             # One cooldown-bounded profile probe tells them apart; a positive
             # "disabled" upgrade makes update_state_with_usage auto-exclude
-            # the account from rotation. "active"/"unknown"/"off" leave this
-            # branch byte-identical to its pre-guard behavior (fail open).
+            # the account from rotation, and a "past_due" one (GH #261,
+            # 2026-10-11: same 429, plan still attached, payment failed)
+            # blocks launch/rotation ONTO it without moving anything off it.
+            # "active"/"unknown"/"off" leave this branch byte-identical to its
+            # pre-guard behavior (fail open).
             verdict, sub_detail = _subscription_probe_verdict(account_name, token)
             u.raw["subscription_probe"] = verdict
             # GH #237: the probe just read the profile — hand its detail to the
@@ -5925,13 +5981,16 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             # persist both records with no plan_tiers.enabled check).
             try:
                 _attach_plan_tier(u, account_name, None,
-                                  detail=sub_detail if verdict in ("active", "disabled") else None)
+                                  detail=sub_detail if verdict in SUBSCRIPTION_VERDICTS else None)
             except AssertionError:
                 raise           # a test canary is never swallowed (PR #242 focused pass, HIGH 2)
             except Exception as _e:  # noqa: BLE001 — never lose the usage reading over metadata
                 click.echo(f"warning: plan-tier read failed for '{account_name}' ({type(_e).__name__}); usage reading kept")
             if verdict == "disabled":
                 u.subscription_disabled = True
+                u.raw["subscription"] = sub_detail
+            elif verdict == "past_due":
+                u.subscription_past_due = True
                 u.raw["subscription"] = sub_detail
             elif verdict == "active":
                 u.raw["subscription"] = sub_detail
@@ -6510,6 +6569,50 @@ def _subscription_dead_accounts(state: dict, config: dict) -> set:
             if isinstance(a, dict) and a.get("subscription_disabled")}
 
 
+def _subscription_past_due_accounts(state: dict, config: dict) -> set:
+    """Accounts auto-flagged `subscription_past_due` in state.json by the poll
+    layer's profile probe (GH #261, 2026-10-11: a Max renewal payment failed;
+    the plan stayed attached, the usage poll 429'd, and every launch walled
+    with the org-disabled text while cus still read the account as active).
+
+    Semantics differ from _subscription_dead_accounts on purpose: a past-due
+    account is a PLACEMENT block only — never a launch target, never a swap /
+    move / switch target — but lanes already on it are LEFT ALONE: no Trigger-0
+    style eviction, no shared-mount auto-migration, no evacuation sweep, no
+    family-store retirement. The plan recovers the moment the payment goes
+    through (a successful poll clears the flag), so a forced move would churn
+    a lane off an account that may be fine again within the hour, and the
+    issue asked for exactly that restraint. Same read-time guard gating as the
+    ended flag: guard off ⇒ empty set, stale flags ignored."""
+    if not _subscription_guard_enabled(config):
+        return set()
+    return {n for n, a in (state.get("accounts") or {}).items()
+            if isinstance(a, dict) and a.get("subscription_past_due")}
+
+
+def _past_due_refusal_text(account: str) -> str:
+    """The one refusal message for an explicit placement onto a past-due
+    account (GH #261) — `cus launch`, `cus slot move`, `cus switch` all say
+    the same thing so the operator reads one fix, not three wordings."""
+    return (f"refusing: '{account}' has a Claude subscription that is PAST DUE (auto-detected: "
+            f"its renewal payment failed) — a new session on it walls at the first prompt with "
+            f"\"organization has disabled Claude subscription access\". Fix: the account owner "
+            f"updates the payment method under claude.ai Settings, Billing; then `cus force-poll "
+            f"{account}` clears the flag. Or pick another account. Lanes already on it are not "
+            f"moved. --force overrides.")
+
+
+def _subscription_blocked_accounts(state: dict, config: dict) -> set:
+    """Accounts no NEW placement may land on because of their subscription:
+    ended (#191) OR past due (#261). This is the set every explicit-target
+    refusal (`cus launch <acct>`, `cus slot move`, `cus switch`) and the SOS
+    target-availability math read; the pickers get the same set through
+    _disabled_accounts(config, state). Movers (evacuation, shared-mount
+    migration, prune retirement) deliberately read _subscription_dead_accounts
+    instead — see _subscription_past_due_accounts for why."""
+    return _subscription_dead_accounts(state, config) | _subscription_past_due_accounts(state, config)
+
+
 def _disabled_accounts(config: dict, state: dict | None = None) -> set:
     """Accounts the operator marked `disabled: true` in config.yaml's accounts
     list — a hard out-of-rotation switch (2026-07-03, user request: `default`
@@ -6536,11 +6639,19 @@ def _disabled_accounts(config: dict, state: dict | None = None) -> set:
     exclusion, triggered automatically instead of by hand; the per-call
     opt-in keeps state-less callers (and the SOS alarm-suppression block,
     which must NOT silence a subscription-dead account's own alarm)
-    byte-identical to their old behavior."""
+    byte-identical to their old behavior.
+
+    GH #261 (2026-10-11): with `state` supplied the set ALSO includes
+    accounts flagged `subscription_past_due`. Every caller that passes `state`
+    is asking "where may a NEW placement land?" (pick_launch_account and its
+    raw fallbacks, pick_swap_target, the evacuation/warm-spare/capacity target
+    lists) and a past-due account is never that. The one mover that used to
+    read this with `state` — _shared_mount_account_unhealthy — now reads the
+    ended set explicitly, because past due must not trigger a move."""
     out = {a.get("name") for a in config.get("accounts", [])
            if isinstance(a, dict) and a.get("disabled")}
     if state is not None:
-        out |= _subscription_dead_accounts(state, config)
+        out |= _subscription_blocked_accounts(state, config)
     return out
 
 
@@ -6563,11 +6674,15 @@ def _shared_mount_account_unhealthy(account: str | None, state: dict, config: di
     03-subscription-ended incident).
 
     Two failure modes, both seen that day:
-      (a) subscription-ended / operator-disabled — `_disabled_accounts(config,
-          state)` (org-disabled bare sessions answer "organization has disabled
-          Claude subscription access for Claude Code"). UNCONDITIONAL: an
-          org-disabled account 429s every request even with a live token, so it
-          is a real block no matter what the live mount looks like.
+      (a) subscription-ended / operator-disabled — `_disabled_accounts(config)`
+          ∪ `_subscription_dead_accounts(state, config)` (org-disabled bare
+          sessions answer "organization has disabled Claude subscription access
+          for Claude Code"). UNCONDITIONAL: an org-disabled account 429s every
+          request even with a live token, so it is a real block no matter what
+          the live mount looks like. A PAST-DUE account (GH #261) is deliberately
+          NOT in this set: it never triggers a migration (see the code comment).
+          Consequence, filed as its own design question: while the shared
+          mount's own account is past due, a NEW bare launch on it still walls.
       (b) dead canonical refresh — the cached `snapshot_refresh_dead` flag (set by
           the un-stale sweep's refresh-grant probe; bare sessions answer "Login
           expired"). We read the CACHED flag here, not a fresh probe: this runs
@@ -6601,7 +6716,12 @@ def _shared_mount_account_unhealthy(account: str | None, state: dict, config: di
     if not account:
         return None
     # Mode (a): org-disabled / subscription-ended — unconditional real block.
-    if account in _disabled_accounts(config, state):
+    # Operator-disabled + ENDED only, read explicitly rather than through
+    # _disabled_accounts(config, state): that set also carries PAST-DUE
+    # accounts (GH #261), and a past-due plan must NOT trigger a migration —
+    # the payment can clear within the hour, and the issue asked that lanes
+    # already on the account be left alone.
+    if account in (_disabled_accounts(config) | _subscription_dead_accounts(state, config)):
         return f"{account} is subscription-ended / disabled"
     # Mode (b): dead canonical refresh, BUT only when the live mount can't heal.
     acct = (state.get("accounts") or {}).get(account)
@@ -11271,6 +11391,19 @@ def _hybrid_cycle(state: dict, config: dict, usage_by_account: dict, no_execute:
         ))
 
 
+def _clear_subscription_past_due(acct: dict, name: str, why: str) -> None:
+    """Drop an account's `subscription_past_due` flag (GH #261) and audit it
+    ONCE. No-op when the flag is absent, so every clearing site (successful
+    poll, probe "active", probe "disabled") can call it unconditionally.
+    `subscription_detail` is left to the caller: the ENDED branch overwrites it
+    and the recovery branches drop it themselves."""
+    if acct.pop("subscription_past_due", None):
+        acct.pop("subscription_past_due_at", None)
+        if not acct.get("subscription_disabled"):
+            acct.pop("subscription_detail", None)
+        _cred_audit("subscription-past-due", "cleared", why, account=name)
+
+
 def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsage]) -> dict:
     """Mutate state.json's per-account current_*_pct from a poll cycle.
 
@@ -11289,11 +11422,18 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
          auto-exclusion (see _disabled_accounts), keep rate_limited set
          (the account IS 429ing), preserve prior percentages, and emit ONE
          CRED-AUDIT line on the off→on transition
+      1.6. subscription_past_due (GH #261, 2026-10-11: the probe read
+         `subscription_status: "past_due"`, plan still attached) — flag for
+         placement-only exclusion (see _subscription_past_due_accounts),
+         same rate_limited / preserve / audit-once treatment as 1.5. The two
+         subscription flags are exclusive: whichever the latest probe says
+         wins and the other is cleared.
       2. rate_limited (HTTP 429) — flag and preserve prior percentages;
          a probe verdict of "active" here also CLEARS a lingering
-         subscription_disabled flag (subscription renewed, still throttled)
+         subscription_disabled or subscription_past_due flag (subscription
+         renewed / payment cleared, still throttled)
       3. poll_error (other failures) — flag and preserve prior percentages
-      4. success — clear all flags (subscription_disabled included — a
+      4. success — clear all flags (both subscription flags included — a
          successful usage poll is proof the subscription works again),
          store new percentages + reset times
 
@@ -11354,6 +11494,9 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             acct["subscription_disabled"] = True
             if newly_flagged:
                 acct["subscription_disabled_at"] = u.polled_at
+            # Exclusive with past_due (GH #261): a past-due plan that finally
+            # lapses to a free org is now ENDED, not past due.
+            _clear_subscription_past_due(acct, name, "subscription now reads ENDED")
             sub = u.raw.get("subscription") or {}
             acct["subscription_detail"] = {k: sub.get(k) for k in
                                            ("subscription_status", "organization_type")}
@@ -11372,6 +11515,52 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
                     "launch/swap rotation; re-enable the subscription in the "
                     "Anthropic console (or renew), then a successful poll (or "
                     "`cus force-poll`) auto-clears this",
+                    account=name)
+            continue
+
+        # Branch 1.6 (GH #261, 2026-10-11): subscription PAST DUE. The 429 was
+        # identified by the profile probe as a plan whose renewal payment
+        # failed — still attached (has_claude_max true), org still claude_max,
+        # but `subscription_status: "past_due"`. Launches on it wall at the
+        # first prompt with the org-disabled text (two sessions did, 2026-10-11)
+        # while the account read as active and carried no SUB flag. Flag it so
+        # the pickers and the explicit-target refusals block NEW placement;
+        # unlike Branch 1.5 nothing reads this flag to MOVE a lane (the plan
+        # recovers when the payment goes through). rate_limited stays set (it
+        # IS 429ing); the off→on transition is audited once.
+        if getattr(u, "subscription_past_due", False):
+            newly_flagged = not acct.get("subscription_past_due")
+            acct["subscription_past_due"] = True
+            if newly_flagged:
+                acct["subscription_past_due_at"] = u.polled_at
+            # Exclusive with ENDED: the plan is attached again, so a lingering
+            # ended flag (and its movers) must not keep firing.
+            if acct.pop("subscription_disabled", None):
+                acct.pop("subscription_disabled_at", None)
+                _cred_audit("subscription-disabled", "cleared",
+                            "profile probe now reads PAST DUE (plan attached) — "
+                            "ended flag replaced by the past-due placement block",
+                            account=name)
+            sub = u.raw.get("subscription") or {}
+            acct["subscription_detail"] = {k: sub.get(k) for k in
+                                           ("subscription_status", "organization_type")}
+            acct["rate_limited"] = True
+            acct["token_expired"] = False
+            acct.pop("token_stale", None)
+            acct.pop("poll_error", None)
+            acct["last_poll_ts"] = u.polled_at
+            update_backoff(acct, success=False, config=config)
+            if newly_flagged:
+                # Kept under _cred_audit's 240-char reason cap so the fix is
+                # never the part that gets truncated.
+                _cred_audit(
+                    "subscription-past-due", "placement-blocked",
+                    "profile probe: subscription PAST DUE "
+                    f"(status={sub.get('subscription_status')}, "
+                    f"org={sub.get('organization_type')}) — no new launches/rotation "
+                    "onto it; lanes on it stay. Fix: update the payment method "
+                    "(claude.ai Settings, Billing); a successful poll or "
+                    "`cus force-poll` clears this",
                     account=name)
             continue
 
@@ -11394,6 +11583,12 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
                             "profile probe reports an ACTIVE subscription again "
                             "(still rate-limited) — account back in rotation",
                             account=name)
+            # Same for past due (GH #261): "active" from the probe means the
+            # payment cleared, even while the usage endpoint still throttles.
+            if u.raw.get("subscription_probe") == "active":
+                _clear_subscription_past_due(
+                    acct, name, "profile probe reports an ACTIVE subscription again "
+                    "(still rate-limited) — payment cleared; placement block lifted")
             update_backoff(acct, success=False, config=config)
             continue
 
@@ -11421,6 +11616,9 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             _cred_audit("subscription-disabled", "cleared",
                         "usage poll succeeded — subscription active again; "
                         "account back in rotation", account=name)
+        # GH #261: likewise for a past-due plan — the payment went through.
+        _clear_subscription_past_due(
+            acct, name, "usage poll succeeded — payment cleared; placement block lifted")
         # A SUCCESSFUL poll of an INACTIVE account read its SNAPSHOT's access token
         # (poll_account_usage → _read_access_token reads storage for inactive accts),
         # so the snapshot authenticates and is NOT refresh-dead — clear a stale flag
@@ -13313,6 +13511,18 @@ def _deep_prune_stores(state: dict, config: dict, *, execute: bool, probe: bool,
                     out.append(_row(acct, store_id, legacy, "subscription-disabled",
                                     detail, retired=retired, would_retire=True))
                     continue
+                if verdict == "past_due":
+                    # GH #261: a past-due plan is attached and recovers once
+                    # the payment clears — its stores are live credentials,
+                    # never retirement candidates. Informational row only.
+                    out.append(_row(acct, store_id, legacy, "subscription-past-due",
+                                    "profile probe on this store's own token: subscription "
+                                    "PAST DUE (payment failed, plan still attached) — kept; "
+                                    "launches are blocked until the account owner updates "
+                                    "the payment method (claude.ai Settings, Billing)"
+                                    + (" — the #191 ended flag on this account looks STALE"
+                                       if flagged else "")))
+                    continue
                 if flagged:
                     # Flag without confirmation → VISIBLE but informational;
                     # fall through to the lifetime check rather than stopping.
@@ -13416,7 +13626,9 @@ def _evacuation_candidates(state: dict, config: dict) -> list[dict]:
     answers org-disabled), so unlike ordinary rebalancing there is no
     cache-warmth argument for leaving it (the "don't churn workable lanes"
     rule doesn't apply — nothing on it is workable). Targets are accounts
-    that are not operator-disabled, not subscription-dead, and whose
+    that are not operator-disabled, not subscription-dead, not subscription
+    past-due (GH #261 — never a destination, though never a source here
+    either), and whose
     `_slot_move_plan` previews a clean install ("snapshot" or "claim" — the
     same clobber guards the real move enforces), preferred emptiest-first by
     max(5h%, 7d%). Locked slots are skipped entirely (a lock is user intent;
@@ -15253,6 +15465,28 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
                 affected=name,
             ))
 
+    # Condition 1b-past-due (GH #261, 2026-10-11): the account's plan is PAST
+    # DUE — the renewal payment failed, the plan is still attached, and every
+    # launch on it walls with the org-disabled text. cus blocks NEW placement
+    # (launch picks, swap targets, `cus launch/slot move/switch` to it) and
+    # leaves lanes already on it alone. WARNING, not urgent: nothing is lost,
+    # and the fix is one action by the account owner. Read-time gated like 1b.
+    if _subscription_guard_enabled(config):
+        for name, acct in accounts.items():
+            if not acct.get("subscription_past_due") or acct.get("subscription_disabled"):
+                continue
+            out.append(SOSCondition(
+                severity="warning",
+                summary=f"{name}: Claude subscription PAST DUE (payment failed) — launches and rotation onto it blocked",
+                action=(f"'{name}' has a Claude plan whose renewal payment failed (status=past_due). "
+                        f"Every new Claude Code session on it walls with \"organization has disabled Claude "
+                        f"subscription access\", so cus blocks launches and rotation ONTO it; lanes already on "
+                        f"it are left in place and recover when the payment clears. Fix: the account owner "
+                        f"updates the payment method under claude.ai Settings, Billing. Then "
+                        f"`cus force-poll {name}` — a successful poll auto-clears the flag."),
+                affected=name,
+            ))
+
     # Condition 1c (2026-09-04, F-F-4 = F-O-1 blind-review consensus): the SHARED
     # bare mount's own account is unhealthy (subscription-ended/disabled, or a dead
     # canonical the live mount can't self-heal) AND the daemon has NO healthy slot-
@@ -15296,13 +15530,13 @@ def diagnose(state: dict | None = None, config: dict | None = None) -> list[SOSC
     # so SOS shouldn't claim "no other account available" when the
     # orchestrator would have happily swapped to one.
     allow_rl = config.get("smart_strategy", {}).get("allow_rate_limited_targets", False)
-    _sub_dead = _subscription_dead_accounts(state, config)
+    _sub_blocked = _subscription_blocked_accounts(state, config)
     def is_valid(a: dict, name: str | None = None) -> bool:
-        # Subscription-ended (2026-08-07): hard-invalid even under
-        # allow_rate_limited_targets — the picker hard-excludes it, so
-        # counting it as an available target here would report capacity
-        # the orchestrator can never actually use.
-        if name is not None and name in _sub_dead:
+        # Subscription-ended (2026-08-07) or past-due (GH #261): hard-invalid
+        # even under allow_rate_limited_targets — the picker hard-excludes
+        # both, so counting one as an available target here would report
+        # capacity the orchestrator can never actually use.
+        if name is not None and name in _sub_blocked:
             return False
         if a.get("token_expired") or a.get("poll_error"):
             return False
@@ -17550,7 +17784,10 @@ def _hot_swap_orchestrate_impl(decision: SwapDecision, state: dict, config: dict
         if fresh.token_expired:
             click.echo(f"    ABORT: {target} is now TOKEN_EXPIRED — letting next cycle pick a different target")
             return
-        if fresh.raw.get("error") == "rate_limited":
+        if fresh.raw.get("rate_limited"):
+            # Same dead `== "rate_limited"` comparison as force-poll had (PR #262
+            # review); the 429 shape is "HTTP 429 (rate_limited): …" with a
+            # structured `rate_limited` key. Message-only branch here.
             click.echo(f"    note: {target} polling endpoint is rate-limited; proceeding with cached numbers (account itself may still be usable)")
         else:
             fh = f"{fresh.five_hour.utilization:.1f}%" if fresh.five_hour else "—"
@@ -18391,6 +18628,11 @@ def status() -> None:
         # never lift.
         if a.get("subscription_disabled"):
             flags.append("SUB_ENDED")
+        elif a.get("subscription_past_due"):
+            # GH #261: distinct from SUB_ENDED — the plan is attached and
+            # recovers on payment; shown instead of RATE_LIMITED for the
+            # same reason (the 429 is the symptom).
+            flags.append("PAST_DUE")
         elif a.get("rate_limited"):
             flags.append("RATE_LIMITED")
         if a.get("poll_error"):
@@ -18698,6 +18940,10 @@ def _session_binding(acct: dict, pool: str, config: dict) -> tuple[str, str]:
     # ended), and unlike a real rate limit no amount of waiting fixes it.
     if acct.get("subscription_disabled"):
         return ("blocked", "subscription ENDED (org-disabled — renew or `cus enable` after renewal)")
+    # GH #261: a past-due plan is a placement block (launches wall) but not a
+    # death — the label names the one fix.
+    if acct.get("subscription_past_due"):
+        return ("blocked", "subscription PAST DUE (payment failed — update the payment method under claude.ai Settings, Billing)")
     if acct.get("poll_error"):
         return ("blocked", "poll error (usage unknown)")
     if acct.get("rate_limited"):
@@ -19015,6 +19261,13 @@ def sessions_cmd(as_json: bool) -> None:
                     and (state.get("accounts", {}).get(r["account"], {}) or {}).get("subscription_disabled")
                     and _subscription_guard_enabled(config)):
                 acct = f"{acct} {click.style('[sub-ended]', fg='red', bold=True)}"
+            # Past-due tag (GH #261): informational — this lane is deliberately
+            # LEFT in place (the plan recovers on payment); the tag says why no
+            # new lane will join it. Yellow, not red: nothing to move.
+            elif (r["account"]
+                    and (state.get("accounts", {}).get(r["account"], {}) or {}).get("subscription_past_due")
+                    and _subscription_guard_enabled(config)):
+                acct = f"{acct} {click.style('[past-due]', fg='yellow', bold=True)}"
             # Line 1: identity + where mounted. Lead with the human-readable
             # tmux session-name (bold) so the operator recognizes the lane at a
             # glance, not just the opaque pane id / 8-char session hash.
@@ -19944,12 +20197,19 @@ def build_panes_payload(window_minutes: float, now: "datetime | None" = None) ->
     accounts = {}
     for a, rec in (state.get("accounts") or {}).items():
         accounts[a] = account_headroom(rec, now)
-        accounts[a]["disabled"] = bool(isinstance(rec, dict) and rec.get("subscription_disabled"))
+        # `disabled` = "not a destination for a pane". GH #261 folds a past-due
+        # account in (the watchdog reads this key to pick where to move a
+        # pane, and a past-due account must never be that) and names the
+        # reason separately so the header can say PAST DUE, not DISABLED.
+        accounts[a]["past_due"] = bool(isinstance(rec, dict) and rec.get("subscription_past_due"))
+        accounts[a]["disabled"] = bool(isinstance(rec, dict) and rec.get("subscription_disabled")) \
+            or accounts[a]["past_due"]
     for r in rows:
         a = r.get("account")
         if a and a not in accounts:
             accounts[a] = account_headroom(None, now)
             accounts[a]["disabled"] = False
+            accounts[a]["past_due"] = False
     for a in accounts:
         mine = [r for r in rows if r.get("account") == a]
         accounts[a]["live_panes"] = len(mine)
@@ -20416,7 +20676,9 @@ def _account_header(name, h: dict | None, now: "datetime") -> str:
     # accounts on 2026-09-20).
     body += f" · plan {plan_tier_text(h.get('plan_tier') or {})}"
     tags = ""
-    if h.get("disabled"):
+    if h.get("past_due"):
+        tags += "  [PAST DUE — payment failed; not a destination; existing panes stay]"
+    elif h.get("disabled"):
         tags += "  [DISABLED]"
     if h.get("unmeasured_panes"):
         tags += (f"  [! {h['unmeasured_panes']} pane(s) UNMEASURED — shares are of the "
@@ -20866,6 +21128,21 @@ def auto_swap_cmd(target: str | None, trigger: str, orchestrate: bool, tier: int
         if target not in state["accounts"]:
             click.echo(f"Unknown account '{target}'. Known: {sorted(state['accounts'].keys())}")
             sys.exit(1)
+        # Explicit-target refusals (PR #262 review, HIGH): `cus auto-swap <acct>`
+        # moved the shared mount onto a flagged account after only an
+        # existence check — `cus switch` refused the same state. An ENDED or
+        # past-due account is never a placement target; this command has no
+        # --force (the override is `cus switch <acct> --force`).
+        if target in _subscription_dead_accounts(state, config):
+            click.echo(click.style(
+                f"refusing: '{target}' has NO active Claude subscription (auto-detected — every "
+                f"session on it opens logged-out). Renew in the Anthropic console then "
+                f"`cus force-poll {target}` to clear, or pick another target. "
+                f"`cus switch {target} --force` overrides.", fg="red"))
+            sys.exit(1)
+        if target in _subscription_past_due_accounts(state, config):
+            click.echo(click.style(_past_due_refusal_text(target), fg="red"))
+            sys.exit(1)
         chosen_name = target
         reason = f"explicit (auto-swap {target})"
     else:
@@ -20946,6 +21223,10 @@ def switch(target: str, dry_run: bool, trigger: str, force: bool) -> None:
             f"session on it opens logged-out). Renew in the Anthropic console then "
             f"`cus force-poll {target}` to clear, or pick another target. --force overrides.",
             fg="red"))
+        sys.exit(1)
+    # Past-due target refusal (GH #261): same shape, different fix.
+    if target in _subscription_past_due_accounts(state, load_config()) and not force:
+        click.echo(click.style(_past_due_refusal_text(target), fg="red"))
         sys.exit(1)
 
     # Duplicate-mount guard (GH #104): putting the shared mount on an account a
@@ -21198,11 +21479,35 @@ def force_poll(account: str) -> None:
         update_state_with_usage(state, {account: u})
         save_state(state)
         sys.exit(2)
-    if u.raw.get("error") == "rate_limited":
-        click.echo("  STILL 429 — Anthropic throttle still engaged. Backoff cycle restarted.")
-        update_backoff(acct, success=False, config=config)
+    if u.raw.get("rate_limited"):
+        # PR #262 review (both seats, HIGH): this branch used to test
+        # `u.raw.get("error") == "rate_limited"`, but the poll layer writes
+        # `"HTTP 429 (rate_limited): <body>"` plus a separate structured
+        # `rate_limited: True` key, so the branch was dead and a 429 fell to
+        # the generic ERROR exit below — which returns BEFORE
+        # update_state_with_usage. force-poll therefore never recorded a 429:
+        # no backoff, no rate_limited flag, and neither subscription flag (the
+        # ENDED flag since #191, the past-due flag of #261) — while the SOS
+        # and refusal texts tell the operator to run exactly this command.
+        # Now keyed on the structured field; state is updated through the
+        # same path `cus poll` uses (Branch 1.5 / 1.6 / 2 there set the flags,
+        # clear them on a probe "active", and apply the backoff — so no
+        # separate update_backoff call here, which double-counted the 429).
         update_state_with_usage(state, {account: u})
         save_state(state)
+        acct = state["accounts"][account]
+        if acct.get("subscription_disabled"):
+            click.echo(f"  SUB_ENDED — the 429 is an ended subscription (profile probe); "
+                       f"'{account}' stays out of rotation. See `cus sos`.")
+        elif acct.get("subscription_past_due"):
+            click.echo(f"  PAST_DUE — the 429 is a past-due subscription (profile probe): "
+                       f"no launches or rotation onto '{account}' until the account owner "
+                       f"updates the payment method (claude.ai Settings, Billing). "
+                       f"Lanes already on it stay. See `cus sos`.")
+        else:
+            click.echo("  STILL 429 — Anthropic throttle still engaged. Backoff cycle restarted."
+                       + ("  (subscription flag cleared — profile probe reads ACTIVE again)"
+                          if u.raw.get("subscription_probe") == "active" else ""))
         sys.exit(3)
     if u.raw.get("error"):
         click.echo(f"  ERROR: {u.raw['error']}")
@@ -22875,6 +23180,8 @@ def statusline_cmd(verbose: bool, compact: bool) -> None:
         # launching onto them. The 429 is implied (it's the symptom).
         if a.get("subscription_disabled"):
             flags.append("SUB-END")
+        elif a.get("subscription_past_due"):
+            flags.append("PAST-DUE")       # GH #261: payment failed, launches wall
         elif a.get("rate_limited"):
             flags.append("429")
         if a.get("token_stale"):
@@ -24177,6 +24484,11 @@ def slot_move_cmd(slot_name: str, account: str, dry_run: bool, force: bool) -> N
             f"`cus force-poll {account}` to clear, or pick another target. --force overrides.",
             fg="red"))
         sys.exit(1)
+    # Past-due target refusal (GH #261): a rescue onto a past-due account
+    # would trade a stuck pane for a walled one. Same --force override.
+    if account in _subscription_past_due_accounts(state, config) and not force:
+        click.echo(click.style(_past_due_refusal_text(account), fg="red"))
+        sys.exit(1)
     # Validate slot: a state entry OR an on-disk dir is enough to move it (an
     # unregistered-but-present dir is a real, movable mount; `cus slot list`
     # flags the registration gap separately).
@@ -24990,6 +25302,13 @@ def _launch_prepare(account: str | None, state: dict, config: dict,
             f"Renew/re-enable the subscription in the Anthropic console, then `cus force-poll "
             f"{account}` to clear the flag; or pick another account (`cus launch auto`). "
             f"--force overrides.")
+    # Past-due launch refusal (GH #261, 2026-10-11): two review sessions were
+    # launched onto a past-due account and both walled at the first prompt.
+    # The auto-pick path excludes it via _disabled_accounts(config, state);
+    # this guards the EXPLICIT `cus launch <account>` path. --force overrides
+    # once (e.g. the payment just cleared and the next poll hasn't run).
+    if account in _subscription_past_due_accounts(state, config) and not force:
+        raise click.ClickException(_past_due_refusal_text(account))
 
     # Lane sharing (GH #109 lanes): if the chosen account is already live on a
     # slot lane, JOIN that lane (share its config dir) rather than refusing

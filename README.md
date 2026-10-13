@@ -503,7 +503,11 @@ Other things worth knowing about the numbers:
                          "headroom_5h_pct": 97.0, "headroom_7d_pct": 41.0,
                          "five_hour_resets_at": "...", "seven_day_resets_at": "...",
                          "live_panes": 1, "disabled": false,   // every configured account is
-                                                               // listed, even with 0 live panes
+                                                               // listed, even with 0 live panes;
+                                                               // disabled = NOT a destination for
+                                                               // a pane: subscription ended OR
+                         "past_due": false,                    // past due (payment failed — new
+                                                               // launches wall; existing panes stay)
                          "last_observed_ts": "...",
                          "age_seconds": 224.9, "unmeasured_panes": 0,
                          "per_model_weekly_pct": {"Fable": 100.0},
