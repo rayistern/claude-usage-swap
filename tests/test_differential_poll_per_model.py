@@ -52,15 +52,19 @@ def _now():
 
 class _FrozenDatetime(datetime):
     """``datetime`` whose ``now()`` is pinned. Installed on ``cus`` by
-    ``_freeze_cus_clock``; everything else (fromisoformat, arithmetic,
-    isinstance checks) behaves like the real class."""
+    ``_freeze_cus_clock``. ``fromisoformat`` and arithmetic behave like the
+    real class. ``now()`` returns a plain ``datetime``, so while the freeze is
+    installed an ``isinstance(x, cus.datetime)`` check would NOT match it;
+    ``cus.py`` has no such check. Only the aware form ``now(tz)`` is supported:
+    ``cus.py`` never asks for a naive ``now()``, and the real one would return
+    local time, which a pinned UTC instant cannot imitate honestly."""
 
     _at = None
 
     @classmethod
     def now(cls, tz=None):
-        if tz is None:  # cus never asks for a naive now; keep the signature honest
-            return cls._at.replace(tzinfo=None)
+        if tz is None:
+            raise AssertionError("frozen clock: cus is not expected to read a naive now()")
         return cls._at.astimezone(tz)
 
 
@@ -156,7 +160,9 @@ def test_inactive_due_after_slow_interval():
 
 def test_flat_config_polls_everyone_each_interval():
     # Backward-compat: with no polling.* keys, both roles are due after the
-    # flat interval and not before.
+    # flat interval and not before. The 10 s margin (290 s vs 300 s) is still
+    # wall-clock, but it is now measured from the start of THIS test body to
+    # the code's read, microseconds apart, not from the module's import (#265).
     now = _now()
     st = _state(active="a", accounts={
         "a": {"last_poll_ts": _iso(now - timedelta(seconds=310))},
@@ -176,7 +182,13 @@ def test_flat_config_boundary_holds_when_execution_lags_collection(monkeypatch):
     time) is already stale by more than the 10 s margin. With the reference
     taken per test through ``cus.datetime``, the boundary test passes under
     the frozen clock; with an import-time reference it fails -- "b" reads as
-    due -- which is exactly the failure the issue reports."""
+    due -- which is exactly the failure the issue reports.
+
+    A red pin has two possible causes: the reference went back to import
+    time, or the reference and the code stopped sharing ``cus.datetime`` (for
+    instance ``_account_poll_due`` reading ``time.time()`` instead). The second
+    is not the #265 defect, but it is the same hazard: a test clock and a code
+    clock that can drift apart."""
     _freeze_cus_clock(monkeypatch, datetime.now(timezone.utc) + timedelta(seconds=11))
     test_flat_config_polls_everyone_each_interval()
 
