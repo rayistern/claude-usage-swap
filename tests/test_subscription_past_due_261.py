@@ -26,8 +26,8 @@ The contract pinned here:
   (5) placement: never a pick_swap_target target (every strategy, even under
       allow_rate_limited_targets); never a pick_launch_account pick at ANY
       of its tiers — the shimmed picker, the raw fallback, the lane-share
-      fallback and the least-bad degraded tier, each reached by its own
-      fixture;
+      fallback and both arms of the least-bad degraded tier (free mount and
+      lane join), each reached by its own fixture;
   (6) NO FORCED MOVES, with a LIVE lane on the account: not a Trigger-0
       eviction, not an evacuation source, not a shared-mount migration
       reason — each with an ENDED/operator-disabled control that DOES move;
@@ -567,6 +567,49 @@ def test_launch_least_bad_tier_skips_past_due():
                                      "slots": {}}, _launch_cfg(gate=True))
         assert t is not None and t.name == "gamma", (
             f"degraded tier placed onto past-due account {t and t.name!r}")
+        assert "[DEGRADED:" in t.reason, t.reason
+    finally:
+        occ.restore()
+
+
+def test_launch_least_bad_tier_lane_join_arm_skips_past_due():
+    """GH #266: reaches the LEAST-BAD tier's LANE-JOIN arm, which the test
+    above never populates (it has no live lane, so only the free-mount arm
+    holds candidates; a mutant that re-admits past due at the lane-join arm
+    alone passed the whole suite).
+
+    Every earlier tier and the free-mount arm are empty here: the gate is on
+    and both accounts are over the Fable cap (the two shims, the raw fallback
+    and the lane-share fallback all drop capped accounts), and both accounts
+    are on live lanes (the free-mount arm drops live accounts). With lane
+    sharing on, the lane-join arm holds both, and its ordering prefers the
+    lower last-known Fable: past-due beta (96%) over gamma (98%).
+
+    Known-present control first: the same state with beta healthy picks beta
+    through the degraded tier. That proves the fixture reaches the lane-join
+    arm and that the ordering would choose beta, so gamma in the real
+    assertion is the past-due exclusion's doing and nothing else's."""
+    occ = _Occupancy({"beta", "gamma"})
+    try:
+        def _state(beta_past_due: bool) -> dict:
+            beta = _past_due_flag_only(5, 5) if beta_past_due else _healthy_acct(5, 5)
+            beta["per_model_weekly_pct"] = {"Fable": 96.0}
+            gamma = _healthy_acct(30, 25)
+            gamma["per_model_weekly_pct"] = {"Fable": 98.0}
+            return {"active": None, "accounts": {"beta": beta, "gamma": gamma},
+                    "slots": {"slot-1": {"account": "beta"},
+                              "slot-2": {"account": "gamma"}}}
+
+        cfg = _launch_cfg(gate=True, lane_sharing=True)
+
+        ctl = cus.pick_launch_account(_state(beta_past_due=False), cfg)
+        assert ctl is not None and ctl.name == "beta", (
+            f"control: a healthy beta at the lower Fable must win the lane-join arm, got {ctl}")
+        assert "[DEGRADED:" in ctl.reason, ctl.reason
+
+        t = cus.pick_launch_account(_state(beta_past_due=True), cfg)
+        assert t is not None and t.name == "gamma", (
+            f"degraded tier's lane-join arm joined past-due account {t and t.name!r}")
         assert "[DEGRADED:" in t.reason, t.reason
     finally:
         occ.restore()
