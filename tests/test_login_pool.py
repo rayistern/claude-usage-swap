@@ -613,6 +613,9 @@ def _reactive_cfg(gate: bool) -> dict:
         "swap_hysteresis": {"enabled": False}, "usage_growth_gate": {"enabled": False},
         "defer_swap_near_5h_reset": {"enabled": False}, "lazy_swap": {"enabled": False},
         "independent_logins": {"use_independent_logins": gate},
+        # PR #187 incorporation (safety fix 1): reactive ships OFF in DEFAULT_CONFIG;
+        # this reactive-picker test enables it explicitly.
+        "reactive": {"enabled": True},
     })
 
 
