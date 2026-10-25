@@ -37,6 +37,7 @@ Diff results from `~/.claude.json` vs `~/.claude-merkos/.claude.json` (2026-05-1
 
 - `userID` — Anthropic-side user ID hash. Differs per OAuth account.
 - `oauthAccount` — block of 15 fields: `accountUuid`, `emailAddress`, `organizationUuid`, `hasExtraUsageEnabled`, `billingType`, `accountCreatedAt`, `subscriptionCreatedAt`, `ccOnboardingFlags`, `claudeCodeTrialEndsAt`, `claudeCodeTrialDurationDays`, `seatTier`, `displayName`, `organizationRole`, `workspaceRole`, `organizationName`.
+  The facets `cus` compares to decide "same account" are `accountUuid`, `emailAddress` and `organizationUuid` (`_identity_fields`); `userID` is deliberately excluded because it varies per `/login` of the same account, while `organizationUuid` is what separates two accounts reachable from one login (the account switcher).
 
 *Note: on 2026-05-18 the user's `~/.claude/` and `~/.claude-merkos/` have the SAME `oauthAccount` block because billing is currently shared across what would normally be two accounts. The design must still handle the general case of distinct OAuth identities.*
 
