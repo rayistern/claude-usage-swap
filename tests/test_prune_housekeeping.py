@@ -241,21 +241,18 @@ def test_free_family_probe_report_then_execute_leased_never_probed():
 
 
 # ---------------------------------------------------------------------------
-# (1b) F-O-1 shield (GH #193 review): a DISTINCT-id FREE family sharing a LIVE
-#      mount's refresh generation is NEVER probed/retired — probing rotates the
-#      shared single-use token and logs the live holder out (#104; confirmed
-#      live logout 2026-08-30). Distinct from (1)'s leased-by-id skip: here the
-#      family is NOT leased (no login_family on the slot), so only the fingerprint
-#      shield — not leased_families — can protect it.
+# (1b) A family sharing a live mount's refresh generation is never probed.
+#      No login_family is recorded; the picker's mount fingerprint counts it
+#      as taken. Probing would rotate the single-use token.
 # ---------------------------------------------------------------------------
 
 def test_free_family_sharing_live_mount_generation_never_probed():
     env = _Env({"acct": _valid("at-c", "rt-c"), "other": _valid("at-o", "rt-o")},
                active="other", config=_ILGATE)
     try:
-        # A LIVE mount holding refresh generation "rt-live-gen". Crucially it is NOT
-        # leased to the free family below (no family_id), so leased_families won't
-        # shield that family — only the F-O-1 refresh-fingerprint shield can.
+        # A LIVE mount holding refresh generation "rt-live-gen", with no
+        # login_family recorded. The picker's fingerprint arm treats the
+        # matching family as taken, so the probe must not fire.
         env.make_slot("acct", live=True, mount_creds=_valid("at-live", "rt-live-gen"))
         # A FREE family with a DISTINCT id but the SAME single-use refresh token as
         # the live mount (a duplicate-generation copy, e.g. an unrotated
