@@ -2084,16 +2084,52 @@ def slot_leased_family(state: dict, slot: str) -> tuple[str, str] | None:
     return (account, family_id)
 
 
+def _store_refresh_fingerprint(path: Path) -> str | None:
+    """Fingerprint of the refresh token in a credentials file, or None.
+
+    Missing, unreadable, or refresh-less files contribute nothing. This read
+    does not probe the token: a probe would rotate it."""
+    if not path.exists():
+        return None
+    try:
+        rt = _credential_refresh_token(read_json(path))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return _refresh_fingerprint(rt) if rt else None
+
+
 def leased_families(account: str, state: dict) -> set[str]:
-    """Family ids of `account` currently leased by a LIVE slot — the in-use set
-    a claim must avoid. Idle slots don't count: with no session refreshing the
-    token, their lease can't clobber, and the family is reclaimable."""
-    live = set(occupied_slot_accounts(state).get(account, []))
+    """Family ids of `account` a claim must not hand out.
+
+    A family is taken when any slot holds it, live or idle, locked or not.
+    A slot holds it when the lease map names it, or when that slot mount's
+    refresh-token fingerprint matches the family's. Either signal is enough.
+    An idle lease is not free: claiming the family rotates its single-use
+    token and logs the other mount out (2026-11-02T21:22:00Z)."""
     out: set[str] = set()
-    for slot in live:
+    slot_names: set[str] = set()
+    for slot, entry in (state.get("slots") or {}).items():
+        if not isinstance(slot, str):
+            continue
+        slot_names.add(slot)
+        if not isinstance(entry, dict):
+            continue
         lease = slot_leased_family(state, slot)
-        if lease and lease[0] == account:
+        if lease and lease[0] == account and lease[1]:
             out.add(lease[1])
+    for d in list_slot_dirs():
+        slot_names.add(d.name)
+    by_fp: dict[str, list[str]] = {}
+    for fam in list_login_families(account):
+        fp = _store_refresh_fingerprint(login_family_creds_path(account, fam))
+        if fp:
+            by_fp.setdefault(fp, []).append(fam)
+    if not by_fp:
+        return out
+    for slot in slot_names:
+        fp = _store_refresh_fingerprint(mount_creds_path(slot_path(slot)))
+        if fp and fp in by_fp:
+            out.update(by_fp[fp])
     return out
 
 
@@ -9199,12 +9235,9 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
         # snapshot (no claim) releases any prior lease.
         if claimed_family is not None:
             slot_entry["login_family"] = f"{target_name}/{claimed_family}"
-            # A claim only succeeds for a family no LIVE slot leases, so any
-            # OTHER slot still recording this family is an idle lane's STALE
-            # lease. Clear it here so it cannot later be mistaken for a lane's
-            # own distinct family (PR #240 review: `launch --lane` accepted an
-            # aliased lease). The launch guard re-verifies independently; this
-            # is the belt, that is the braces.
+            # A claim only succeeds for a family no slot holds. Another slot
+            # recording this same family was written after the pick. Clear it
+            # so the map does not name one family on two slots.
             for _other, _entry in (state.get("slots") or {}).items():
                 if (_other != slot and isinstance(_entry, dict)
                         and _entry.get("login_family") == f"{target_name}/{claimed_family}"):
@@ -12718,22 +12751,13 @@ def _prune_free_families(state: dict, config: dict, *, execute: bool, probe: boo
         "probe_cooldown_minutes": hk.get("family_probe_cooldown_minutes", 60),
     }
     pool_size = config.get("independent_logins", {}).get("pool_size", 3)
-    # ---- F-O-1 shield (GH #193 review; confirmed live-logout 2026-08-30) --------
-    # leased_families only shields families held BY ID. A FREE family with a
-    # DISTINCT id can still carry the SAME single-use refresh-token generation as a
-    # LIVE mount (a duplicate-generation copy — e.g. an unrotated `--from-existing`
-    # snapshot). Such a copy is NOT in `leased`, so pre-fix it fell straight through
-    # to the probe below — and `_store_creds_dead`'s refresh-grant probe ROTATES
-    # that shared single-use token, dead-branching the live mount and logging out a
-    # running session (violates #104 / "never log out a live session"; this was the
-    # confirmed root cause of a live logout on 2026-08-30). The deep-walk retire
-    # (rung 3, `_deep_prune_stores`) already shields on this fingerprint; the base
-    # free-family PROBE did not. Reuse the SAME helpers the deep walk uses
-    # (`_live_surface_fingerprints` / `_refresh_fingerprint`) rather than
-    # reimplementing fingerprinting. Computed once here (not per-account) because
-    # this base pass runs in BOTH plain `cus prune` and `cus prune --deep`, so the
-    # shield protects both. Best-effort: an unreadable live surface simply
-    # contributes nothing, exactly as the deep walk treats it.
+    # A slot mount that shares a family's refresh token is already in
+    # leased_families, so the loop below skips it before any probe. This
+    # shield still covers a generation shared with a live surface the picker
+    # does not scan (the shared ~/.claude mount). Probing that generation
+    # rotates the single-use token. Computed once (not per-account) because
+    # this pass runs in both plain `cus prune` and `cus prune --deep`.
+    # Best-effort: an unreadable live surface contributes nothing.
     live_fps = _live_surface_fingerprints(state)
     out: list[dict] = []
     for acct in sorted(accounts if accounts is not None else state.get("accounts", {})):
@@ -12744,7 +12768,7 @@ def _prune_free_families(state: dict, config: dict, *, execute: bool, probe: boo
         live_free = 0
         for fam in fams:
             if fam in leased:
-                continue  # live mount's generation — never probed, never retired
+                continue  # a slot holds this family — never probed, never retired
             # The invariant this whole mechanism rests on: by the time we reach
             # a probe, the family MUST be free. leased_families is recomputed
             # here (not the loop-top copy) so drift between the two reads can
@@ -18746,7 +18770,7 @@ def status() -> None:
         click.echo()
 
     # Login pools (GH #109 pool model): per-account backup-family depth + how
-    # many are currently free (not leased to a live lane). Stays invisible until
+    # many are currently free (not held by any slot). Stays invisible until
     # a pool exists, so users not using the feature see nothing new.
     pool_rows = [(n, list_login_families(n)) for n in sorted(state["accounts"])]
     pool_rows = [(n, fams) for n, fams in pool_rows if fams]
@@ -18769,8 +18793,8 @@ def status() -> None:
         _now_ms = int(time.time() * 1000)
         for n, fams in pool_rows:
             leased_now = leased_families(n, state)
-            # fam -> [slots] recorded as leasing it (live or idle; idle leases are
-            # reclaimable, so they are labelled distinctly below).
+            # fam -> [slots] recorded as leasing it. An idle lease is held, and
+            # labelled idle-lease below so it is not printed as free.
             lease_slots: dict[str, list[str]] = {}
             for _sname, _entry in sorted((state.get("slots") or {}).items()):
                 _ref = (_entry or {}).get("login_family") if isinstance(_entry, dict) else None
@@ -18806,15 +18830,15 @@ def status() -> None:
                         wall_txt = click.style(f"wall in {left:.1f}d", fg="red")
                     else:
                         wall_txt = f"wall in {left:.1f}d"
-                if f in leased_now:
-                    # F-F-14 (2026-09-08): fall back to "leased (?)" when the
-                    # occupied-slot filter yields nothing (the lease was recorded on
-                    # a slot that just went idle mid-call) so we don't print a
-                    # dangling "leased " with no slot names.
-                    _live_lease_slots = [s for s in lease_slots.get(f, []) if s in occupied_slot_accounts(state).get(n, [])]
-                    lease_txt = "leased " + ",".join(_live_lease_slots) if _live_lease_slots else "leased (?)"
-                elif lease_slots.get(f):
-                    lease_txt = "idle-lease " + ",".join(lease_slots[f])
+                holders = lease_slots.get(f, [])
+                live_holders = [s for s in holders if s in occupied_slot_accounts(state).get(n, [])]
+                if live_holders:
+                    lease_txt = "leased " + ",".join(live_holders)
+                elif holders:
+                    lease_txt = "idle-lease " + ",".join(holders)
+                elif f in leased_now:
+                    # Mount fingerprint matches and no slot records the lease.
+                    lease_txt = "held"
                 else:
                     lease_txt = "free"
                 try:

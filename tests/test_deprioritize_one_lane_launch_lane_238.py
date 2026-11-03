@@ -403,21 +403,23 @@ def test_aliased_or_missing_lease_is_a_note_and_only_shared_bytes_refuse(capsys)
         env.restore()
 
 
-def test_claiming_a_family_clears_an_idle_lanes_stale_lease_to_it():
-    """H1, the aliasing source: the claim reclaims a family an IDLE lane still
-    records; that stale lease is now cleared at claim time."""
+def test_claim_leaves_an_idle_lanes_lease_and_takes_the_next_family():
+    """An idle lane's lease is a hold even when its mount bytes are the
+    snapshot token rather than the family's. The claim takes the next free
+    family and leaves that lease recorded."""
     env = _Env(accounts=("alpha", "beta"))
     try:
         env.set_config({"independent_logins": {"use_independent_logins": True}})
         mover = env.make_slot("alpha", live=True)
         env.make_slot("beta", live=True)                                # beta live elsewhere => must claim
-        stale = env.make_slot("beta", live=False, family_id="family-1")  # idle lane, stale lease
+        stale = env.make_slot("beta", live=False, family_id="family-1")  # idle lane, lease only
         env.plant_family("beta", "family-1", "rt-b1")
-        assert cus.leased_families("beta", cus.load_state()) == set()
+        env.plant_family("beta", "family-2", "rt-b2")
+        assert cus.leased_families("beta", cus.load_state()) == {"family-1"}
         cus.execute_swap("beta", trigger="test", slot=mover)
         st = cus.load_state()
-        assert st["slots"][mover]["login_family"] == "beta/family-1"
-        assert "login_family" not in st["slots"][stale], st["slots"][stale]
+        assert st["slots"][mover]["login_family"] == "beta/family-2"
+        assert st["slots"][stale]["login_family"] == "beta/family-1"
     finally:
         env.restore()
 
@@ -773,7 +775,9 @@ def test_launch_lane_that_would_install_takes_a_free_family_or_refuses_on_exhaus
         assert "distinct family (pooled-family: family-1)" in capsys.readouterr().out
         cus.login_family_creds_path("alpha", "family-1").write_text(_creds_blob("rt-alpha"))  # shares the live lane's bytes
         refused, msg = _guard_refuses("alpha", lane, cus.load_state(), config)
-        assert refused and "SAME OAuth refresh-token family" in msg
+        # The shared generation is taken by the mount fingerprint, so the
+        # picker refuses before the byte-collision check.
+        assert refused and "no free independent login family" in msg
     finally:
         env.restore()
 

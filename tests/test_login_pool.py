@@ -4,7 +4,7 @@ Plan: docs/plans/2026-07-03-independent-login-pool.md.
 
 Phase 1 covers the store + lease primitives:
   - list_login_families / next_family_id (usable-only, numeric order)
-  - leased_families: only LIVE slots' leases count (idle reclaimable)
+  - leased_families: any slot's lease counts, idle and locked included
   - free_login_family / has_free_login_family: lowest-free, exhaustion
 
 Later phases (provisioning command, swap claim/install, decision + reactive
@@ -137,7 +137,7 @@ def test_next_family_id_increments_past_highest():
         env.restore()
 
 
-def test_free_family_skips_live_leases_reclaims_idle():
+def test_free_family_skips_live_and_idle_leases():
     env = _Env()
     try:
         env.plant_family("alpha", "family-1", "rt-a1")
@@ -151,10 +151,12 @@ def test_free_family_skips_live_leases_reclaims_idle():
         assert cus.free_login_family("alpha", state) == "family-2"
         assert cus.has_free_login_family("alpha", state) is True
 
-        # An IDLE slot leasing family-2 does NOT consume it (reclaimable).
+        # An IDLE slot leasing family-2 consumes it too. Claiming it would
+        # rotate the token that mount still holds.
         env.make_slot("alpha", live=False, family_id="family-2")
         state = cus.load_state()
-        assert cus.free_login_family("alpha", state) == "family-2"
+        assert cus.free_login_family("alpha", state) is None
+        assert cus.has_free_login_family("alpha", state) is False
     finally:
         env.restore()
 
