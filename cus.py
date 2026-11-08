@@ -874,6 +874,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "repoll_buffer_seconds": 20,
         "min_repoll_seconds": 30,
     },
+    # poll_only_lane_maintenance (2026-11-08): opt in to credential maintenance
+    # under daemon --no-execute. Only lane preempt and verified lane heal
+    # execute; swaps and lane moves stay disabled. Default off.
+    "poll_only_lane_maintenance": False,
     # token_self_refresh (2026-07-02, GH #13 follow-up): before flagging an
     # inactive account token_stale, attempt a plain OAuth refresh_token grant
     # against the same undocumented endpoint the `claude` CLI itself uses (see
@@ -884,9 +888,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # never a new failure mode. Set `enabled: false` to revert to the
     # pre-2026-07-02 behavior (never talk to this endpoint) if Anthropic ever
     # changes its shape and this starts erroring on every stale account.
-    # Opt in to credential maintenance under daemon --no-execute. Only lane
-    # preempt and verified lane heal execute; swaps and lane moves stay disabled.
-    "poll_only_lane_maintenance": False,
     "token_self_refresh": {
         "enabled": True,
         # Fix 4 (2026-07-07 un-stale idle accounts). An idle account whose stored

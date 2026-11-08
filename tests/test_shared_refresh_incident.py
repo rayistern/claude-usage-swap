@@ -536,3 +536,19 @@ def test_incident_slot_listing_error_fails_closed_without_raising(incident, monk
     assert cus._refresh_account_token("sample", creds_path=mount) is False
     assert cus._guarded_store_refresh_grant("fake-refresh", mount) == ("unknown", None)
     assert calls == []
+
+
+@pytest.mark.parametrize("cls", ["HTTPConnection", "HTTPSConnection"])
+def test_suite_blocks_http_client_connections(cls):
+    import http.client
+    conn = getattr(http.client, cls)("fake-host.invalid", timeout=1)
+    with pytest.raises(AssertionError, match="unstubbed HTTP"):
+        conn.request("GET", "/")
+    opener = urllib_opener()
+    with pytest.raises(AssertionError, match="unstubbed HTTP"):
+        opener.open("https://fake-host.invalid/", timeout=1)
+
+
+def urllib_opener():
+    import urllib.request
+    return urllib.request.build_opener()
