@@ -294,3 +294,22 @@ def test_incident_verified_preference_cannot_bypass_probe_via_config(incident, m
     monkeypatch.setattr(cus, "free_login_family", lambda *a: "family-1")
     monkeypatch.setattr(cus, "_oauth_refresh_grant", lambda rt: ("unknown", None))
     assert cus.claim_verified_login_family("sample", state, cfg, require_verified=True) is None
+
+
+@pytest.mark.parametrize("surface", ["mount", "unreadable-store"])
+def test_incident_recovery_sharing_check_fails_closed(incident, surface):
+    cfg, state, snap, mount = incident
+    mount.unlink()
+    if surface == "mount":
+        cus.CREDS_JSON.parent.mkdir()
+        cus.write_json(cus.CREDS_JSON, creds())
+    else:
+        (cus.ACCOUNTS_DIR / ".credentials.json.bak.fake").write_text("invalid-json")
+    assert cus._heal_token_shared("fake-refresh", snap)
+
+
+def test_incident_mount_scan_failure_cannot_authorize_rotation(incident, monkeypatch):
+    def unavailable():
+        raise OSError("fake directory failure")
+    monkeypatch.setattr(cus, "list_slot_dirs", unavailable)
+    assert cus._refresh_token_on_mount("fake-refresh")
