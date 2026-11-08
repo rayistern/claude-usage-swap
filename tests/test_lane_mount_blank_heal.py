@@ -91,7 +91,7 @@ class _Env:
 
         self._saved = {k: getattr(cus, k) for k in (
             "HOME", "CLAUDE_DIR", "CREDS_JSON", "CLAUDE_JSON", "ACCOUNTS_DIR",
-            "STATE_JSON", "CONFIG_YAML", "INBOX_MD")}
+            "STATE_JSON", "CONFIG_YAML", "INBOX_MD", "_oauth_refresh_grant")}
         cus.HOME = root
         cus.CLAUDE_DIR = self.claude_dir
         cus.CREDS_JSON = self.creds_json
@@ -100,6 +100,20 @@ class _Env:
         cus.STATE_JSON = self.state_json
         cus.CONFIG_YAML = self.config_yaml
         cus.INBOX_MD = self.inbox_md
+
+        # Recovery now proves the refresh chain even when access is fresh.
+        # Keep these shape/audit fixtures offline while returning rotated fakes.
+        def recovery_grant(rt):
+            for path in self.accounts_dir.rglob("*credentials.json*"):
+                try:
+                    payload = cus.read_json(path)
+                except (OSError, ValueError):
+                    continue
+                if cus._credential_refresh_token(payload) == rt:
+                    return "alive", {"access_token": payload["claudeAiOauth"]["accessToken"],
+                                     "refresh_token": rt + "-rotated", "expires_in": 3600}
+            return "dead", None
+        cus._oauth_refresh_grant = recovery_grant
 
         # /proc mock: a slot dir counts as "in use" iff its name is in live_slots
         # (same pattern as test_login_pool). mount_in_use → mount_pids → this.

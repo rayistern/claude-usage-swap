@@ -228,6 +228,11 @@ def test_a_swap_onto_dead_snapshot_seeds_from_valid_family():
         assert seeded and "decision=seeded-from-family" in seeded[0], env.echoes
         assert "login_family=merkos/family-1" in seeded[0]
         assert "rt-dead" not in seeded[0] and "rt-fam" not in seeded[0], "raw token leaked"
+        # The verified claim that seeded it also logs its persisted rotation.
+        claimed = env.audit_lines("claim-refresh")
+        assert claimed and "decision=refreshed" in claimed[0], env.echoes
+        assert "login_family=merkos/family-1" in claimed[0]
+        assert "rt-dead" not in claimed[0] and "rt-fam" not in claimed[0], "raw token leaked"
     finally:
         env.restore()
 

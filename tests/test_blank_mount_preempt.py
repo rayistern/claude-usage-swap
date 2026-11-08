@@ -101,7 +101,7 @@ class _Env:
 
         self._saved = {k: getattr(cus, k) for k in (
             "HOME", "CLAUDE_DIR", "CREDS_JSON", "CLAUDE_JSON", "ACCOUNTS_DIR",
-            "STATE_JSON", "CONFIG_YAML", "INBOX_MD")}
+            "STATE_JSON", "CONFIG_YAML", "INBOX_MD", "_oauth_refresh_grant")}
         cus.HOME = root
         cus.CLAUDE_DIR = self.claude_dir
         cus.CREDS_JSON = self.creds_json
@@ -110,6 +110,28 @@ class _Env:
         cus.STATE_JSON = self.state_json
         cus.CONFIG_YAML = self.config_yaml
         cus.INBOX_MD = self.inbox_md
+
+        # Recovery now proves the refresh chain even when access is fresh.
+        # Keep these shape/audit fixtures offline while returning rotated fakes.
+        # A refresh token is single-use, as at the real endpoint: once rotated,
+        # presenting it again is invalid_grant, so a heal cannot pass by
+        # restoring a backup of an already-spent chain.
+        spent: set[str] = set()
+
+        def recovery_grant(rt):
+            if rt in spent:
+                return "dead", None
+            spent.add(rt)
+            for path in self.accounts_dir.rglob("*credentials.json*"):
+                try:
+                    payload = cus.read_json(path)
+                except (OSError, ValueError):
+                    continue
+                if cus._credential_refresh_token(payload) == rt:
+                    return "alive", {"access_token": payload["claudeAiOauth"]["accessToken"],
+                                     "refresh_token": rt + "-rotated", "expires_in": 3600}
+            return "dead", None
+        cus._oauth_refresh_grant = recovery_grant
 
         # /proc mock: a slot dir is "in use" iff its name is in live_slots.
         self._saved_mount_pids = cus.mount_pids
@@ -365,8 +387,12 @@ def test_b_repeated_blank_heals_emit_stuck_sos():
         # One heal is below the default threshold (2) → no stuck SOS yet.
         assert cus._diagnose_stuck_lanes(cus.load_state(), cus.load_config()) == []
 
-        # Re-blank (Claude Code's next failed refresh) then heal #2.
+        # Re-blank (Claude Code's next failed refresh) then heal #2. The shadow
+        # from heal #1 stays: it equals the snapshot, the lane's steady state.
         env.write_mount(slot, _blank())
+        rt = cus._credential_refresh_token
+        lane_account = cus.load_state()["slots"][slot]["account"]
+        assert rt(cus.read_json(env.shadow_path(slot))) == rt(cus.read_json(cus.account_creds_path(lane_account)))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
 
         conds = cus._diagnose_stuck_lanes(cus.load_state(), cus.load_config())
