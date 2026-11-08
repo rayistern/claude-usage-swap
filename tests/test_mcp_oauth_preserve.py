@@ -548,7 +548,7 @@ def test_crash_recovery_completed_install_keeps_mount_mcp():
 #    destination's live mcpOAuth survives a stub-only / MCP-less source.
 # ---------------------------------------------------------------------------
 
-def test_auto_heal_live_lanes_restores_account_and_keeps_lane_mcp():
+def test_auto_heal_live_lanes_restores_account_and_keeps_lane_mcp(monkeypatch):
     """`_auto_heal_live_lanes` (the per-slot analogue of the shared-mount heal):
     a blanked LIVE lane mount that still carries a live MCP token keeps it after
     the heal, while claudeAiOauth becomes exactly the snapshot source's."""
@@ -556,6 +556,8 @@ def test_auto_heal_live_lanes_restores_account_and_keeps_lane_mcp():
     env = _Env({"rayi": _account_creds("rt-rayi", access="at-snap")}, active="rayi",
                live_creds=_account_creds("rt-shared"), mode="per_session")
     try:
+        monkeypatch.setattr(cus, "_oauth_refresh_grant", lambda rt: ("alive", {
+            "access_token": "at-snap", "refresh_token": "fake-rotated", "expires_in": 3600}))
         slot = env.make_slot("rayi", live=True, mount_creds=_blank(mcp={KEY: live_tok}))
         healed = cus._auto_heal_live_lanes(cus.load_state(), cus.load_config())
         assert healed == [slot]

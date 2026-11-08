@@ -224,8 +224,8 @@ def test_a_swap_onto_dead_snapshot_seeds_from_valid_family():
         # A distinct family lease was recorded (#104-safe).
         assert cus.load_state()["slots"][slot]["login_family"] == "merkos/family-1"
         # The fallback audit line is emitted, naming the family it seeded from.
-        seeded = env.audit_lines("snapshot-dead-family-fallback")
-        assert seeded and "decision=seeded-from-family" in seeded[0], env.echoes
+        seeded = env.audit_lines("claim-refresh")
+        assert seeded and "decision=refreshed" in seeded[0], env.echoes
         assert "login_family=merkos/family-1" in seeded[0]
         assert "rt-dead" not in seeded[0] and "rt-fam" not in seeded[0], "raw token leaked"
     finally:

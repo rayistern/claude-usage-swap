@@ -346,3 +346,20 @@ Inside `~/claude-accounts/`:
 | `Daemon pid <N> recorded but process is gone` | Daemon crashed/killed; pid file stale | Restart daemon; then `rm ~/claude-accounts/daemon.pid` if needed |
 
 See `docs/TROUBLESHOOTING.md` for deeper recovery procedures.
+
+### Lane credential maintenance while polling only
+
+`poll_only_lane_maintenance: false` is the default. Set it to `true` to let
+lane preempt refresh and verified lane auto-heal execute with daemon
+`--no-execute`. Swaps and lane moves still honor `--no-execute`.
+
+Snapshot refreshes always decline when any slot mount, including an idle slot,
+or the shared mount holds the same refresh token. This safety default has no
+new key. A stale snapshot can remain stale until the mount refreshes and saves
+back. `force-poll` explains a declined grant in its audit output.
+
+A heal requires a verified refresh chain even if the source access token has
+not expired. Shared, spent and unverifiable recovery sources are refused.
+When the independent login pool is enabled, slot installs, including blank
+same-account reinstalls, prefer a verified free family before a snapshot.
+An unheld account falls back to its snapshot if no verified family is available.
