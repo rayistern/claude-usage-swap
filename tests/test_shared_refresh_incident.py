@@ -406,3 +406,37 @@ def test_incident_heal_still_refuses_token_held_elsewhere(incident, monkeypatch,
     assert calls == []
     assert holder.read_bytes() == before
     assert cus.read_json(mount) == BLANK
+
+
+def test_incident_unheld_install_keeps_family_for_second_lane(monkeypatch):
+    """A plain install of an account no other mount holds uses the snapshot,
+    so the account's one free family is left for a second concurrent lane."""
+    from test_login_pool import _Env
+    env = _Env(accounts=("sample", "other"))
+    try:
+        env.set_config({"mode": "per_session", "independent_logins": {"use_independent_logins": True}})
+        env.plant_family("sample", "family-1", "fake-independent")
+        lane_a = env.make_slot("other", live=True)
+        lane_b = env.make_slot("other", live=True)
+        calls = []
+        monkeypatch.setattr(cus, "_oauth_refresh_grant", lambda rt: calls.append(rt) or ("alive", {
+            "access_token": "fake-verified-access", "refresh_token": "fake-verified-refresh",
+            "expires_in": 3600}))
+        launch_a = cus._launch_install_plan("sample", lane_a, cus.slot_path(lane_a),
+                                            cus.load_state(), cus.load_config())
+        assert launch_a["kind"] == "snapshot" and not launch_a["pool_exhausted"]
+        cus.execute_swap("sample", slot=lane_a)
+        cus._OCCUPIED_SLOTS_CACHE.clear()
+        rt = cus._credential_refresh_token
+        assert rt(cus.read_json(cus.mount_creds_path(cus.slot_path(lane_a)))) == "rt-sample"
+        assert cus.slot_leased_family(cus.load_state(), lane_a) is None
+        assert calls == []
+        # The second lane on the same account still launches, on the family.
+        launch_b = cus._launch_install_plan("sample", lane_b, cus.slot_path(lane_b),
+                                            cus.load_state(), cus.load_config())
+        assert launch_b["kind"] == "pooled-family" and launch_b["family"] == "family-1"
+        cus.execute_swap("sample", slot=lane_b)
+        assert cus.slot_leased_family(cus.load_state(), lane_b) == ("sample", "family-1")
+        assert rt(cus.read_json(cus.mount_creds_path(cus.slot_path(lane_b)))) == "fake-verified-refresh"
+    finally:
+        env.restore()

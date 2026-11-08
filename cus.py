@@ -8953,20 +8953,29 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
     # 2026-09-08 ordering note above: writing the live identity before the
     # refusal guards is what let crash recovery "complete" a refused swap.
     target_account_cj = read_json(target_cj)
-    # Prefer an independent, verified free login whenever a slot is installed,
-    # including a blank same-account reinstall. Only fall back to the snapshot
-    # when no verified family is available and no other mount holds the account.
-    # The pool gate still controls use of independent logins.
+    # Install source. Pool model (2026-07-03): if the gate is on and the target
+    # is ALREADY live on another mount, a plain snapshot copy would clobber its
+    # shared token family (#104), so CLAIM a free pooled family instead, and
+    # REFUSE when the pool is exhausted. A blank same-account reinstall also
+    # prefers a verified free family over the snapshot it may share a spent
+    # chain with, falling back to the snapshot when none verifies. A plain
+    # install of an account no other mount holds keeps the snapshot and leaves
+    # the family free for a second lane on that account (2026-11-08: claiming
+    # it here made the second lane's install fail as pool exhausted). Gate off
+    # skips the whole claim block.
     claimed_family = None
     install_src = None
     used_independent = False
-    if slot is not None and independent_logins_enabled(config):
+    held_elsewhere = (slot is not None
+                      and _account_held_by_other_live_mount(state, target_name, slot, config))
+    blank_reinstall = force_reinstall and target_name == current
+    if (slot is not None and independent_logins_enabled(config)
+            and (held_elsewhere or blank_reinstall)):
         # #127: liveness-verified claim — probes each free family's refresh
         # token, retires dead stores (the pre-PR#126 poisoning landmines), and
         # persists the rotation into the store this install copies from.
         claimed_family = claim_verified_login_family(
-            target_name, state, config,
-            require_verified=not _account_held_by_other_live_mount(state, target_name, slot, config))
+            target_name, state, config, require_verified=not held_elsewhere)
         if claimed_family is not None:
             install_src = login_family_creds_path(target_name, claimed_family)
             used_independent = True
@@ -8974,7 +8983,7 @@ def _execute_swap_locked(target_name: str, trigger: str, slot: str | None = None
             # Legacy per-slot family (superseded; retained until P5).
             install_src = login_store_creds_path(target_name, slot)
             used_independent = True
-        elif _account_held_by_other_live_mount(state, target_name, slot, config):
+        elif held_elsewhere:
             raise RuntimeError(
                 f"pool exhausted for '{target_name}': it is live on another mount and has no free "
                 f"independent login family to claim — refusing to install a clobbering copy. "
@@ -24592,8 +24601,6 @@ def _slot_move_plan(state: dict, config: dict, slot_name: str, target: str) -> d
                 f"{slot_name} is already on '{target}' but creds are blank/expired — the real move "
                 f"would liveness-probe and, if dead, retire the family and reinstall from a "
                 f"verified source (GH #190)")
-    elif not held_elsewhere and gate and has_free_login_family(target, state, config):
-        plan, detail = "claim", "try a verified free login family before the snapshot"
     elif not held_elsewhere:
         plan, detail = "snapshot", (
             f"'{target}' is not live on any other mount — a plain snapshot install, no login family needed")
@@ -25191,9 +25198,8 @@ def _launch_install_plan(account: str, lane: str, slot_dir: Path, state: dict, c
         plan.update(source=mount_creds_path(slot_dir), kind="mount")
         return plan
     gate = independent_logins_enabled(config)
-    held_elsewhere = _account_held_by_other_live_mount(state, account, lane, config)
-    if gate and (held_elsewhere or has_free_login_family(account, state, config)):
-        plan["held_elsewhere"] = held_elsewhere
+    if gate and _account_held_by_other_live_mount(state, account, lane, config):
+        plan["held_elsewhere"] = True
         fam = free_login_family(account, state, config)
         if fam:
             plan.update(source=login_family_creds_path(account, fam), kind="pooled-family", family=fam)
