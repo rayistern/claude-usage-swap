@@ -379,10 +379,11 @@ def test_b_repeated_blank_heals_emit_stuck_sos():
         # One heal is below the default threshold (2) → no stuck SOS yet.
         assert cus._diagnose_stuck_lanes(cus.load_state(), cus.load_config()) == []
 
-        # Re-blank with an independent recovery source; duplicate shadows are
-        # deliberately refused by the refresh-chain safety tests.
+        # Re-blank (Claude Code's next failed refresh) then heal #2. The shadow
+        # from heal #1 stays: it equals the snapshot, the lane's steady state.
         env.write_mount(slot, _blank())
-        env.shadow_path(slot).unlink(missing_ok=True)
+        rt = cus._credential_refresh_token
+        assert rt(cus.read_json(env.shadow_path(slot))) == rt(cus.read_json(cus.account_creds_path("rayi")))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
 
         conds = cus._diagnose_stuck_lanes(cus.load_state(), cus.load_config())
