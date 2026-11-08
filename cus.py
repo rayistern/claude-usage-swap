@@ -14501,11 +14501,31 @@ def _lane_divergence_sos(slot: str, account: str, mount_expired: bool) -> SOSCon
     )
 
 
-def _heal_token_shared(refresh_token: str, source: Path) -> bool:
-    """A recovery grant cannot consume another store's or mount's token."""
+def _lane_own_copy(path: Path, own: set[Path]) -> bool:
+    """True for a file in `own`, or a rotated backup (`<name>.bak.<ts>`) of one."""
+    if path in own:
+        return True
+    cut = path.name.find(".bak.")
+    return cut > 0 and path.with_name(path.name[:cut]) in own
+
+
+def _heal_token_shared(refresh_token: str, source: Path, own: tuple[Path, ...] = ()) -> bool:
+    """A recovery grant cannot consume another store's or mount's token.
+
+    `own` names the lane's own copies of its chain: its last-valid shadow and
+    the store it was installed from (the snapshot for a plain lane, the leased
+    family store for a pooled one). Those files, and backups that only copy
+    them or `source`, are not rival holders. Periodic save-back keeps them equal
+    to each other, so counting them as "another store" refused every lane in
+    its normal steady state (found 2026-11-08 in review: 0 of 4 steady-state
+    lanes healed). Every other store under the accounts root, and every mount
+    including the lane's own, is still compared, and an unreadable file still
+    fails closed.
+    """
+    skip = {source, *own}
     try:
         for other in ACCOUNTS_DIR.rglob("*credentials.json*"):
-            if other == source or not other.is_file():
+            if _lane_own_copy(other, skip) or not other.is_file():
                 continue
             if _credential_refresh_token(read_json(other)) == refresh_token:
                 return True
@@ -14524,19 +14544,39 @@ def _verified_lane_heal_source(slot: str, account: str, state: dict,
     rather than invalidate its other holder. Recovery fails closed on unknown
     grants; ordinary launch/poll probes retain their historical fallback.
     """
+    mount = mount_creds_path(slot_path(slot))
+    shadow = _lane_lastvalid_path(mount)
     lease = slot_leased_family(state, slot)
     if lease and lease[0] == account and independent_logins_enabled(config):
-        candidates = [login_family_creds_path(*lease)]
+        install_store = login_family_creds_path(*lease)
+        candidates = [install_store]
     else:
-        candidates = [_lane_lastvalid_path(mount_creds_path(slot_path(slot))),
-                      account_creds_path(account), *list_creds_backups(account)]
+        install_store = account_creds_path(account)
+        candidates = [shadow, install_store, *list_creds_backups(account)]
+        try:
+            same_chain = (_credential_refresh_token(read_json(shadow))
+                          == _credential_refresh_token(read_json(install_store)))
+        except (OSError, ValueError):
+            same_chain = False
+        if same_chain:
+            # Steady state: the shadow is a copy of the snapshot's chain.
+            # Grant on the snapshot itself so it ends holding the new chain
+            # and never again presents the spent one; the shadow follows the
+            # healed mount after the install.
+            candidates = [install_store, *list_creds_backups(account)]
+    # The lane's own copies of its chain are not rival holders (see
+    # _heal_token_shared). Its mount is listed only so the mount's backups
+    # are skipped; the mount itself is still compared by the mount guard.
+    own = (mount, shadow, install_store)
+    tried: set[str] = set()
     for source in candidates:
         try:
             creds = read_json(source)
             rt = _credential_refresh_token(creds)
-            if not rt or _live_mount_creds_invalid(creds):
+            if not rt or _live_mount_creds_invalid(creds) or rt in tried:
                 continue
-            if _heal_token_shared(rt, source):
+            tried.add(rt)
+            if _heal_token_shared(rt, source, own):
                 _cred_audit("lane-heal-verify", "refused-shared",
                             "recovery token held by another store or mount",
                             account=account, token_fp=_audit_token_fp(creds))

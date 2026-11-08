@@ -141,10 +141,19 @@ def test_incident_heal_does_not_spend_token_held_in_another_store(incident, monk
     cus.write_json(mount, {})
     shadow = cus._lane_lastvalid_path(mount)
     cus.write_json(shadow, creds(expiry=int((time.time() + 3600) * 1000)))
+    # The lane's own snapshot equal to its shadow is its steady state, not a
+    # rival (see the steady-state tests below). A store outside the lane's own
+    # chain holding the same token is a rival.
+    cus.write_json(snap, creds(rt="fake-snapshot"))
+    foreign = cus.account_creds_path("other")
+    foreign.parent.mkdir()
+    cus.write_json(foreign, creds())
     calls = []
     monkeypatch.setattr(cus, "_oauth_refresh_grant", lambda rt: calls.append(rt) or ("dead", None))
     assert cus._verified_lane_heal_source("slot-1", "sample", state, cfg) is None
-    assert calls == []
+    # The shared token is never presented; only the snapshot's own chain is.
+    assert calls == ["fake-snapshot"]
+    assert cus.read_json(foreign) == creds()
 
 
 @pytest.mark.parametrize("other", ["shared", "idle", "unreadable"])
@@ -313,3 +322,87 @@ def test_incident_mount_scan_failure_cannot_authorize_rotation(incident, monkeyp
         raise OSError("fake directory failure")
     monkeypatch.setattr(cus, "list_slot_dirs", unavailable)
     assert cus._refresh_token_on_mount("fake-refresh")
+
+
+# ---------------------------------------------------------------------------
+# Steady-state lane heal. Periodic save-back keeps a plain lane's snapshot
+# equal to its last-valid shadow, and a leased lane's family store equal to its
+# shadow. Those copies are the lane's own source, not a rival holder, so the
+# verified heal must still recover the lane. A token held by any other mount or
+# store stays refused.
+# ---------------------------------------------------------------------------
+
+STEADY_STATE_LANES = ["plain", "plain-backup", "leased", "leased-backup"]
+BLANK = {"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}
+
+
+def steady_state_lane(incident, kind, expiry):
+    """Blank a lane whose shadow equals the store it was installed from."""
+    cfg, state, snap, mount = incident
+    store = snap
+    if kind.startswith("leased"):
+        state["slots"]["slot-1"]["login_family"] = "sample/family-1"
+        cus.write_json(cus.STATE_JSON, state)
+        store = cus.login_family_creds_path("sample", "family-1")
+        store.parent.mkdir(parents=True)
+    chain = creds(rt="fake-chain", expiry=expiry)
+    cus.write_json(store, chain)
+    cus.write_json(cus._lane_lastvalid_path(mount), chain)
+    if kind.endswith("backup"):
+        cus.write_json(store.with_name(store.name + ".bak.20260101T000000.000000Z"), chain)
+    cus.write_json(mount, BLANK)
+    return store
+
+
+def rotating_grant(calls):
+    def grant(rt):
+        calls.append(rt)
+        return "alive", {"access_token": "fake-next-access", "refresh_token": rt + "-next",
+                         "expires_in": 3600}
+    return grant
+
+
+@pytest.mark.parametrize("fresh", [True, False], ids=["access-fresh", "access-expired"])
+@pytest.mark.parametrize("kind", STEADY_STATE_LANES)
+def test_incident_heal_recovers_steady_state_lane(incident, monkeypatch, kind, fresh):
+    cfg, state, snap, mount = incident
+    cfg["poll_only_lane_maintenance"] = False
+    expiry = int((time.time() + 3600) * 1000) if fresh else 1000
+    store = steady_state_lane(incident, kind, expiry)
+    calls = []
+    monkeypatch.setattr(cus, "_oauth_refresh_grant", rotating_grant(calls))
+    assert cus._auto_heal_live_lanes(state, cfg) == ["slot-1"]
+    rt = cus._credential_refresh_token
+    assert calls == ["fake-chain"]
+    assert rt(cus.read_json(mount)) == "fake-chain-next"
+    # The source store carries the new chain, so it never again presents the
+    # spent one; the shadow follows the healed mount.
+    assert rt(cus.read_json(store)) == "fake-chain-next"
+    assert rt(cus.read_json(cus._lane_lastvalid_path(mount))) == "fake-chain-next"
+
+
+@pytest.mark.parametrize("rival", ["live-slot", "idle-slot", "shared-mount", "other-family"])
+@pytest.mark.parametrize("kind", STEADY_STATE_LANES)
+def test_incident_heal_still_refuses_token_held_elsewhere(incident, monkeypatch, kind, rival):
+    cfg, state, snap, mount = incident
+    cfg["poll_only_lane_maintenance"] = False
+    steady_state_lane(incident, kind, 1000)
+    if rival == "shared-mount":
+        holder = cus.CREDS_JSON
+    elif rival == "other-family":
+        holder = cus.login_family_creds_path("sample", "family-2")
+    else:
+        holder = cus.mount_creds_path(cus.slot_path("slot-2"))
+    holder.parent.mkdir(parents=True, exist_ok=True)
+    cus.write_json(holder, creds(rt="fake-chain", expiry=int((time.time() + 3600) * 1000)))
+    if rival == "live-slot":
+        lane = mount.parent
+        other = holder.parent
+        monkeypatch.setattr(cus, "mount_pids", lambda p: [123] if p in (lane, other) else [])
+    calls = []
+    monkeypatch.setattr(cus, "_oauth_refresh_grant", rotating_grant(calls))
+    before = holder.read_bytes()
+    assert cus._auto_heal_live_lanes(state, cfg) == []
+    assert calls == []
+    assert holder.read_bytes() == before
+    assert cus.read_json(mount) == BLANK
