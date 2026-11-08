@@ -2259,12 +2259,39 @@ def _distinct_family_capacity(account: str, state: dict, config: dict | None, sl
     return cap
 
 
-def _refresh_token_on_mount(refresh_token: str, source: Path | None = None) -> bool:
-    """Refuse store rotation when any mount holds the same single-use token.
+# Accounts whose snapshot refresh grant was declined this cycle because a
+# mount holds the same token: account -> holder label (a slot name, "shared
+# mount", or "unreadable <slot>"). Never a token. The poll copies it into the
+# account's state so `cus status` and the poll log name the holder; the next
+# poll that needs no declined grant clears it.
+_SHARED_MOUNT_DECLINES: dict[str, str] = {}
+# Unreadable mount files already audited this cycle (one line per cycle per
+# file, not one per declined attempt). Cleared at each daemon cycle start.
+_UNREADABLE_MOUNT_AUDITED: set[str] = set()
+
+
+def _mount_label(path: Path) -> str:
+    return "shared mount" if path == CREDS_JSON else path.parent.name
+
+
+def _is_mount_path(path: Path | None) -> bool:
+    """True for the shared mount or a slot mount; never raises. A slot listing
+    error reads as "not a mount", so the mount scan that follows fails closed."""
+    if path is None:
+        return False
+    try:
+        return path == CREDS_JSON or path.parent in list_slot_dirs()
+    except OSError:
+        return False
+
+
+def _mount_holding_refresh_token(refresh_token: str, source: Path | None = None) -> str | None:
+    """Label of a mount holding the same single-use token, or None.
 
     Slot occupancy is irrelevant: an idle mount can be resumed. Compare secrets
-    only in memory, and fail closed on an unreadable existing mount. A mount
-    refresh may exclude itself because its new token is written in place.
+    only in memory, and fail closed on an unreadable existing mount (returned
+    as "unreadable <slot>"). A mount refresh may exclude itself because its new
+    token is written in place.
     """
     try:
         paths = [CREDS_JSON] + [mount_creds_path(d) for d in list_slot_dirs()]
@@ -2276,25 +2303,64 @@ def _refresh_token_on_mount(refresh_token: str, source: Path | None = None) -> b
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
-                return True
+                label = _mount_label(path)
+                if label not in _UNREADABLE_MOUNT_AUDITED:
+                    _UNREADABLE_MOUNT_AUDITED.add(label)
+                    _cred_audit("mount-scan", "unreadable-fail-closed",
+                                "mount credentials file unreadable; refresh grants are declined "
+                                "until it reads",
+                                slot=None if path == CREDS_JSON else label,
+                                mount="shared" if path == CREDS_JSON else None)
+                return f"unreadable {label}"
             if _credential_refresh_token(creds) == refresh_token:
-                return True
+                return _mount_label(path)
     except OSError:
-        return True
-    return False
+        return "unreadable slot list"
+    return None
 
 
-def _guarded_store_refresh_grant(refresh_token: str, source: Path | None = None) -> tuple[str, dict | None]:
+def _refresh_token_on_mount(refresh_token: str, source: Path | None = None) -> bool:
+    """Refuse store rotation when any mount holds the same single-use token."""
+    return _mount_holding_refresh_token(refresh_token, source) is not None
+
+
+def _refresh_held_text(holder: str) -> str:
+    """Operator text for a declined snapshot refresh. Names the holder only."""
+    if holder.startswith("unreadable"):
+        return (f"snapshot refresh declined: {holder} credentials file (fails closed until it "
+                f"reads)")
+    return (f"snapshot refresh declined: its token is held by {holder}; clears when that "
+            f"lane's own refresh saves back or usage is read with its token")
+
+
+def _audit_shared_mount_decline(op: str, holder: str, refresh_token: str,
+                                account: str | None) -> None:
+    """One decline line per attempt naming the holder; an unreadable holder
+    already has its once-per-cycle mount-scan line, so it adds none here."""
+    if account is not None:
+        _SHARED_MOUNT_DECLINES[account] = holder
+    if holder.startswith("unreadable"):
+        return
+    _cred_audit(op, "skipped-shared-mount",
+                "refresh token held by a mount; leaving store stale",
+                account=account, token_fp=_refresh_fingerprint(refresh_token),
+                extra=f"held_by={holder}")
+
+
+def _guarded_store_refresh_grant(refresh_token: str, source: Path | None = None,
+                                 *, account: str | None = None) -> tuple[str, dict | None]:
     """All store probes share the unconditional mount safety veto.
 
     No config gate: declining a destructive grant preserves a running login.
     Keep this above the transport seam so tests replacing HTTP still exercise it.
+    `account` (the snapshot's account, when the store is one) records the
+    decline for the account's visible state.
     """
-    is_mount = source is not None and (source == CREDS_JSON or source.parent in list_slot_dirs())
-    if _refresh_token_on_mount(refresh_token, source if is_mount else None):
-        _cred_audit("store-refresh", "skipped-shared-mount",
-                    "refresh token held by a mount or mount unreadable; leaving store stale",
-                    token_fp=_refresh_fingerprint(refresh_token))
+    is_mount = _is_mount_path(source)
+    holder = _mount_holding_refresh_token(refresh_token, source if is_mount else None)
+    if holder is not None:
+        _audit_shared_mount_decline("store-refresh", holder, refresh_token,
+                                    None if is_mount else account)
         return "unknown", None
     return _oauth_refresh_grant(refresh_token)
 
@@ -5055,11 +5121,11 @@ def _refresh_account_token(account_name: str, creds_path: Path | None = None) ->
 
     # Snapshot grants must never spend a mount's token. A preempt writes its
     # own mount in place, but still refuses a duplicate on any other mount.
-    is_mount = creds_path == CREDS_JSON or creds_path.parent in list_slot_dirs()
-    if _refresh_token_on_mount(refresh_token, creds_path if is_mount else None):
-        _cred_audit("account-refresh", "skipped-shared-mount",
-                    "refresh token held by a mount or mount unreadable; leaving store stale",
-                    account=account_name, token_fp=_audit_token_fp(creds))
+    is_mount = _is_mount_path(creds_path)
+    holder = _mount_holding_refresh_token(refresh_token, creds_path if is_mount else None)
+    if holder is not None:
+        _audit_shared_mount_decline("account-refresh", holder, refresh_token,
+                                    None if is_mount else account_name)
         return False
 
     body = json.dumps({
@@ -5187,7 +5253,7 @@ def _unstale_account_snapshot(account: str, state: dict, config: dict | None = N
                     account=account, token_fp="none")
         return False
 
-    verdict, tok = _guarded_store_refresh_grant(rt)
+    verdict, tok = _guarded_store_refresh_grant(rt, account=account)
     if verdict != "alive" or not isinstance(tok, dict):
         # A definitive invalid_grant is the "dead snapshot" signal (2026-07-07 merkos
         # incident): flag it on the account so the swap-target picker excludes it and
@@ -5975,6 +6041,7 @@ def poll_account_usage(account_name: str) -> AccountUsage:
             # 30s grace — don't fire on tokens that are about to expire mid-flight
             if int(expires_at) < now_ms - 30_000:
                 stale_expires_at = expires_at
+                _SHARED_MOUNT_DECLINES.pop(account_name, None)
                 if _refresh_account_token(account_name):
                     token, expires_at = _read_access_token_with_expiry(account_name)
                 if not token or expires_at is None or int(expires_at) < now_ms - 30_000:
@@ -5984,6 +6051,13 @@ def poll_account_usage(account_name: str) -> AccountUsage:
                         "error": "stored access token expired (refresh token still valid)",
                         "expired_minutes_ago": (now_ms - int(stale_expires_at)) // 60_000,
                     }
+                    # 2026-11-08: a grant declined because a mount holds the
+                    # token can last as long as save-back keeps the snapshot
+                    # equal to that mount. Carry the holder (never the token)
+                    # so the state and the poll log say why.
+                    held = _SHARED_MOUNT_DECLINES.get(account_name)
+                    if held:
+                        u.raw["refresh_held_by"] = held
                     return u
         except (TypeError, ValueError):
             pass
@@ -11561,6 +11635,19 @@ def update_state_with_usage(state: dict, usage_by_account: dict[str, AccountUsag
             if getattr(u, "plan_tier_file", None):
                 acct["plan_tier_file"] = dict(u.plan_tier_file)
 
+        # Declined snapshot refresh (2026-11-08): visible while every poll's
+        # grant is declined because a mount holds the token. It ends on the
+        # first poll that needs no declined grant: the lane's own refresh saved
+        # back a fresh access token, or usage was read with the lane's token.
+        held = (u.raw or {}).get("refresh_held_by") if u.token_stale else None
+        if held:
+            if acct.get("refresh_held_by") != held or not acct.get("refresh_held_since"):
+                acct["refresh_held_since"] = u.polled_at
+            acct["refresh_held_by"] = held
+        else:
+            acct.pop("refresh_held_by", None)
+            acct.pop("refresh_held_since", None)
+
         # Branch 0: token stale (stored access token expired but refresh
         # token still valid — recoverable on next swap, NOT an SOS condition).
         # Clear any prior false-positive token_expired flag if present.
@@ -12253,6 +12340,8 @@ def _reset_blank_tracking() -> None:
     _SNAPSHOT_DEAD_PROBE.clear()
     _STORE_DEAD_PROBE.clear()
     _LANE_TRANSFER_ATTEMPT.clear()
+    _SHARED_MOUNT_DECLINES.clear()
+    _UNREADABLE_MOUNT_AUDITED.clear()
     _HOUSEKEEPING_LAST_RUN = None
 
 
@@ -12326,7 +12415,7 @@ def _account_snapshot_dead(account: str, config: dict | None = None, *, force: b
         cached = _SNAPSHOT_DEAD_PROBE.get(account)
         if cached is not None and (now - cached[0]) < cooldown_min * 60:
             return cached[1]
-    verdict, tok = _guarded_store_refresh_grant(rt)
+    verdict, tok = _guarded_store_refresh_grant(rt, account=account)
     if verdict == "alive" and isinstance(tok, dict):
         # Persist the rotation BEFORE returning (mirrors _unstale_account_snapshot):
         # after a successful grant the snapshot's OLD refresh token is a dead branch
@@ -18883,6 +18972,9 @@ def status() -> None:
             parts = "  ".join(f"{m}={_fmt_model_pct(a, p, color_on=color_on)}"
                               for m, p in sorted(pm.items(), key=lambda kv: -kv[1]))
             click.echo(f"{'':<20}   └ 7d by model: {parts}")
+        if a.get("refresh_held_by"):
+            since = a.get("refresh_held_since") or "unknown"
+            click.echo(f"{'':<20}   └ {_refresh_held_text(a['refresh_held_by'])} (since {since})")
     click.echo()
 
     # Lanes (per_session): lane → account → live pids, with any orphan dirs.
@@ -21547,6 +21639,8 @@ def poll(account: str | None, no_write: bool) -> None:
                          if minutes is not None
                          else "stored access token was rejected (HTTP 401)")
             click.echo(f"  TOKEN_STALE — {staleness} (refresh token still valid; account remains usable and swap-eligible).")
+            if u.raw.get("refresh_held_by"):
+                click.echo(f"  {_refresh_held_text(u.raw['refresh_held_by'])}")
             continue
         if u.token_expired:
             # GH #77 auto-heal hint: for the ACTIVE account, poll reads the
@@ -22121,6 +22215,7 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
         per_session = mode == "per_session"
         hybrid = mode == "hybrid"
         click.echo(f"[{now_iso()}] cycle start. mode={mode} active={state['active']}")
+        _UNREADABLE_MOUNT_AUDITED.clear()  # one unreadable-mount line per file per cycle
 
         # 0. Reactive check — has anything 429'd since last cycle?
         # per_session + hybrid handle 429s AFTER polling (inside their cycle
@@ -22177,6 +22272,9 @@ def daemon(once: bool, foreground: bool, no_execute: bool) -> None:
                 time.sleep(stagger)
             usage_by_account[name] = poll_account_usage(name)
             polled_this_cycle += 1
+            _held = usage_by_account[name].raw.get("refresh_held_by")
+            if usage_by_account[name].token_stale and _held:
+                click.echo(f"  {name}: TOKEN_STALE, {_refresh_held_text(_held)}")
 
         # GH #75 (lost-update race): the poll loop above holds the network
         # for seconds to ~40s (per-account HTTP calls, 10s timeout each). A

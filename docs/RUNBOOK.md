@@ -358,8 +358,24 @@ or the shared mount holds the same refresh token. This safety default has no
 new key. A stale snapshot can remain stale until the mount refreshes and saves
 back. `force-poll` explains a declined grant in its audit output.
 
+While a decline lasts, `cus status` shows a line under the account naming the
+holding slot (never the token) and the time it started, `cus poll` prints the
+same line, and the daemon log carries `<account>: TOKEN_STALE, snapshot
+refresh declined: its token is held by <slot>`. The state clears on the first
+poll that needs no declined grant: the lane's own refresh saves a fresh access
+token back, or usage is read with the lane's token. An unreadable mount file
+fails closed and is logged once per daemon cycle as `op=mount-scan
+decision=unreadable-fail-closed` naming its slot.
+
 A heal requires a verified refresh chain even if the source access token has
 not expired. Shared, spent and unverifiable recovery sources are refused.
-When the independent login pool is enabled, slot installs, including blank
-same-account reinstalls, prefer a verified free family before a snapshot.
-An unheld account falls back to its snapshot if no verified family is available.
+A lane whose last-valid shadow equals the store it was installed from (its
+normal state after save-back) heals from that store: the grant runs on the
+store itself, which then holds the new chain. A token that any other mount or
+store holds is still refused.
+
+When the independent login pool is enabled, a blank same-account reinstall
+prefers a verified free family and falls back to the snapshot if none
+verifies. An account live on another mount claims a free family, or the
+install is refused. A plain install of an account no other mount holds uses
+the snapshot and leaves the family free for a second lane.

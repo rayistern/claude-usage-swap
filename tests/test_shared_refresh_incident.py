@@ -440,3 +440,99 @@ def test_incident_unheld_install_keeps_family_for_second_lane(monkeypatch):
         assert rt(cus.read_json(cus.mount_creds_path(cus.slot_path(lane_b)))) == "fake-verified-refresh"
     finally:
         env.restore()
+
+
+class UsageResponse:
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def read(self, *a):
+        return json.dumps({"five_hour": {"utilization": 10, "resets_at": "2026-07-02T10:00:00Z"},
+                           "seven_day": {"utilization": 20, "resets_at": "2026-07-08T10:00:00Z"}}).encode()
+
+
+def test_incident_declined_refresh_is_visible_until_lane_token_reads(incident, monkeypatch):
+    """A decline names the holding slot in the poll, the state and `cus status`,
+    never the token, and clears once usage is read with the lane's token."""
+    cfg, state, snap, mount = incident
+    u = cus.poll_account_usage("sample")
+    assert u.token_stale and u.raw["refresh_held_by"] == "slot-1"
+    st = cus.load_state()
+    st["active"] = None
+    cus.update_state_with_usage(st, {"sample": u})
+    cus.save_state(st)
+    acct = cus.load_state()["accounts"]["sample"]
+    assert acct["refresh_held_by"] == "slot-1" and acct["refresh_held_since"]
+    status = CliRunner().invoke(cus.cli, ["status"])
+    assert status.exit_code == 0, status.output
+    assert "token is held by slot-1" in status.output
+    polled = CliRunner().invoke(cus.cli, ["poll", "--account", "sample", "--no-write"])
+    assert "token is held by slot-1" in polled.output
+    for out in (status.output, polled.output):
+        assert "fake-refresh" not in out and "fake-access" not in out
+    # The lane's own refresh lands a fresh access token on its mount: the poll
+    # reads usage with it, needs no grant, and the declined state ends.
+    cus.write_json(mount, creds(rt="fake-lane-next", expiry=int((time.time() + 3600) * 1000)))
+    monkeypatch.setattr(cus.urllib.request, "urlopen", lambda *a, **k: UsageResponse())
+    u = cus.poll_account_usage("sample")
+    assert not u.token_stale and "refresh_held_by" not in u.raw
+    st = cus.load_state()
+    cus.update_state_with_usage(st, {"sample": u})
+    assert "refresh_held_by" not in st["accounts"]["sample"]
+    assert "refresh_held_since" not in st["accounts"]["sample"]
+
+
+def test_incident_unreadable_mount_fails_closed_with_one_line_per_cycle(incident, capsys):
+    cfg, state, snap, mount = incident
+    broken = cus.mount_creds_path(cus.slot_path("slot-2"))
+    broken.parent.mkdir()
+    broken.write_text("broken-json")
+    cus.write_json(snap, creds(rt="fake-snapshot"))  # held by no readable mount
+    for _ in range(3):
+        assert cus._refresh_token_on_mount("fake-other")
+        assert not cus._refresh_account_token("sample")
+    lines = [l for l in capsys.readouterr().out.splitlines() if "op=mount-scan" in l]
+    assert len(lines) == 1 and "slot=slot-2" in lines[0] and "unreadable-fail-closed" in lines[0]
+    assert cus._SHARED_MOUNT_DECLINES["sample"] == "unreadable slot-2"
+    cus._UNREADABLE_MOUNT_AUDITED.clear()  # the next daemon cycle
+    assert cus._refresh_token_on_mount("fake-other")
+    assert len([l for l in capsys.readouterr().out.splitlines() if "op=mount-scan" in l]) == 1
+
+
+def test_incident_declined_refresh_names_holder_in_daemon_poll_log(monkeypatch):
+    from test_swap_lock_journal import _Env, TWO_ACCOUNTS, _creds as journal_creds
+    env = _Env(TWO_ACCOUNTS, active="a", live_creds=journal_creds("rt-a", "at-a"))
+    try:
+        def poll(name):
+            u = stale_usage()
+            u.raw = {"refresh_held_by": "slot-3"} if name == "b" else {}
+            return u
+        monkeypatch.setattr(cus, "poll_account_usage", poll)
+        monkeypatch.setattr(cus, "check_rate_limit_reactive", lambda state, config: None)
+        monkeypatch.setattr(cus, "diagnose", lambda state=None, config=None: [])
+        monkeypatch.setattr(cus, "maybe_write_sos", lambda conditions, state: None)
+        monkeypatch.setattr(cus, "_log_decision", lambda record: None)
+        monkeypatch.setattr(cus, "_build_decision_record", lambda *a, **k: {})
+        monkeypatch.setattr(cus, "_sweep_unstale_idle_accounts", lambda *a, **k: [])
+        monkeypatch.setattr(cus, "_sweep_clock_keepalive", lambda *a, **k: [])
+        result = CliRunner().invoke(cus.cli, ["daemon", "--once", "--no-execute"],
+                                    catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        lines = [l for l in result.output.splitlines() if "refresh declined" in l]
+        assert len(lines) == 1 and lines[0].strip().startswith("b: TOKEN_STALE")
+        assert "held by slot-3" in lines[0]
+        assert env.state()["accounts"]["b"]["refresh_held_by"] == "slot-3"
+        assert "refresh_held_by" not in env.state()["accounts"]["a"]
+    finally:
+        env.restore()
+
+
+def test_incident_slot_listing_error_fails_closed_without_raising(incident, monkeypatch):
+    cfg, state, snap, mount = incident
+    def unavailable():
+        raise OSError("fake directory failure")
+    monkeypatch.setattr(cus, "list_slot_dirs", unavailable)
+    calls = []
+    monkeypatch.setattr(cus, "_oauth_refresh_grant", lambda rt: calls.append(rt) or ("dead", None))
+    assert cus._refresh_account_token("sample", creds_path=mount) is False
+    assert cus._guarded_store_refresh_grant("fake-refresh", mount) == ("unknown", None)
+    assert calls == []
