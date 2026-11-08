@@ -113,7 +113,15 @@ class _Env:
 
         # Recovery now proves the refresh chain even when access is fresh.
         # Keep these shape/audit fixtures offline while returning rotated fakes.
+        # A refresh token is single-use, as at the real endpoint: once rotated,
+        # presenting it again is invalid_grant, so a heal cannot pass by
+        # restoring a backup of an already-spent chain.
+        spent: set[str] = set()
+
         def recovery_grant(rt):
+            if rt in spent:
+                return "dead", None
+            spent.add(rt)
             for path in self.accounts_dir.rglob("*credentials.json*"):
                 try:
                     payload = cus.read_json(path)
