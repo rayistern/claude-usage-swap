@@ -391,7 +391,8 @@ def test_b_repeated_blank_heals_emit_stuck_sos():
         # from heal #1 stays: it equals the snapshot, the lane's steady state.
         env.write_mount(slot, _blank())
         rt = cus._credential_refresh_token
-        assert rt(cus.read_json(env.shadow_path(slot))) == rt(cus.read_json(cus.account_creds_path("rayi")))
+        lane_account = cus.load_state()["slots"][slot]["account"]
+        assert rt(cus.read_json(env.shadow_path(slot))) == rt(cus.read_json(cus.account_creds_path(lane_account)))
         assert cus._auto_heal_live_lanes(cus.load_state(), cus.load_config()) == [slot]
 
         conds = cus._diagnose_stuck_lanes(cus.load_state(), cus.load_config())
